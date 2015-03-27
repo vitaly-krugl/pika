@@ -23,6 +23,7 @@
 from pika.adapters.base_connection import BaseConnection
 from pika.adapters.asyncore_connection import AsyncoreConnection
 from pika.adapters.blocking_connection import BlockingConnection
+from pika.adapters.synchronous_connection import SynchronousConnection
 from pika.adapters.select_connection import SelectConnection
 from pika.adapters.select_connection import IOLoop
 
