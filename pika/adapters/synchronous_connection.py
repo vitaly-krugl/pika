@@ -1,18 +1,55 @@
-"""The SynchronousConnection is a direct replacement for the BlockingConnection.
-It's a subclass of and reuses 100% of SelectConnection.
+"""The SynchronousConnection is a direct replacement for BlockingConnection.
+It's implemented as an adapter around SelectConnection.
 """
 
 import logging
 import time
 
-from pika.adapters import select_connection
+from pika.adapters.select_connection import SelectConnection
 import pika.channel
 import pika.spec
 
 LOGGER = logging.getLogger(__name__)
 
 
-class SynchronousConnection(select_connection.SelectConnection):
+class _CallbackResult(object):
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._ready = False
+        self._value = None
+
+    def set(self):
+        assert not self._ready, "_CallbackResult was already ready"
+        self._ready = True
+
+    def set_value(self, value):
+        self.set()
+        self._value = value
+
+    def is_ready(self):
+        return self._ready
+
+    @property
+    def ready(self):
+        return self.is_ready()
+
+    @property
+    def value(self):
+        return self._value
+
+
+class _ChannelWrapper(pika.channel.Channel):
+    """ We ask SelectConnection to create channels of this class that we can
+    use to override method calls for debugging
+
+    TODO Remove this class
+    """
+    pass
+
+
+class SynchronousConnection(object):
     """
     """
 
@@ -24,89 +61,23 @@ class SynchronousConnection(select_connection.SelectConnection):
 
         """
         # TODO define passed callbacks
-        super(SynchronousConnection, self).__init__(parameters,
-                                                    on_open_callback,
-                                                    on_open_error_callback,
-                                                    on_close_callback,
-                                                    stop_ioloop_on_close=False)
+        # TODO verify suitability of stop_ioloop_on_close value 
+        self._impl = SelectConnection(
+            parameters=parameters,
+            on_open_callback=on_connection_opened,
+            on_open_error_callback=on_open_error_callback,
+            on_close_callback=on_close_callback,
+            stop_ioloop_on_close=False)
         # TODO pump messages
 
-    def add_timeout(self, deadline, callback_method):
-        """Add the callback_method to the IOLoop timer to fire after deadline
-        seconds. Returns a handle to the timeout. Do not confuse with
-        Tornado's timeout where you pass in the time you want to have your
-        callback called. Only pass in the seconds until it's to be called.
+    def add_backpressure_callback(self, callback_method):
+        """Call method "callback" when pika believes backpressure is being
+        applied.
 
-        :param int deadline: The number of seconds to wait to call callback
-        :param method callback_method: The callback method
-        :rtype: str
+        :param method callback_method: The method to call
 
         """
-        super(SynchronousConnection, self).add_timeout(deadline,
-                                                       callback_method)
-
-    def remove_timeout(self, timeout_id):
-        """Remove the timeout from the IOLoop by the ID returned from
-        add_timeout.
-
-        :param str timeout_id: The id of the timeout to remove
-
-        """
-        super(SynchronousConnection, self).remove_timeout(timeout_id)
-
-    def channel(self, channel_number=None):
-        """Create a new channel with the next available channel number or pass
-        in a channel number to use. Must be non-zero if you would like to
-        specify but it is recommended that you let Pika manage the channel
-        numbers.
-
-        :rtype: pika.synchronous_connection.SynchronousChannel
-        """
-        # TODO define actual on_open_callback
-        channel = super(SynchronousConnection, self).channel(
-            on_open_callback,
-            channel_number=None,
-            _channel_class=SynchronousChannel)
-        # TODO pump messages
-
-        return channel
-
-    def connect(self):
-        """Invoke if trying to reconnect to a RabbitMQ server. Constructing the
-        Connection object should connect on its own.
-
-        """
-        super(SynchronousConnection, self).connect()
-        # TODO pump messages
-
-    def close(self, reply_code=200, reply_text='Normal shutdown'):
-        """Disconnect from RabbitMQ. If there are any open channels, it will
-        attempt to close them prior to fully disconnecting. Channels which
-        have active consumers will attempt to send a Basic.Cancel to RabbitMQ
-        to cleanly stop the delivery of messages prior to closing the channel.
-
-        :param int reply_code: The code number for the close
-        :param str reply_text: The text reason for the close
-
-        """
-        LOGGER.info("Closing connection (%s): %s", reply_code, reply_text)
-        super(SynchronousConnection, self).close(reply_code, reply_text)
-        # TODO pump messages
-
-    def sleep(self, duration):
-        """A safer way to sleep than calling time.sleep() directly which will
-        keep the adapter from ignoring frames sent from RabbitMQ. The
-        connection will "sleep" or block the number of seconds specified in
-        duration in small intervals.
-
-        :param float duration: The time to sleep in seconds
-
-        """
-        deadline = time.time() + duration
-        while duration > 0:
-            # TODO define _process_events
-            super(SynchronousConnection, self)._process_events(duration)
-            duration = time.time() - deadline
+        self._impl.add_backpressure_callback(callback_method)
 
     def add_on_close_callback(self, callback_method_unused):
         """This is not supported in SynchronousConnection. When a connection is
@@ -143,30 +114,329 @@ class SynchronousConnection(select_connection.SelectConnection):
         raise NotImplementedError('Connection callbacks not supported in '
                                   'SynchronousConnection')
 
+    def add_timeout(self, deadline, callback_method):
+        """Add the callback_method to the IOLoop timer to fire after deadline
+        seconds. Returns a handle to the timeout. Do not confuse with
+        Tornado's timeout where you pass in the time you want to have your
+        callback called. Only pass in the seconds until it's to be called.
 
-class SynchronousChannel(channel.Channel):
-
-    def __init__(self, connection, channel_number, on_open_callback):
-        """Create a new instance of the Channel
-
-        :param SynchronousConnection connection: The connection
-        :param int channel_number: The channel number for this instance
-        :param method on_open_callback: The method to call on channel open
+        :param int deadline: The number of seconds to wait to call callback
+        :param method callback_method: The callback method
+        :returns: timeout id
 
         """
-        super(SynchronousChannel, self).__init__(connection,
-                                                 channel_number,
-                                                 on_open_callback)
-        self.__delivery_confirmation = False
+        self._impl.add_timeout(deadline, callback_method)
 
-        # TODO register for channel callbacks (on-error, etc.)
+    def remove_timeout(self, timeout_id):
+        """Remove the timeout from the IOLoop by the ID returned from
+        add_timeout.
+
+        :param str timeout_id: The id of the timeout to remove
+
+        """
+        self._impl.remove_timeout(timeout_id)
+
+    def channel(self, channel_number=None):
+        """Create a new channel with the next available channel number or pass
+        in a channel number to use. Must be non-zero if you would like to
+        specify but it is recommended that you let Pika manage the channel
+        numbers.
+
+        :rtype: pika.synchronous_connection.SynchronousChannel
+        """
+        # TODO define actual on_channel_opened
+        channel = self._impl.channel(
+            on_open_callback=on_channel_opened,
+            channel_number=None,
+            _channel_class=_ChannelWrapper)
+        # TODO pump messages and wait for on_channel_opened
+
+        return SynchronousChannel(channel, self)
+
+    def connect(self):
+        """Invoke if trying to reconnect to a RabbitMQ server. Constructing the
+        Connection object should connect on its own.
+
+        """
+        self._impl.connect()
+        # TODO pump messages and wait for on_open_callback passed to constructor
+
+    def close(self, reply_code=200, reply_text='Normal shutdown'):
+        """Disconnect from RabbitMQ. If there are any open channels, it will
+        attempt to close them prior to fully disconnecting. Channels which
+        have active consumers will attempt to send a Basic.Cancel to RabbitMQ
+        to cleanly stop the delivery of messages prior to closing the channel.
+
+        :param int reply_code: The code number for the close
+        :param str reply_text: The text reason for the close
+
+        """
+        LOGGER.info("Closing connection (%s): %s", reply_code, reply_text)
+        self._impl.close(reply_code, reply_text)
+        # TODO pump messages
+
+    def set_backpressure_multiplier(self, value=10):
+        """Alter the backpressure multiplier value. We set this to 10 by default.
+        This value is used to raise warnings and trigger the backpressure
+        callback.
+
+        :param int value: The multiplier value to set
+
+        """
+        self._impl.set_backpressure_multiplier(value)
+
+    def sleep(self, duration):
+        """A safer way to sleep than calling time.sleep() directly which will
+        keep the adapter from ignoring frames sent from RabbitMQ. The
+        connection will "sleep" or block the number of seconds specified in
+        duration in small intervals.
+
+        :param float duration: The time to sleep in seconds
+
+        """
+        deadline = time.time() + duration
+        while duration > 0:
+            # TODO define _process_events
+            self._impl._process_events(duration)
+            duration = time.time() - deadline
+
+    #
+    # Connections state properties
+    #
+
+    @property
+    def is_closed(self):
+        """
+        Returns a boolean reporting the current connection state.
+        """
+        return self._impl.is_closed
+
+    @property
+    def is_closing(self):
+        """
+        Returns a boolean reporting the current connection state.
+        """
+        return self._impl.is_closing
+
+    @property
+    def is_open(self):
+        """
+        Returns a boolean reporting the current connection state.
+        """
+        return self._impl.is_open
+
+    #
+    # Properties that reflect server capabilities for the current connection
+    #
+
+    @property
+    def basic_nack(self):
+        """Specifies if the server supports basic.nack on the active connection.
+
+        :rtype: bool
+
+        """
+        return self._impl.basic_nack
+
+    @property
+    def consumer_cancel_notify(self):
+        """Specifies if the server supports consumer cancel notification on the
+        active connection.
+
+        :rtype: bool
+
+        """
+        return self._impl.consumer_cancel_notify
+
+    @property
+    def exchange_exchange_bindings(self):
+        """Specifies if the active connection supports exchange to exchange
+        bindings.
+
+        :rtype: bool
+
+        """
+        return self._impl.exchange_exchange_bindings
+
+    @property
+    def publisher_confirms(self):
+        """Specifies if the active connection can use publisher confirmations.
+
+        :rtype: bool
+
+        """
+        return self._impl.publisher_confirms
+
+
+class SynchronousChannel(object):
+    """The SynchronousChannel implements blocking semantics for most things that
+    one would use callback-passing-style for with the
+    :py:class:`~pika.channel.Channel` class. In addition,
+    the `SynchronousChannel` class implements a :term:`generator` that allows
+    you to :doc:`consume messages </examples/blocking_consumer_generator>`
+    without using callbacks.
+
+    Example of creating a SynchronousChannel::
+
+        import pika
+
+        # Create our connection object
+        connection = pika.BlockingConnection()
+
+        # The returned object will be a synchronous channel
+        channel = connection.channel()
+
+    :param channel_impl: Channel implementation object as returned from
+                         SelectConnection.channel()
+    :param SynchronousConnection connection: The connection object
+
+    TODO fill in missing channel methods see BlockingChannel methods in
+    http://pika.readthedocs.org/en/latest/modules/adapters/blocking.html
+
+    """
+
+    def __init__(self, channel_impl, connection):
+        """Create a new instance of the Channel
+
+        :param channel_impl: Channel implementation object as returned from
+                             SelectConnection.channel()
+        :param SynchronousConnection connection: The connection object
+
+        """
+        self._impl = channel_impl
+        self._connection = connection
+        self._delivery_confirmation = False
+
+        # TODO register for channel callbacks (on-error, on-cancel, etc.)
         # TODO register add_on_return_callback: here, if
-        #  __delivery_confirmation is False, we log.warn and drop returned
+        #  _delivery_confirmation is False, we log.warn and drop returned
         #  messages.
         # TODO Register on_channel_close via Channel.add_on_close_callback()
         # TODO Register callback for Basic.GetEmpty via Channel.add_callback()
         #  callback should expect only one parameter, frame.
         #  http://www.rabbitmq.com/amqp-0-9-1-reference.html#basic.get
+
+    @property
+    def connection(self):
+        return self._connection
+
+    @property
+    def is_closed(self):
+        """Returns True if the channel is closed.
+
+        :rtype: bool
+
+        """
+        return self._impl.is_closed
+
+    @property
+    def is_closing(self):
+        """Returns True if the channel is closing.
+
+        :rtype: bool
+
+        """
+        return self._impl.is_closing
+
+    @property
+    def is_open(self):
+        """Returns True if the channel is open.
+
+        :rtype: bool
+
+        """
+        return self._impl.is_open
+
+    def close(self, reply_code=0, reply_text="Normal Shutdown"):
+        """Will invoke a clean shutdown of the channel with the AMQP Broker.
+
+        :param int reply_code: The reply code to close the channel with
+        :param str reply_text: The reply text to close the channel with
+
+        """
+        LOGGER.info('Channel.close(%s, %s)', reply_code, reply_text)
+
+        # TODO define actual on_channel_close_ok
+        self._impl.add_callback(callback=on_channel_close_ok,
+                                replies=[pika.spec.Channel.CloseOk],
+                                one_shot=True)
+
+        self._impl.close(reply_code=reply_code, reply_text=reply_text)
+        # TODO pump messages and wait for on_channel_close_ok
+
+    def basic_ack(self, delivery_tag=0, multiple=False):
+        """Acknowledge one or more messages. When sent by the client, this
+        method acknowledges one or more messages delivered via the Deliver or
+        Get-Ok methods. When sent by server, this method acknowledges one or
+        more messages published with the Publish method on a channel in
+        confirm mode. The acknowledgement can be for a single message or a
+        set of messages up to and including a specific message.
+
+        :param int delivery-tag: The server-assigned delivery tag
+        :param bool multiple: If set to True, the delivery tag is treated as
+                              "up to and including", so that multiple messages
+                              can be acknowledged with a single method. If set
+                              to False, the delivery tag refers to a single
+                              message. If the multiple field is 1, and the
+                              delivery tag is zero, this indicates
+                              acknowledgement of all outstanding messages.
+        """
+        self._imp.basic_ack(delivery_tag=delivery_tag, multiple=multiple)
+        # TODO flush output
+
+    def basic_nack(self, delivery_tag=None, multiple=False, requeue=True):
+        """This method allows a client to reject one or more incoming messages.
+        It can be used to interrupt and cancel large incoming messages, or
+        return untreatable messages to their original queue.
+
+        :param int delivery-tag: The server-assigned delivery tag
+        :param bool multiple: If set to True, the delivery tag is treated as
+                              "up to and including", so that multiple messages
+                              can be acknowledged with a single method. If set
+                              to False, the delivery tag refers to a single
+                              message. If the multiple field is 1, and the
+                              delivery tag is zero, this indicates
+                              acknowledgement of all outstanding messages.
+        :param bool requeue: If requeue is true, the server will attempt to
+                             requeue the message. If requeue is false or the
+                             requeue attempt fails the messages are discarded or
+                             dead-lettered.
+
+        """
+        self._impl.basic_nack(delivery_tag=delivery_tag, multiple=multiple,
+                              requeue=requeue)
+        # TODO flush output
+
+    def basic_consume(self, consumer_callback, queue='', no_ack=False,
+                      exclusive=False, consumer_tag=None, arguments=None):
+        """Sends the AMQP command Basic.Consume to the broker and binds messages
+        for the consumer_tag to the consumer callback. If you do not pass in
+        a consumer_tag, one will be automatically generated for you. Returns
+        the consumer tag.
+
+        For more information on basic_consume, see:
+        http://www.rabbitmq.com/amqp-0-9-1-reference.html#basic.consume
+
+        :param method consumer_callback: The method to callback when consuming
+        :param queue: The queue to consume from
+        :type queue: str or unicode
+        :param bool no_ack: Tell the broker to not expect a response
+        :param bool exclusive: Don't allow other consumers on the queue
+        :param consumer_tag: Specify your own consumer tag
+        :type consumer_tag: str or unicode
+        :param dict arguments: Custom key/value pair arguments for the consume
+        :rtype: str
+
+        """
+        consumer_tag = self._impl.basic_consume(
+            consumer_callback=consumer_callback,
+            queue=queue,
+            no_ack=no_ack,
+            exclusive=exclusive,
+            consumer_tag=consumer_tag,
+            arguments=arguments)
+        # TODO Flush output
+    
 
     def basic_cancel(self, consumer_tag='', nowait=False):
         """This method cancels a consumer. This does not affect already
@@ -183,166 +453,25 @@ class SynchronousChannel(channel.Channel):
         :param bool nowait: Do not expect a Basic.CancelOk response
 
         """
-        # TODO define actual cancel_ok_callback
-        cancel_ok_callback = None if nowait else cancel_ok_callback
-        super(SynchronousChannel, self).basic_cancel(cancel_ok_callback,
-                                                     consumer_tag=consumer_tag,
-                                                     nowait=nowait)
+        # TODO define actual on_consumer_cancel_ok
+        self._impl.basic_cancel(
+            callback=None if nowait else on_consumer_cancel_ok,
+            consumer_tag=consumer_tag,
+            nowait=nowait)
         # TODO pump messages; also wait for cancel-ok if nowait is false
 
-    def basic_get(self, queue=None, no_ack=False):
-        """Get a single message from the AMQP broker. Returns a set with the 
-        method frame, header frame and body.
+    def start_consuming(self):
+        """Starts consuming from registered callbacks."""
+        # TODO
+        pass
 
-        :param queue: The queue to get a message from
-        :type queue: str or unicode
-        :param bool no_ack: Tell the broker to not expect a reply
-        :rtype: (None, None, None)|(spec.Basic.Get,
-                                    spec.Basic.Properties,
-                                    str or unicode)
+    def stop_consuming(self, consumer_tag=None):
+        """Sends off the Basic.Cancel to let RabbitMQ know to stop consuming and
+        sets our internal state to exit out of the basic_consume.
 
         """
-        # TODO define actual get_ok_callback
-        get_ok_callback = None if nowait else get_ok_callback
-        super(SynchronousChannel, self).basic_get(get_ok_callback,
-                                                  queue=queue,
-                                                  no_ack=no_ack)
-        # TODO pump messages and wait for get-ok or Basic.GetEmpty
-        # TODO return value form get_ok_callback or three-tuple with None's
-        #  from Basic.GetEmpty
-
-    def basic_publish(self, exchange, routing_key, body,
-                      properties=None, mandatory=False, immediate=False):
-        """Publish to the channel with the given exchange, routing key and body.
-        Returns a boolean value indicating the success of the operation. For 
-        more information on basic_publish and what the parameters do, see:
-
-        NOTE: mandatory and immediate may be enabled even without delivery
-          confirmation, but in the absence of delivery confirmation the
-          synchronous implementation has no way to know how long to wait for
-          the return.
-
-        http://www.rabbitmq.com/amqp-0-9-1-reference.html#basic.publish
-
-        :param exchange: The exchange to publish to
-        :type exchange: str or unicode
-        :param routing_key: The routing key to bind on
-        :type routing_key: str or unicode
-        :param body: The message body
-        :type body: str or unicode
-        :param pika.spec.Properties properties: Basic.properties
-        :param bool mandatory: The mandatory flag
-        :param bool immediate: The immediate flag
-
-        :returns: None if delivery confirmation is disabled; otherwise returns
-                  False if the message could not be deliveved (Basic.nack or
-                  msg return) and True if the message was delivered (Basic.ack
-                  and no msg return)
-        """
-        super(SynchronousChannel, self).basic_publish(exchange=exchange,
-                                                      routing_key=routing_key,
-                                                      body=body,
-                                                      properties=properties,
-                                                      mandatory=mandatory,
-                                                      immediate=immediate)
-        # TODO pump messages; if __delivery_confirmation mode, also wait for
-        # confirmation that will come with callback registred via
-        # confirm_delivery: if ack and no return yet (add_on_return_callback),
-        #  then return success; if nack or return, then return failure
-
-    def close(self, reply_code=0, reply_text="Normal Shutdown"):
-        """Will invoke a clean shutdown of the channel with the AMQP Broker.
-
-        :param int reply_code: The reply code to close the channel with
-        :param str reply_text: The reply text to close the channel with
-
-        """
-        LOGGER.info('Channel.close(%s, %s)', reply_code, reply_text)
-
-        # TODO define actual on_close_ok
-        self.add_callback(on_close_ok,
-                          [pika.spec.Channel.CloseOk],
-                          one_shot=True)
-
-        super(SynchronousChannel, self).close(reply_code=reply_code,
-                                              reply_text=reply_text)
-        # TODO pump messages and wait for on_close_ok
-
-    def basic_qos(self, prefetch_size=0, prefetch_count=0, all_channels=False):
-        """Specify quality of service. This method requests a specific quality
-        of service. The QoS can be specified for the current channel or for all
-        channels on the connection. The client can request that messages be sent
-        in advance so that when the client finishes processing a message, the
-        following message is already held locally, rather than needing to be
-        sent down the channel. Prefetching gives a performance improvement.
-
-        :param int prefetch_size:  This field specifies the prefetch window
-                                   size. The server will send a message in
-                                   advance if it is equal to or smaller in size
-                                   than the available prefetch size (and also
-                                   falls into other prefetch limits). May be set
-                                   to zero, meaning "no specific limit",
-                                   although other prefetch limits may still
-                                   apply. The prefetch-size is ignored if the
-                                   no-ack option is set.
-        :param int prefetch_count: Specifies a prefetch window in terms of whole
-                                   messages. This field may be used in
-                                   combination with the prefetch-size field; a
-                                   message will only be sent in advance if both
-                                   prefetch windows (and those at the channel
-                                   and connection level) allow it. The
-                                   prefetch-count is ignored if the no-ack
-                                   option is set.
-        :param bool all_channels: Should the QoS apply to all channels
-
-        """
-        # TODO define actual qos_ok_callback
-        super(SynchronousChannel, self).basic_qos(qos_ok_callback,
-                                                  prefetch_size=prefetch_size,
-                                                  prefetch_count=prefetch_count,
-                                                  all_channels=all_channels)
-        # TODO pump messages and wait for qos_ok_callback
-
-    def basic_recover(self, requeue=False):
-        """This method asks the server to redeliver all unacknowledged messages
-        on a specified channel. Zero or more messages may be redelivered. This
-        method replaces the asynchronous Recover.
-
-        :param bool requeue: If False, the message will be redelivered to the
-                             original recipient. If True, the server will
-                             attempt to requeue the message, potentially then
-                             delivering it to an alternative subscriber.
-
-        """
-        # TODO define actual recover_ok_callback
-        super(SynchronousChannel, self).basic_recover(recover_ok_callback,
-                                                      requeue=requeue)
-        # TODO pump messages and wait for recover_ok_callback
-
-    def confirm_delivery(self, nowait=False):
-        """Turn on RabbitMQ-proprietary Confirm mode in the channel.
-
-        For more information see:
-            http://www.rabbitmq.com/extensions.html#confirms
-
-        :param bool nowait: Do not send a reply frame (Confirm.SelectOk)
-
-        """
-        # TODO define actual on_confirm_select_ok
-        if not nowait:
-            self.add_callback(on_confirm_select_ok,
-                              [pika.spec.Confirm.SelectOk],
-                              one_shot=True)
-
-        # TODO define actual on_msg_delivery_confirmation
-        super(SynchronousChannel, self).confirm_delivery(
-            on_msg_delivery_confirmation,
-            nowait=nowait)
-
-        # TODO pump messages; also, if nowait=False, wait for
-        # on_confirm_select_ok
-
-        self.__delivery_confirmation = True
+        # TODO
+        pass
 
     def consume(self, queue, no_ack=False, exclusive=False):
         """Blocking consumption of a queue instead of via a callback. This
@@ -390,6 +519,155 @@ class SynchronousChannel(channel.Channel):
         # TODO borrow from BlockingChannel
         pass
 
+    def basic_get(self, queue=None, no_ack=False):
+        """Get a single message from the AMQP broker. Returns a set with the 
+        method frame, header frame and body.
+
+        :param queue: The queue to get a message from
+        :type queue: str or unicode
+        :param bool no_ack: Tell the broker to not expect a reply
+        :rtype: (None, None, None)|(spec.Basic.Get,
+                                    spec.Basic.Properties,
+                                    str or unicode)
+
+        """
+        # TODO define actual on_basic_get_ok
+        self._impl.basic_get(callback=None if nowait else on_basic_get_ok,
+                             queue=queue,
+                             no_ack=no_ack)
+        # TODO pump messages and wait for get-ok or Basic.GetEmpty
+        # TODO return value form get_ok_callback or three-tuple with None's
+        #  from Basic.GetEmpty
+
+    def basic_publish(self, exchange, routing_key, body,
+                      properties=None, mandatory=False, immediate=False):
+        """Publish to the channel with the given exchange, routing key and body.
+        Returns a boolean value indicating the success of the operation. For 
+        more information on basic_publish and what the parameters do, see:
+
+        NOTE: mandatory and immediate may be enabled even without delivery
+          confirmation, but in the absence of delivery confirmation the
+          synchronous implementation has no way to know how long to wait for
+          the return.
+
+        http://www.rabbitmq.com/amqp-0-9-1-reference.html#basic.publish
+
+        :param exchange: The exchange to publish to
+        :type exchange: str or unicode
+        :param routing_key: The routing key to bind on
+        :type routing_key: str or unicode
+        :param body: The message body
+        :type body: str or unicode
+        :param pika.spec.Properties properties: Basic.properties
+        :param bool mandatory: The mandatory flag
+        :param bool immediate: The immediate flag
+
+        :returns: None if delivery confirmation is not enabled; otherwise
+                  returns False if the message could not be deliveved (
+                  Basic.nack or msg return) and True if the message was
+                  delivered (Basic.ack and no msg return)
+        """
+        self._impl.basic_publish(exchange=exchange,
+                                 routing_key=routing_key,
+                                 body=body,
+                                 properties=properties,
+                                 mandatory=mandatory,
+                                 immediate=immediate)
+        # TODO pump messages; if _delivery_confirmation mode, also wait for
+        # confirmation that will come with callback registred via
+        # confirm_delivery: if ack and no msg-return yet
+        # (add_on_return_callback), then return success; if nack or msg-return,
+        # then return failure
+
+    def basic_qos(self, prefetch_size=0, prefetch_count=0, all_channels=False):
+        """Specify quality of service. This method requests a specific quality
+        of service. The QoS can be specified for the current channel or for all
+        channels on the connection. The client can request that messages be sent
+        in advance so that when the client finishes processing a message, the
+        following message is already held locally, rather than needing to be
+        sent down the channel. Prefetching gives a performance improvement.
+
+        :param int prefetch_size:  This field specifies the prefetch window
+                                   size. The server will send a message in
+                                   advance if it is equal to or smaller in size
+                                   than the available prefetch size (and also
+                                   falls into other prefetch limits). May be set
+                                   to zero, meaning "no specific limit",
+                                   although other prefetch limits may still
+                                   apply. The prefetch-size is ignored if the
+                                   no-ack option is set.
+        :param int prefetch_count: Specifies a prefetch window in terms of whole
+                                   messages. This field may be used in
+                                   combination with the prefetch-size field; a
+                                   message will only be sent in advance if both
+                                   prefetch windows (and those at the channel
+                                   and connection level) allow it. The
+                                   prefetch-count is ignored if the no-ack
+                                   option is set.
+        :param bool all_channels: Should the QoS apply to all channels
+
+        """
+        # TODO define actual on_qos_ok
+        self._impl.basic_qos(callback=on_qos_ok,
+                             prefetch_size=prefetch_size,
+                             prefetch_count=prefetch_count,
+                             all_channels=all_channels)
+        # TODO pump messages and wait for on_qos_ok
+
+    def basic_recover(self, requeue=False):
+        """This method asks the server to redeliver all unacknowledged messages
+        on a specified channel. Zero or more messages may be redelivered. This
+        method replaces the asynchronous Recover.
+
+        :param bool requeue: If False, the message will be redelivered to the
+                             original recipient. If True, the server will
+                             attempt to requeue the message, potentially then
+                             delivering it to an alternative subscriber.
+
+        """
+        # TODO define actual on_recover_ok
+        self._impl.basic_recover(callback=on_recover_ok, requeue=requeue)
+        # TODO pump messages and wait for on_recover_ok
+
+    def basic_reject(self, delivery_tag=None, requeue=True):
+        """Reject an incoming message. This method allows a client to reject a
+        message. It can be used to interrupt and cancel large incoming messages,
+        or return untreatable messages to their original queue.
+
+        :param int delivery-tag: The server-assigned delivery tag
+        :param bool requeue: If requeue is true, the server will attempt to
+                             requeue the message. If requeue is false or the
+                             requeue attempt fails the messages are discarded or
+                             dead-lettered.
+
+        """
+        self._impl.basic_reject(delivery_tag=delivery_tag, requeue=requeue)
+        # TODO flush output
+
+    def confirm_delivery(self, nowait=False):
+        """Turn on RabbitMQ-proprietary Confirm mode in the channel.
+
+        For more information see:
+            http://www.rabbitmq.com/extensions.html#confirms
+
+        :param bool nowait: Do not send a reply frame (Confirm.SelectOk)
+
+        """
+        # TODO define actual on_confirm_select_ok
+        if not nowait:
+            self._impl.add_callback(callback=on_confirm_select_ok,
+                                    replies=[pika.spec.Confirm.SelectOk],
+                                    one_shot=True)
+
+        # TODO define actual on_msg_delivery_confirmation
+        self._impl.confirm_delivery(callback=on_msg_delivery_confirmation,
+                                    nowait=nowait)
+
+        # TODO pump messages; also, if nowait=False, wait for
+        # on_confirm_select_ok
+
+        self._delivery_confirmation = True
+
     def force_data_events(self, enable):
         """Turn on and off forcing the blocking adapter to stop and look to see
         if there are any frames from RabbitMQ in the read buffer. By default
@@ -427,6 +705,117 @@ class SynchronousChannel(channel.Channel):
                     self.__clas__.__name__)
         pass
 
+    def exchange_bind(self, destination=None, source=None, routing_key='',
+                      nowait=False, arguments=None):
+        """Bind an exchange to another exchange.
+
+        :param destination: The destination exchange to bind
+        :type destination: str or unicode
+        :param source: The source exchange to bind to
+        :type source: str or unicode
+        :param routing_key: The routing key to bind on
+        :type routing_key: str or unicode
+        :param bool nowait: Do not wait for an Exchange.BindOk
+        :param dict arguments: Custom key/value pair arguments for the binding
+
+        """
+        # TODO define on_exchange_bind_ok
+        self._impl.exchange_bind(
+            callback=None if nowait else on_exchange_bind_ok,
+            destination=destination,
+            source=source,
+            routing_key=routing_key,
+            nowait=nowait,
+            arguments=arguments)
+        # TODO pump messages; also wait for exchange bind-ok if nowait is false
+
+    def exchange_declare(self, exchange=None,
+                         exchange_type='direct', passive=False, durable=False,
+                         auto_delete=False, internal=False, nowait=False,
+                         arguments=None, **kwargs):
+        """This method creates an exchange if it does not already exist, and if
+        the exchange exists, verifies that it is of the correct and expected
+        class.
+
+        If passive set, the server will reply with Declare-Ok if the exchange
+        already exists with the same name, and raise an error if not and if the
+        exchange does not already exist, the server MUST raise a channel
+        exception with reply code 404 (not found).
+
+        :param exchange: The exchange name consists of a non-empty sequence of
+                          these characters: letters, digits, hyphen, underscore,
+                          period, or colon.
+        :type exchange: str or unicode
+        :param str exchange_type: The exchange type to use
+        :param bool passive: Perform a declare or just check to see if it exists
+        :param bool durable: Survive a reboot of RabbitMQ
+        :param bool auto_delete: Remove when no more queues are bound to it
+        :param bool internal: Can only be published to by other exchanges
+        :param bool nowait: Do not expect an Exchange.DeclareOk response
+        :param dict arguments: Custom key/value pair arguments for the exchange
+        :param str type: via kwargs: the deprecated exchange type parameter
+
+        """
+        assert len(kwargs) <= 1, kwargs
+        
+        # TODO define on_exchange_declare_ok
+        self._impl.exchange_declare(
+            callback=None if nowait else on_exchange_declare_ok,
+            exchange=exchange,
+            exchange_type=exchange_type,
+            passive=passive,
+            durable=durable,
+            auto_delete=auto_delete,
+            internal=internal,
+            nowait=nowait,
+            arguments=arguments,
+            type=kwargs["type"] if kwargs else None)
+        # TODO pump messages; also wait for exchange declare-ok if nowait is
+        # false
+
+    def exchange_delete(self, exchange=None, if_unused=False, nowait=False):
+        """Delete the exchange.
+
+        :param exchange: The exchange name
+        :type exchange: str or unicode
+        :param bool if_unused: only delete if the exchange is unused
+        :param bool nowait: Do not wait for an Exchange.DeleteOk
+
+        """
+        # TODO define on_exchange_delete_ok
+        self._impl.exchange_delete(
+            callback=None if nowait else on_exchange_delete_ok,
+            exchange=exchange,
+            if_unused=if_unused,
+            nowait=nowait)
+        # TODO pump messages; also wait for exchange delete-ok if nowait is
+        # false
+
+    def exchange_unbind(self, destination=None, source=None, routing_key='',
+                        nowait=False, arguments=None):
+        """Unbind an exchange from another exchange.
+
+        :param destination: The destination exchange to unbind
+        :type destination: str or unicode
+        :param source: The source exchange to unbind from
+        :type source: str or unicode
+        :param routing_key: The routing key to unbind
+        :type routing_key: str or unicode
+        :param bool nowait: Do not wait for an Exchange.UnbindOk
+        :param dict arguments: Custom key/value pair arguments for the binding
+
+        """
+        # TODO define on_exchange_unbind_ok
+        self._impl.exchange_unbind(
+            callback=None if nowait else on_exchange_unbind_ok,
+            destination=destination,
+            source=source,
+            routing_key=routing_key,
+            nowait=nowait,
+            arguments=arguments)
+        # TODO pump messages; also wait for exchange unbind-ok if nowait is
+        # false
+
     def queue_bind(self, queue, exchange, routing_key=None, nowait=False,
                    arguments=None):
         """Bind the queue to the specified exchange
@@ -441,15 +830,14 @@ class SynchronousChannel(channel.Channel):
         :param dict arguments: Custom key/value pair arguments for the binding
 
         """
-        # TODO define actual bind_ok_callback
-        bind_ok_callback = None if nowait else bind_ok_callback
-        super(SynchronousChannel, self).queue_bind(callback=bind_ok_callback,
-                                                   queue=queue,
-                                                   exchange=exchange,
-                                                   routing_key=routing_key,
-                                                   nowait=nowait,
-                                                   arguments=arguments)
-        # TODO pump messages; also wait for bind-ok if nowait is false
+        # TODO define actual on_queue_bind_ok
+        self._impl.queue_bind(callback=None if nowait else on_queue_bind_ok,
+                              queue=queue,
+                              exchange=exchange,
+                              routing_key=routing_key,
+                              nowait=nowait,
+                              arguments=arguments)
+        # TODO pump messages; also wait for queue bind-ok if nowait is false
 
     def queue_declare(self, queue='', passive=False, durable=False,
                       exclusive=False, auto_delete=False, nowait=False,
@@ -471,15 +859,87 @@ class SynchronousChannel(channel.Channel):
         :param dict arguments: Custom key/value arguments for the queue
 
         """
-        # TODO define actual declare_ok_callback
-        declare_ok_callback = None if nowait else declare_ok_callback
-        super(SynchronousChannel, self).queue_declare(declare_ok_callback,
-                                                      queue=queue,
-                                                      passive=passive,
-                                                      durable=durable,
-                                                      exclusive=exclusive,
-                                                      auto_delete=auto_delete,
-                                                      nowait=nowait,
-                                                      arguments=arguments)
+        # TODO define actual on_queue_declare_ok
+        self._impl.queue_declare(
+            callback=None if nowait else on_queue_declare_ok,
+            queue=queue,
+            passive=passive,
+            durable=durable,
+            exclusive=exclusive,
+            auto_delete=auto_delete,
+            nowait=nowait,
+            arguments=arguments)
+        # TODO pump messages; also wait for queue declare-ok if nowait is false
 
-        # TODO pump messages; also wait for declare-ok if nowait is false
+    def queue_delete(self, queue='', if_unused=False, if_empty=False,
+                     nowait=False):
+        """Delete a queue from the broker.
+
+        :param queue: The queue to delete
+        :type queue: str or unicode
+        :param bool if_unused: only delete if it's unused
+        :param bool if_empty: only delete if the queue is empty
+        :param bool nowait: Do not wait for a Queue.DeleteOk
+
+        """
+        # TODO define on_queue_delete_ok
+        self._impl.queue_delete(callback=None if nowait else on_queue_delete_ok,
+                                queue=queue,
+                                if_unused=if_unused,
+                                if_empty=if_empty,
+                                nowait=nowait)
+        # TODO pump messages; also wait for queue delete-ok if nowait is false
+
+    def queue_purge(self, queue='', nowait=False):
+        """Purge all of the messages from the specified queue
+
+        :param queue: The queue to purge
+        :type  queue: str or unicode
+        :param bool nowait: Do not expect a Queue.PurgeOk response
+
+        """
+        # TODO define on_queue_purge_ok
+        self._impl.queue_purge(callback=None if nowait else on_queue_purge_ok,
+                               queue=queue,
+                               nowait=nowait)
+        # TODO pump messages; also wait for queue purge-ok if nowait is false
+
+    def queue_unbind(self, queue='', exchange=None, routing_key=None,
+                     arguments=None):
+        """Unbind a queue from an exchange.
+
+        :param queue: The queue to unbind from the exchange
+        :type queue: str or unicode
+        :param exchange: The source exchange to bind from
+        :type exchange: str or unicode
+        :param routing_key: The routing key to unbind
+        :type routing_key: str or unicode
+        :param dict arguments: Custom key/value pair arguments for the binding
+
+        """
+        # TODO define on_queue_unbind_ok
+        self._impl.queue_unbind(callback=None if nowait else on_queue_unbind_ok,
+                                queue=queue,
+                                exchange=exchange,
+                                routing_key=routing_key,
+                                arguments=arguments)
+        # TODO pump messages; also wait for queue unbind-ok if nowait is false
+
+    def tx_select(self):
+        """Select standard transaction mode. This method sets the channel to use
+        standard transactions. The client must use this method at least once on
+        a channel before using the Commit or Rollback methods.
+
+        """
+        self._impl.tx_select(on_tx_select_ok)
+        # TODO flush output and wait for tx select-ok
+
+    def tx_commit(self):
+        """Commit a transaction."""
+        self._impl.tx_commit(on_tx_commit_ok)
+        # TODO flush output and wait for tx commit-ok
+
+    def tx_rollback(self):
+        """Rollback a transaction."""
+        self._impl.tx_rollback(on_tx_rollback_ok)
+        # TODO flush output and wait for tx rollback-ok
