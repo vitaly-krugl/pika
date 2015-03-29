@@ -9,6 +9,7 @@ import time
 from pika.adapters.select_connection import SelectConnection
 import pika.channel
 from pika.callback import CallbackResult
+from pika import exceptions
 import pika.spec
 
 LOGGER = logging.getLogger(__name__)
@@ -57,6 +58,10 @@ class SynchronousConnection(object):
         # Receives on_close_callback args from Connection
         self._on_closed_args = CallbackResult(self._OnClosedArgs)
 
+        # Set to True when when user calls close() on the connection
+        # NOTE: this is a workaround to detect socket error because
+        # on_close_callback passes reason_code=0 when called due to socket error
+        self._user_initiated_close = False
 
         # TODO verify suitability of stop_ioloop_on_close value 
         self._impl = SelectConnection(
@@ -65,31 +70,72 @@ class SynchronousConnection(object):
             on_open_error_callback=self._on_open_error_args.set_value_once,
             on_close_callback=self._on_closed_args.set_value_once,
             stop_ioloop_on_close=False)
-        self._flush_output(self._on_open_args, self._on_open_error_args)
-        # TODO raise on failure
+
+        self._process_io_for_connection_setup()
+
+    def _clean_up(self):
+        """ Perform clean-up that is necessary for re-connecting
+
+        """
+        self._on_open_args.reset()
+        self._on_closed_args.reset()
+        self._on_open_error_args.reset()
+        self._user_initiated_close = False
+
+    def _process_io_for_connection_setup(self):
+        """ Perform follow-up processing for connection setup request: flush
+        connection output and process input while waiting for connection-open
+        or conneciton-error.
+
+        :raises AMQPConnectionError: on connection open error
+        """
+        self._flush_output(self._on_open_args.is_ready,
+                           self._on_open_error_args.is_ready)
+
+        if self._on_open_error_args.ready:
+            raise exceptions.AMQPConnectionError(
+                self._on_open_error_args.value.error_text)
+
+        assert self._on_open_args.ready
+        assert self._on_open_args.value.connection is self._impl
 
     def _flush_output(self, *waiters):
+        """ Flush output and process input while waiting for any of the given
+        callbacks to return true. The wait is aborted upon connection-close.
+        Otherwise, processing continues until the output if flushed AND at least
+        one of the callbacks returns true. If there are no callbacks, then
+        processing ends when all output is flushed.
+
+        :param waiters: sequence of zero or more callables taking no args and
+                        returning true when it's time to stop processing.
+                        Their results are OR'ed together.
         """
-        :param waiters: sequence of zero or more objects that signal readiness
-                        via the `ready` attribute evaluating to true
-        """
+        if self._impl.is_closed:
+            raise exceptions.ConnectionClosed()
+
         # Conditions for terminating the processing loop:
         #   connection closed
         #         OR
         #   empty outbound buffer and no waiters
         #         OR
         #   empty outbound buffer and any waiter is ready
-        is_done = (lambda:
+        check_completion = (lambda:
             self._on_closed_args.ready or
             (not self._impl.outbound_buffer and
-             (not waiters or any(waiter.ready for waiter in  waiters))))
+             (not waiters or any(ready() for ready in  waiters))))
 
-        self._impl._process_io_and_events(is_done)
+        self._impl._process_io_and_events(check_completion)
 
         if self._on_closed_args.ready:
             result = self._on_closed_args.value
+            LOGGER.critical('Connection close detected; result=%r', result)
             if result.reason_code not in [0, 200]:
                 raise exceptions.ConnectionClosed(*result)
+            elif not self._user_initiated_close:
+                # NOTE: unfortunately, upon socket error, on_close_callback
+                # presently passes reason_code=0, so we don't detect that as an
+                # error
+                raise exceptions.ConnectionClosed()
 
     def close(self, reply_code=200, reply_text='Normal shutdown'):
         """Disconnect from RabbitMQ. If there are any open channels, it will
@@ -101,14 +147,13 @@ class SynchronousConnection(object):
         :param str reply_text: The text reason for the close
 
         """
-        try:
-            LOGGER.info("Closing connection (%s): %s", reply_code, reply_text)
-            self._impl.close(reply_code, reply_text)
-            self._flush_output()
-        finally:
-            self._on_open_args.reset()
-            self._on_closed_args.reset()
-            self._on_open_error_args.reset()
+        LOGGER.info('Closing connection (%s): %s', reply_code, reply_text)
+        self._user_initiated_close = True
+        self._impl.close(reply_code, reply_text)
+
+        self._flush_output(self._on_closed_args.is_ready)
+
+        assert self._on_closed_args.ready
 
     def add_backpressure_callback(self, callback_method):
         """Call method "callback" when pika believes backpressure is being
@@ -189,8 +234,8 @@ class SynchronousConnection(object):
                 on_open_callback=openedArgs.set_value_once,
                 channel_number=None,
                 _channel_class=_ChannelWrapper)
-            # TODO pump messages and wait for on_channel_opened
-            self._flush_output(openedArgs)
+
+            self._flush_output(openedArgs.is_ready)
 
         return SynchronousChannel(channel, self)
 
@@ -203,8 +248,11 @@ class SynchronousConnection(object):
             'Connection was not closed; connection_state=%r'
             % (self._impl.connection_state,))
 
+        self._clean_up()
+
         self._impl.connect()
-        # TODO pump messages and wait for on_open_callback passed to constructor
+
+        self._process_io_for_connection_setup()
 
     def set_backpressure_multiplier(self, value=10):
         """Alter the backpressure multiplier value. We set this to 10 by default.
@@ -225,11 +273,10 @@ class SynchronousConnection(object):
         :param float duration: The time to sleep in seconds
 
         """
+        assert duration >= 0, duration
+
         deadline = time.time() + duration
-        while duration > 0:
-            # TODO define _process_events
-            self._impl._process_events(duration)
-            duration = time.time() - deadline
+        self._flush_output(lambda: time.time() >= deadline)
 
     #
     # Connections state properties

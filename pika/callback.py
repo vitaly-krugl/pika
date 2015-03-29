@@ -106,13 +106,12 @@ class CallbackResult(object):
                                      methods will be passed to this class.
                                         
         """
-        self.reset()
         self._value_class = value_class
+        self.reset()
 
     def reset(self):
         self._ready = False
         self._values = None
-        self._value_class = None
 
     def __enter__(self):
         """ Entry into context manager that automatically resets the object
@@ -131,10 +130,10 @@ class CallbackResult(object):
     def ready(self):
         return self._ready
 
-    def set_once(self):
+    def signal_once(self):
         """ Set as ready
 
-        :raises AssertionError: if result was already set
+        :raises AssertionError: if result was already signalled
         """
         assert not self._ready, '_CallbackResult was already set'
         self._ready = True
@@ -145,7 +144,7 @@ class CallbackResult(object):
 
         :raises AssertionError: if result was already set
         """
-        self.set_once()
+        self.signal_once()
         self._values = (self._value_class(*args, **kwargs),)
 
     def append_value(self, *args, **kwargs):
