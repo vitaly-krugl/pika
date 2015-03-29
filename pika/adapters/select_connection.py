@@ -76,6 +76,20 @@ class SelectConnection(BaseConnection):
         # events through the consumer
         self.ioloop.poller.poll(write_only=True)
 
+    def _process_io_and_events(self, is_done_callback):
+        """ Process i/o and timeouts until `is_done_callback` returns True
+
+        NOTE: used by SynchronousConnection
+       
+        :param is_done_callback: Callback that returns true when it's time to
+                                 stop processing
+        :type is_done_callback: bool is_done_callback()
+        """
+        while not is_done_callback():
+            self.ioloop.poller.poll()
+            self.ioloop.poller.process_timeouts()
+            self.ioloop.poller._manage_event_state()
+
 
 class IOLoop(object):
     """Singlton wrapper that decides which type of poller to use, creates an

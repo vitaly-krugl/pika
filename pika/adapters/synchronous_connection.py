@@ -2,42 +2,16 @@
 It's implemented as an adapter around SelectConnection.
 """
 
+from collections import namedtuple
 import logging
 import time
 
 from pika.adapters.select_connection import SelectConnection
 import pika.channel
+from pika.callback import CallbackResult
 import pika.spec
 
 LOGGER = logging.getLogger(__name__)
-
-
-class _CallbackResult(object):
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self._ready = False
-        self._value = None
-
-    def set(self):
-        assert not self._ready, "_CallbackResult was already ready"
-        self._ready = True
-
-    def set_value(self, value):
-        self.set()
-        self._value = value
-
-    def is_ready(self):
-        return self._ready
-
-    @property
-    def ready(self):
-        return self.is_ready()
-
-    @property
-    def value(self):
-        return self._value
 
 
 class _ChannelWrapper(pika.channel.Channel):
@@ -51,7 +25,21 @@ class _ChannelWrapper(pika.channel.Channel):
 
 class SynchronousConnection(object):
     """
+    TODO flesh out docstring
+
     """
+    # Connection-opened callback args
+    _OnOpenedArgs = namedtuple('_OnOpenedArgs', 'connection')
+
+    # Connection-establishment error callback args
+    _OnOpenErrorArgs = namedtuple('_OnOpenErrorArgs', 'connection error_text')
+
+    # Connection-closing callback args
+    _OnClosedArgs = namedtuple('_OnClosedArgs', 
+                               'connection reason_code reason_text')
+
+    # Channel-opened callback args
+    _OnChannelOpenedArgs = namedtuple('_OnChannelOpenedArgs', 'channel')
 
     def __init__(self, parameters=None):
         """Create a new instance of the Connection object.
@@ -60,15 +48,67 @@ class SynchronousConnection(object):
         :raises: RuntimeError
 
         """
-        # TODO define passed callbacks
+        # Receives on_open_callback args from Connection
+        self._on_open_args = CallbackResult(self._OnOpenedArgs)
+
+        # Receives on_open_error_callback args from Connection
+        self._on_open_error_args= CallbackResult(self._OnOpenErrorArgs)
+
+        # Receives on_close_callback args from Connection
+        self._on_closed_args = CallbackResult(self._OnClosedArgs)
+
+
         # TODO verify suitability of stop_ioloop_on_close value 
         self._impl = SelectConnection(
             parameters=parameters,
-            on_open_callback=on_connection_opened,
-            on_open_error_callback=on_open_error_callback,
-            on_close_callback=on_close_callback,
+            on_open_callback=self._on_open_args.set_value_once,
+            on_open_error_callback=self._on_open_error_args.set_value_once,
+            on_close_callback=self._on_closed_args.set_value_once,
             stop_ioloop_on_close=False)
-        # TODO pump messages
+        self._flush_output(self._on_open_args, self._on_open_error_args)
+        # TODO raise on failure
+
+    def _flush_output(self, *waiters):
+        """
+        :param waiters: sequence of zero or more objects that signal readiness
+                        via the `ready` attribute evaluating to true
+        """
+        # Conditions for terminating the processing loop:
+        #   connection closed
+        #         OR
+        #   empty outbound buffer and no waiters
+        #         OR
+        #   empty outbound buffer and any waiter is ready
+        is_done = (lambda:
+            self._on_closed_args.ready or
+            (not self._impl.outbound_buffer and
+             (not waiters or any(waiter.ready for waiter in  waiters))))
+
+        self._impl._process_io_and_events(is_done)
+
+        if self._on_closed_args.ready:
+            result = self._on_closed_args.value
+            if result.reason_code not in [0, 200]:
+                raise exceptions.ConnectionClosed(*result)
+
+    def close(self, reply_code=200, reply_text='Normal shutdown'):
+        """Disconnect from RabbitMQ. If there are any open channels, it will
+        attempt to close them prior to fully disconnecting. Channels which
+        have active consumers will attempt to send a Basic.Cancel to RabbitMQ
+        to cleanly stop the delivery of messages prior to closing the channel.
+
+        :param int reply_code: The code number for the close
+        :param str reply_text: The text reason for the close
+
+        """
+        try:
+            LOGGER.info("Closing connection (%s): %s", reply_code, reply_text)
+            self._impl.close(reply_code, reply_text)
+            self._flush_output()
+        finally:
+            self._on_open_args.reset()
+            self._on_closed_args.reset()
+            self._on_open_error_args.reset()
 
     def add_backpressure_callback(self, callback_method):
         """Call method "callback" when pika believes backpressure is being
@@ -144,12 +184,13 @@ class SynchronousConnection(object):
 
         :rtype: pika.synchronous_connection.SynchronousChannel
         """
-        # TODO define actual on_channel_opened
-        channel = self._impl.channel(
-            on_open_callback=on_channel_opened,
-            channel_number=None,
-            _channel_class=_ChannelWrapper)
-        # TODO pump messages and wait for on_channel_opened
+        with CallbackResult(self._OnChannelOpenedArgs) as openedArgs:
+            channel = self._impl.channel(
+                on_open_callback=openedArgs.set_value_once,
+                channel_number=None,
+                _channel_class=_ChannelWrapper)
+            # TODO pump messages and wait for on_channel_opened
+            self._flush_output(openedArgs)
 
         return SynchronousChannel(channel, self)
 
@@ -158,22 +199,12 @@ class SynchronousConnection(object):
         Connection object should connect on its own.
 
         """
+        assert not self._impl.is_open, (
+            'Connection was not closed; connection_state=%r'
+            % (self._impl.connection_state,))
+
         self._impl.connect()
         # TODO pump messages and wait for on_open_callback passed to constructor
-
-    def close(self, reply_code=200, reply_text='Normal shutdown'):
-        """Disconnect from RabbitMQ. If there are any open channels, it will
-        attempt to close them prior to fully disconnecting. Channels which
-        have active consumers will attempt to send a Basic.Cancel to RabbitMQ
-        to cleanly stop the delivery of messages prior to closing the channel.
-
-        :param int reply_code: The code number for the close
-        :param str reply_text: The text reason for the close
-
-        """
-        LOGGER.info("Closing connection (%s): %s", reply_code, reply_text)
-        self._impl.close(reply_code, reply_text)
-        # TODO pump messages
 
     def set_backpressure_multiplier(self, value=10):
         """Alter the backpressure multiplier value. We set this to 10 by default.
@@ -305,6 +336,11 @@ class SynchronousChannel(object):
         """
         self._impl = channel_impl
         self._connection = connection
+
+        # Whether `basic_publish` has been called at least once
+        self._basic_publish_used = False
+
+        # Whether RabbitMQ delivery confirmation has been enabled
         self._delivery_confirmation = False
 
         # TODO register for channel callbacks (on-error, on-cancel, etc.)
@@ -531,6 +567,8 @@ class SynchronousChannel(object):
                                     str or unicode)
 
         """
+        self._basic_publish_used = True
+
         # TODO define actual on_basic_get_ok
         self._impl.basic_get(callback=None if nowait else on_basic_get_ok,
                              queue=queue,
@@ -653,6 +691,24 @@ class SynchronousChannel(object):
         :param bool nowait: Do not send a reply frame (Confirm.SelectOk)
 
         """
+        if self._delivery_confirmation:
+            LOGGER.warn('confirm_delivery: confirmation was already enabled on '
+                        'channel=%s', self._impl.channel_number)
+
+        # Set it ahead of the call so that subsequent `basic_publish` calls
+        # will use logic appropriate for this mode
+        self._delivery_confirmation = True
+
+        if self._basic_publish_used:
+            # Force synchronization with the broker to flush any pending
+            # basic-returns on messages that might have been published
+            # prior to this call
+            if nowait:
+                LOGGER.warn('confirm_delivery: overriding nowait on channel=%s '
+                            'to force synchronization on previously-published '
+                            'channel', self._impl.channel_number)
+            nowait = False
+
         # TODO define actual on_confirm_select_ok
         if not nowait:
             self._impl.add_callback(callback=on_confirm_select_ok,
@@ -665,8 +721,6 @@ class SynchronousChannel(object):
 
         # TODO pump messages; also, if nowait=False, wait for
         # on_confirm_select_ok
-
-        self._delivery_confirmation = True
 
     def force_data_events(self, enable):
         """Turn on and off forcing the blocking adapter to stop and look to see
