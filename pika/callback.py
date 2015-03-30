@@ -160,6 +160,9 @@ class CallbackResult(object):
         else:
             self._values.append(value)
 
+        self._ready = True
+
+
     @property
     def value(self):
         """

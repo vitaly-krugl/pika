@@ -374,6 +374,22 @@ class SynchronousChannel(object):
 
     """
 
+    # Basic.Return args from broker
+    _OnMessageReturnedArgs = namedtuple(
+        '_OnMessageReturnedArgs',
+        [
+            'channel',       # implementation Channel instance
+            'method',        # spec.Basic.Return
+            'properties',    # pika.spec.BasicProperties
+            'body'           # returned message body (None or str/equivalent)
+        ])
+
+    # Broker's basic-ack/basic-nack when delivery confirmation is enabled;
+    # may concern a single or multiple messages
+    _OnMessageDeliveryReportArgs = namedtuple(
+        '_OnMessageDeliveryReportArgs',
+        'method_frame')
+
     def __init__(self, channel_impl, connection):
         """Create a new instance of the Channel
 
@@ -390,6 +406,17 @@ class SynchronousChannel(object):
 
         # Whether RabbitMQ delivery confirmation has been enabled
         self._delivery_confirmation = False
+
+        # Receives message delivery confirmation report (Basic.ack or
+        # Basic.nack) from broker when delivery confirmations are enabled
+        self._message_delivery_result = CallbackResult(
+            self._OnMessageDeliveryReportArgs)
+
+        # Receives Basic.Return results
+        self._message_return_results = CallbackResult(
+            self._OnMessageReturnedArgs)
+
+        self._impl.add_on_return_callback(self._on_message_returned)
 
         # TODO register for channel callbacks (on-error, on-cancel, etc.)
         # TODO register add_on_return_callback: here, if
@@ -451,6 +478,37 @@ class SynchronousChannel(object):
         # TODO: also monitor channel-closed, channel-error and raise as needed
         self._connection._flush_output(*waiters)
 
+    def _on_message_returned(self, args): #,  body):
+        """ Called as the result of Basic.Returns from broker. If
+        delivery-confirmation is enabled, appends the info to
+        self._message_return_results
+        
+        :param args: a 4-tuple of the following elements:
+                     pika.Channel channel: our self._impl channel
+                     pika.spec.Basic.Return method:
+                     pika.spec.BasicProperties properties: message properties
+                     str body: returned message body (may be None)
+        """
+        args = self._OnMessageReturnedArgs(*args)
+        
+        assert args.channel is self._impl, (
+            args.channel.channel_number, self._impl.channel_number)
+
+        assert isinstance(args.method, pika.spec.Basic.Return), args.method
+        assert isinstance(args.properties, pika.spec.BasicProperties), (
+            args.properties)
+
+        LOGGER.warn(
+            "Published message was returned: _delivery_confirmation=%s; "
+            "channel=%s; method=%r; properties=%r; body_size=%d; "
+            "body_prefix=%r", self._delivery_confirmation,
+            args.channel.channel_number, args.method, args.properties,
+            len(args.body) if args.body is not None else None,
+            args.body[:30] if args.body is not None else None)
+
+        if self._delivery_confirmation:
+            self._message_return_results.append_value(*args)
+
     def close(self, reply_code=0, reply_text="Normal Shutdown"):
         """Will invoke a clean shutdown of the channel with the AMQP Broker.
 
@@ -459,14 +517,18 @@ class SynchronousChannel(object):
 
         """
         LOGGER.info('Channel.close(%s, %s)', reply_code, reply_text)
-
-        with CallbackResult() as close_ok_result:
-            self._impl.add_callback(callback=close_ok_result.signal_once,
-                                    replies=[pika.spec.Channel.CloseOk],
-                                    one_shot=True)
-    
-            self._impl.close(reply_code=reply_code, reply_text=reply_text)
-            self._flush_output(close_ok_result.is_ready)
+        try:
+            with CallbackResult() as close_ok_result:
+                self._impl.add_callback(callback=close_ok_result.signal_once,
+                                        replies=[pika.spec.Channel.CloseOk],
+                                        one_shot=True)
+        
+                self._impl.close(reply_code=reply_code, reply_text=reply_text)
+                self._flush_output(close_ok_result.is_ready)
+        finally:
+            # Clean up members that might inhibit garbage collection
+            self._message_delivery_result.reset()
+            self._message_return_results.reset()
 
     def basic_ack(self, delivery_tag=0, multiple=False):
         """Acknowledge one or more messages. When sent by the client, this
@@ -644,8 +706,6 @@ class SynchronousChannel(object):
         """
         raise NotImplementedError
 
-        self._basic_publish_used = True
-
         # TODO define actual on_basic_get_ok
         self._impl.basic_get(callback=None if nowait else on_basic_get_ok,
                              queue=queue,
@@ -682,21 +742,46 @@ class SynchronousChannel(object):
                   Basic.nack or msg return) and True if the message was
                   delivered (Basic.ack and no msg return)
         """
-        if self._delivery_confirmation:
-            raise NotImplementedError("delivery confirmation not supported yet")
+        self._basic_publish_used = True
 
-        self._impl.basic_publish(exchange=exchange,
-                                 routing_key=routing_key,
-                                 body=body,
-                                 properties=properties,
-                                 mandatory=mandatory,
-                                 immediate=immediate)
-        self._flush_output()
-        # TODO: if _delivery_confirmation mode, also wait for
-        # confirmation that will come with callback registred via
-        # confirm_delivery: if ack and no msg-return yet
-        # (add_on_return_callback), then return success; if nack or msg-return,
-        # then return failure
+        self._message_return_results.reset()
+
+        with self._message_return_results, self._message_delivery_result:
+            self._impl.basic_publish(exchange=exchange,
+                                     routing_key=routing_key,
+                                     body=body,
+                                     properties=properties,
+                                     mandatory=mandatory,
+                                     immediate=immediate)
+            if self._delivery_confirmation:
+                self._flush_output(self._message_delivery_result.is_ready)
+                conf_method = (self._message_delivery_result.value
+                               .method_frame
+                               .method)
+                if isinstance(conf_method, pika.spec.Basic.Ack):
+                    if self._message_return_results.is_ready():
+                        # Message was returned by broker
+                        result = False
+                    else:
+                        # Broker accepted responsibility for message
+                        result = True
+                elif isinstance(conf_method, pika.spec.Basic.Nack):
+                    # Broker was unable to process the message due to internal
+                    # error
+                    LOGGER.warn(
+                        "Message was Nack'ed by broker: nack=%r; channel=%s; "
+                        "exchange=%s; routing_key=%s; mandatory=%r; "
+                        "immediate=%r", conf_method, self._impl.channel_number,
+                        exchange, routing_key, mandatory, immediate)
+                    result = False
+                else:
+                    raise ValueError('Unexpected method type: %r', conf_method)
+            else:
+                self._flush_output()
+                result = None  # Non-confirmation-mode result
+
+            
+            return result
 
     def basic_qos(self, prefetch_size=0, prefetch_count=0, all_channels=False):
         """Specify quality of service. This method requests a specific quality
@@ -773,15 +858,10 @@ class SynchronousChannel(object):
         :param bool nowait: Do not send a reply frame (Confirm.SelectOk)
 
         """
-        raise NotImplementedError
-
         if self._delivery_confirmation:
-            LOGGER.warn('confirm_delivery: confirmation was already enabled on '
-                        'channel=%s', self._impl.channel_number)
-
-        # Set it ahead of the call so that subsequent `basic_publish` calls
-        # will use logic appropriate for this mode
-        self._delivery_confirmation = True
+            LOGGER.error('confirm_delivery: confirmation was already enabled '
+                         'on channel=%s', self._impl.channel_number)
+            return
 
         if self._basic_publish_used:
             # Force synchronization with the broker to flush any pending
@@ -793,18 +873,22 @@ class SynchronousChannel(object):
                             'channel', self._impl.channel_number)
             nowait = False
 
-        # TODO define actual on_confirm_select_ok
-        if not nowait:
-            self._impl.add_callback(callback=on_confirm_select_ok,
-                                    replies=[pika.spec.Confirm.SelectOk],
-                                    one_shot=True)
+        with CallbackResult() as select_ok_result:
+            if not nowait:
+                self._impl.add_callback(callback=select_ok_result.signal_once,
+                                        replies=[pika.spec.Confirm.SelectOk],
+                                        one_shot=True)
+    
+            # TODO define actual on_msg_delivery_confirmation
+            self._impl.confirm_delivery(
+                callback=self._message_delivery_result.set_value_once,
+                nowait=nowait)
+            if nowait:
+                self._flush_output()
+            else:
+                self._flush_output(select_ok_result.is_ready)
 
-        # TODO define actual on_msg_delivery_confirmation
-        self._impl.confirm_delivery(callback=on_msg_delivery_confirmation,
-                                    nowait=nowait)
-
-        # TODO pump messages; also, if nowait=False, wait for
-        # on_confirm_select_ok
+        self._delivery_confirmation = True
 
     def force_data_events(self, enable):
         """Turn on and off forcing the blocking adapter to stop and look to see
