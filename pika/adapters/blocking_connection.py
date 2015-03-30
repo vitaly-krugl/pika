@@ -396,6 +396,8 @@ class BlockingConnection(base_connection.BaseConnection):
             LOGGER.warning("Disconnected from RabbitMQ at %s:%i (%s): %s",
                            self.params.host, self.params.port,
                            self.closing[0], self.closing[1])
+        # Save the codes because self.closing gets reset by _adapter_disconnect
+        reply_code, reply_text = self.closing
         self._set_connection_state(self.CONNECTION_CLOSED)
         self._remove_connection_callbacks()
         if not from_adapter:
@@ -403,8 +405,10 @@ class BlockingConnection(base_connection.BaseConnection):
         for channel in self._channels:
             self._channels[channel]._on_close(method_frame)
         self._remove_connection_callbacks()
-        if self.closing[0] not in [0, 200]:
-            raise exceptions.ConnectionClosed(*self.closing)
+        if reply_code not in [0, 200]:
+            LOGGER.error("Raising ConnectionClosed due to reply_code=%s",
+                         reply_code)
+            raise exceptions.ConnectionClosed(reply_code, reply_text)
 
     def _send_frame(self, frame_value):
         """This appends the fully generated frame to send to the broker to the
@@ -1159,6 +1163,8 @@ class BlockingChannel(channel.Channel):
         while wait and not self._received_response:
             try:
                 self.connection.process_data_events()
+            except exceptions.ConnectionClosed:
+                raise
             except exceptions.AMQPConnectionError:
                 break
         self._received_response = prev_received_response
