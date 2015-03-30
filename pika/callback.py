@@ -130,7 +130,7 @@ class CallbackResult(object):
     def ready(self):
         return self._ready
 
-    def signal_once(self):
+    def signal_once(self, *_args, **_kwargs):
         """ Set as ready
 
         :raises AssertionError: if result was already signalled

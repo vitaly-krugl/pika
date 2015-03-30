@@ -50,13 +50,13 @@ class SynchronousConnection(object):
 
         """
         # Receives on_open_callback args from Connection
-        self._on_open_args = CallbackResult(self._OnOpenedArgs)
+        self._opened_result = CallbackResult(self._OnOpenedArgs)
 
         # Receives on_open_error_callback args from Connection
-        self._on_open_error_args= CallbackResult(self._OnOpenErrorArgs)
+        self._open_error_result= CallbackResult(self._OnOpenErrorArgs)
 
         # Receives on_close_callback args from Connection
-        self._on_closed_args = CallbackResult(self._OnClosedArgs)
+        self._closed_result = CallbackResult(self._OnClosedArgs)
 
         # Set to True when when user calls close() on the connection
         # NOTE: this is a workaround to detect socket error because
@@ -66,9 +66,9 @@ class SynchronousConnection(object):
         # TODO verify suitability of stop_ioloop_on_close value 
         self._impl = SelectConnection(
             parameters=parameters,
-            on_open_callback=self._on_open_args.set_value_once,
-            on_open_error_callback=self._on_open_error_args.set_value_once,
-            on_close_callback=self._on_closed_args.set_value_once,
+            on_open_callback=self._opened_result.set_value_once,
+            on_open_error_callback=self._open_error_result.set_value_once,
+            on_close_callback=self._closed_result.set_value_once,
             stop_ioloop_on_close=False)
 
         self._process_io_for_connection_setup()
@@ -77,9 +77,9 @@ class SynchronousConnection(object):
         """ Perform clean-up that is necessary for re-connecting
 
         """
-        self._on_open_args.reset()
-        self._on_closed_args.reset()
-        self._on_open_error_args.reset()
+        self._opened_result.reset()
+        self._closed_result.reset()
+        self._open_error_result.reset()
         self._user_initiated_close = False
 
     def _process_io_for_connection_setup(self):
@@ -89,20 +89,20 @@ class SynchronousConnection(object):
 
         :raises AMQPConnectionError: on connection open error
         """
-        self._flush_output(self._on_open_args.is_ready,
-                           self._on_open_error_args.is_ready)
+        self._flush_output(self._opened_result.is_ready,
+                           self._open_error_result.is_ready)
 
-        if self._on_open_error_args.ready:
+        if self._open_error_result.ready:
             raise exceptions.AMQPConnectionError(
-                self._on_open_error_args.value.error_text)
+                self._open_error_result.value.error_text)
 
-        assert self._on_open_args.ready
-        assert self._on_open_args.value.connection is self._impl
+        assert self._opened_result.ready
+        assert self._opened_result.value.connection is self._impl
 
     def _flush_output(self, *waiters):
         """ Flush output and process input while waiting for any of the given
         callbacks to return true. The wait is aborted upon connection-close.
-        Otherwise, processing continues until the output if flushed AND at least
+        Otherwise, processing continues until the output is flushed AND at least
         one of the callbacks returns true. If there are no callbacks, then
         processing ends when all output is flushed.
 
@@ -120,14 +120,14 @@ class SynchronousConnection(object):
         #         OR
         #   empty outbound buffer and any waiter is ready
         check_completion = (lambda:
-            self._on_closed_args.ready or
+            self._closed_result.ready or
             (not self._impl.outbound_buffer and
              (not waiters or any(ready() for ready in  waiters))))
 
         self._impl._process_io_and_events(check_completion)
 
-        if self._on_closed_args.ready:
-            result = self._on_closed_args.value
+        if self._closed_result.ready:
+            result = self._closed_result.value
             LOGGER.critical('Connection close detected; result=%r', result)
             if result.reason_code not in [0, 200]:
                 raise exceptions.ConnectionClosed(*result)
@@ -151,9 +151,9 @@ class SynchronousConnection(object):
         self._user_initiated_close = True
         self._impl.close(reply_code, reply_text)
 
-        self._flush_output(self._on_closed_args.is_ready)
+        self._flush_output(self._closed_result.is_ready)
 
-        assert self._on_closed_args.ready
+        assert self._closed_result.ready
 
     def add_backpressure_callback(self, callback_method):
         """Call method "callback" when pika believes backpressure is being
@@ -232,12 +232,13 @@ class SynchronousConnection(object):
         with CallbackResult(self._OnChannelOpenedArgs) as openedArgs:
             channel = self._impl.channel(
                 on_open_callback=openedArgs.set_value_once,
-                channel_number=None,
+                channel_number=channel_number,
                 _channel_class=_ChannelWrapper)
 
-            self._flush_output(openedArgs.is_ready)
+            channel = SynchronousChannel(channel, self)
+            channel._flush_output(openedArgs.is_ready)
 
-        return SynchronousChannel(channel, self)
+        return channel
 
     def connect(self):
         """Invoke if trying to reconnect to a RabbitMQ server. Constructing the
@@ -399,6 +400,8 @@ class SynchronousChannel(object):
         #  callback should expect only one parameter, frame.
         #  http://www.rabbitmq.com/amqp-0-9-1-reference.html#basic.get
 
+        LOGGER.info("Created channel=%s", self._impl.channel_number)
+
     @property
     def connection(self):
         return self._connection
@@ -430,6 +433,24 @@ class SynchronousChannel(object):
         """
         return self._impl.is_open
 
+    def _flush_output(self, *waiters):
+        """ Flush output and process input while waiting for any of the given
+        callbacks to return true. The wait is aborted upon channel-close or
+        connection-close.
+        Otherwise, processing continues until the output is flushed AND at least
+        one of the callbacks returns true. If there are no callbacks, then
+        processing ends when all output is flushed.
+
+        :param waiters: sequence of zero or more callables taking no args and
+                        returning true when it's time to stop processing.
+                        Their results are OR'ed together.
+        """
+        if self._impl.is_closed:
+            raise exceptions.ChannelClosed()
+
+        # TODO: also monitor channel-closed, channel-error and raise as needed
+        self._connection._flush_output(*waiters)
+
     def close(self, reply_code=0, reply_text="Normal Shutdown"):
         """Will invoke a clean shutdown of the channel with the AMQP Broker.
 
@@ -439,13 +460,13 @@ class SynchronousChannel(object):
         """
         LOGGER.info('Channel.close(%s, %s)', reply_code, reply_text)
 
-        # TODO define actual on_channel_close_ok
-        self._impl.add_callback(callback=on_channel_close_ok,
-                                replies=[pika.spec.Channel.CloseOk],
-                                one_shot=True)
-
-        self._impl.close(reply_code=reply_code, reply_text=reply_text)
-        # TODO pump messages and wait for on_channel_close_ok
+        with CallbackResult() as close_ok_result:
+            self._impl.add_callback(callback=close_ok_result.signal_once,
+                                    replies=[pika.spec.Channel.CloseOk],
+                                    one_shot=True)
+    
+            self._impl.close(reply_code=reply_code, reply_text=reply_text)
+            self._flush_output(close_ok_result.is_ready)
 
     def basic_ack(self, delivery_tag=0, multiple=False):
         """Acknowledge one or more messages. When sent by the client, this
@@ -465,7 +486,7 @@ class SynchronousChannel(object):
                               acknowledgement of all outstanding messages.
         """
         self._imp.basic_ack(delivery_tag=delivery_tag, multiple=multiple)
-        # TODO flush output
+        self._flush_output()
 
     def basic_nack(self, delivery_tag=None, multiple=False, requeue=True):
         """This method allows a client to reject one or more incoming messages.
@@ -488,7 +509,7 @@ class SynchronousChannel(object):
         """
         self._impl.basic_nack(delivery_tag=delivery_tag, multiple=multiple,
                               requeue=requeue)
-        # TODO flush output
+        self._flush_output()
 
     def basic_consume(self, consumer_callback, queue='', no_ack=False,
                       exclusive=False, consumer_tag=None, arguments=None):
@@ -518,7 +539,7 @@ class SynchronousChannel(object):
             exclusive=exclusive,
             consumer_tag=consumer_tag,
             arguments=arguments)
-        # TODO Flush output
+        self._flush_output()
     
 
     def basic_cancel(self, consumer_tag='', nowait=False):
@@ -536,17 +557,21 @@ class SynchronousChannel(object):
         :param bool nowait: Do not expect a Basic.CancelOk response
 
         """
-        # TODO define actual on_consumer_cancel_ok
-        self._impl.basic_cancel(
-            callback=None if nowait else on_consumer_cancel_ok,
-            consumer_tag=consumer_tag,
-            nowait=nowait)
-        # TODO pump messages; also wait for cancel-ok if nowait is false
+        with CallbackResult() as cancel_ok_result:
+            self._impl.basic_cancel(
+                callback=None if nowait else cancel_ok_result.signal_once,
+                consumer_tag=consumer_tag,
+                nowait=nowait)
+            if nowait:
+                self._flush_output()
+            else:
+                self._flush_output(cancel_ok_result.is_ready)
 
     def start_consuming(self):
         """Starts consuming from registered callbacks."""
         # TODO
         pass
+        raise NotImplementedError
 
     def stop_consuming(self, consumer_tag=None):
         """Sends off the Basic.Cancel to let RabbitMQ know to stop consuming and
@@ -555,6 +580,7 @@ class SynchronousChannel(object):
         """
         # TODO
         pass
+        raise NotImplementedError
 
     def consume(self, queue, no_ack=False, exclusive=False):
         """Blocking consumption of a queue instead of via a callback. This
@@ -585,6 +611,7 @@ class SynchronousChannel(object):
         """
         # TODO borrow from BlockingChannel
         pass
+        raise NotImplementedError
 
     def cancel(self):
         """Cancel the consumption of a queue, rejecting all pending messages.
@@ -601,6 +628,7 @@ class SynchronousChannel(object):
         """
         # TODO borrow from BlockingChannel
         pass
+        raise NotImplementedError
 
     def basic_get(self, queue=None, no_ack=False):
         """Get a single message from the AMQP broker. Returns a set with the 
@@ -614,6 +642,8 @@ class SynchronousChannel(object):
                                     str or unicode)
 
         """
+        raise NotImplementedError
+
         self._basic_publish_used = True
 
         # TODO define actual on_basic_get_ok
@@ -652,13 +682,17 @@ class SynchronousChannel(object):
                   Basic.nack or msg return) and True if the message was
                   delivered (Basic.ack and no msg return)
         """
+        if self._delivery_confirmation:
+            raise NotImplementedError("delivery confirmation not supported yet")
+
         self._impl.basic_publish(exchange=exchange,
                                  routing_key=routing_key,
                                  body=body,
                                  properties=properties,
                                  mandatory=mandatory,
                                  immediate=immediate)
-        # TODO pump messages; if _delivery_confirmation mode, also wait for
+        self._flush_output()
+        # TODO: if _delivery_confirmation mode, also wait for
         # confirmation that will come with callback registred via
         # confirm_delivery: if ack and no msg-return yet
         # (add_on_return_callback), then return success; if nack or msg-return,
@@ -692,12 +726,12 @@ class SynchronousChannel(object):
         :param bool all_channels: Should the QoS apply to all channels
 
         """
-        # TODO define actual on_qos_ok
-        self._impl.basic_qos(callback=on_qos_ok,
-                             prefetch_size=prefetch_size,
-                             prefetch_count=prefetch_count,
-                             all_channels=all_channels)
-        # TODO pump messages and wait for on_qos_ok
+        with CallbackResult() as qos_ok_result:
+            self._impl.basic_qos(callback=qos_ok_result.signal_once,
+                                 prefetch_size=prefetch_size,
+                                 prefetch_count=prefetch_count,
+                                 all_channels=all_channels)
+            self._flush_output(qos_ok_result.is_ready)
 
     def basic_recover(self, requeue=False):
         """This method asks the server to redeliver all unacknowledged messages
@@ -710,9 +744,10 @@ class SynchronousChannel(object):
                              delivering it to an alternative subscriber.
 
         """
-        # TODO define actual on_recover_ok
-        self._impl.basic_recover(callback=on_recover_ok, requeue=requeue)
-        # TODO pump messages and wait for on_recover_ok
+        with CallbackResult() as recover_ok_result:
+            self._impl.basic_recover(callback=recover_ok_result.signal_once,
+                                     requeue=requeue)
+            self._flush_output(recover_ok_result.is_ready)
 
     def basic_reject(self, delivery_tag=None, requeue=True):
         """Reject an incoming message. This method allows a client to reject a
@@ -727,7 +762,7 @@ class SynchronousChannel(object):
 
         """
         self._impl.basic_reject(delivery_tag=delivery_tag, requeue=requeue)
-        # TODO flush output
+        self._flush_output()
 
     def confirm_delivery(self, nowait=False):
         """Turn on RabbitMQ-proprietary Confirm mode in the channel.
@@ -738,6 +773,8 @@ class SynchronousChannel(object):
         :param bool nowait: Do not send a reply frame (Confirm.SelectOk)
 
         """
+        raise NotImplementedError
+
         if self._delivery_confirmation:
             LOGGER.warn('confirm_delivery: confirmation was already enabled on '
                         'channel=%s', self._impl.channel_number)
@@ -820,15 +857,18 @@ class SynchronousChannel(object):
         :param dict arguments: Custom key/value pair arguments for the binding
 
         """
-        # TODO define on_exchange_bind_ok
-        self._impl.exchange_bind(
-            callback=None if nowait else on_exchange_bind_ok,
-            destination=destination,
-            source=source,
-            routing_key=routing_key,
-            nowait=nowait,
-            arguments=arguments)
-        # TODO pump messages; also wait for exchange bind-ok if nowait is false
+        with CallbackResult() as bind_ok_result:
+            self._impl.exchange_bind(
+                callback=None if nowait else bind_ok_result.signal_once,
+                destination=destination,
+                source=source,
+                routing_key=routing_key,
+                nowait=nowait,
+                arguments=arguments)
+            if nowait:
+                self._flush_output()
+            else:
+                self._flush_output(bind_ok_result.is_ready)
 
     def exchange_declare(self, exchange=None,
                          exchange_type='direct', passive=False, durable=False,
@@ -859,20 +899,22 @@ class SynchronousChannel(object):
         """
         assert len(kwargs) <= 1, kwargs
         
-        # TODO define on_exchange_declare_ok
-        self._impl.exchange_declare(
-            callback=None if nowait else on_exchange_declare_ok,
-            exchange=exchange,
-            exchange_type=exchange_type,
-            passive=passive,
-            durable=durable,
-            auto_delete=auto_delete,
-            internal=internal,
-            nowait=nowait,
-            arguments=arguments,
-            type=kwargs["type"] if kwargs else None)
-        # TODO pump messages; also wait for exchange declare-ok if nowait is
-        # false
+        with CallbackResult() as declare_ok_result:
+            self._impl.exchange_declare(
+                callback=None if nowait else declare_ok_result.signal_once,
+                exchange=exchange,
+                exchange_type=exchange_type,
+                passive=passive,
+                durable=durable,
+                auto_delete=auto_delete,
+                internal=internal,
+                nowait=nowait,
+                arguments=arguments,
+                type=kwargs["type"] if kwargs else None)
+            if nowait:
+                self._flush_output()
+            else:
+                self._flush_output(declare_ok_result.is_ready)
 
     def exchange_delete(self, exchange=None, if_unused=False, nowait=False):
         """Delete the exchange.
@@ -883,14 +925,16 @@ class SynchronousChannel(object):
         :param bool nowait: Do not wait for an Exchange.DeleteOk
 
         """
-        # TODO define on_exchange_delete_ok
-        self._impl.exchange_delete(
-            callback=None if nowait else on_exchange_delete_ok,
-            exchange=exchange,
-            if_unused=if_unused,
-            nowait=nowait)
-        # TODO pump messages; also wait for exchange delete-ok if nowait is
-        # false
+        with CallbackResult() as delete_ok_result:
+            self._impl.exchange_delete(
+                callback=None if nowait else delete_ok_result.signal_once,
+                exchange=exchange,
+                if_unused=if_unused,
+                nowait=nowait)
+            if nowait:
+                self._flush_output()
+            else:
+                self._flush_output(delete_ok_result.is_ready)
 
     def exchange_unbind(self, destination=None, source=None, routing_key='',
                         nowait=False, arguments=None):
@@ -906,16 +950,18 @@ class SynchronousChannel(object):
         :param dict arguments: Custom key/value pair arguments for the binding
 
         """
-        # TODO define on_exchange_unbind_ok
-        self._impl.exchange_unbind(
-            callback=None if nowait else on_exchange_unbind_ok,
-            destination=destination,
-            source=source,
-            routing_key=routing_key,
-            nowait=nowait,
-            arguments=arguments)
-        # TODO pump messages; also wait for exchange unbind-ok if nowait is
-        # false
+        with CallbackResult() as unbind_ok_result:
+            self._impl.exchange_unbind(
+                callback=None if nowait else unbind_ok_result.signal_once,
+                destination=destination,
+                source=source,
+                routing_key=routing_key,
+                nowait=nowait,
+                arguments=arguments)
+            if nowait:
+                self._flush_output()
+            else:
+                self._flush_output(unbind_ok_result.is_ready)
 
     def queue_bind(self, queue, exchange, routing_key=None, nowait=False,
                    arguments=None):
@@ -931,14 +977,17 @@ class SynchronousChannel(object):
         :param dict arguments: Custom key/value pair arguments for the binding
 
         """
-        # TODO define actual on_queue_bind_ok
-        self._impl.queue_bind(callback=None if nowait else on_queue_bind_ok,
-                              queue=queue,
-                              exchange=exchange,
-                              routing_key=routing_key,
-                              nowait=nowait,
-                              arguments=arguments)
-        # TODO pump messages; also wait for queue bind-ok if nowait is false
+        with CallbackResult() as bind_ok_result:
+            self._impl.queue_bind(callback=None if nowait else bind_ok_result.signal_once,
+                                  queue=queue,
+                                  exchange=exchange,
+                                  routing_key=routing_key,
+                                  nowait=nowait,
+                                  arguments=arguments)
+            if nowait:
+                self._flush_output()
+            else:
+                self._flush_output(bind_ok_result.is_ready)
 
     def queue_declare(self, queue='', passive=False, durable=False,
                       exclusive=False, auto_delete=False, nowait=False,
@@ -960,17 +1009,20 @@ class SynchronousChannel(object):
         :param dict arguments: Custom key/value arguments for the queue
 
         """
-        # TODO define actual on_queue_declare_ok
-        self._impl.queue_declare(
-            callback=None if nowait else on_queue_declare_ok,
-            queue=queue,
-            passive=passive,
-            durable=durable,
-            exclusive=exclusive,
-            auto_delete=auto_delete,
-            nowait=nowait,
-            arguments=arguments)
-        # TODO pump messages; also wait for queue declare-ok if nowait is false
+        with CallbackResult() as declare_ok_result:
+            self._impl.queue_declare(
+                callback=None if nowait else declare_ok_result.signal_once,
+                queue=queue,
+                passive=passive,
+                durable=durable,
+                exclusive=exclusive,
+                auto_delete=auto_delete,
+                nowait=nowait,
+                arguments=arguments)
+            if nowait:
+                self._flush_output()
+            else:
+                self._flush_output(declare_ok_result.is_ready)
 
     def queue_delete(self, queue='', if_unused=False, if_empty=False,
                      nowait=False):
@@ -983,13 +1035,16 @@ class SynchronousChannel(object):
         :param bool nowait: Do not wait for a Queue.DeleteOk
 
         """
-        # TODO define on_queue_delete_ok
-        self._impl.queue_delete(callback=None if nowait else on_queue_delete_ok,
-                                queue=queue,
-                                if_unused=if_unused,
-                                if_empty=if_empty,
-                                nowait=nowait)
-        # TODO pump messages; also wait for queue delete-ok if nowait is false
+        with CallbackResult() as delete_ok_result:
+            self._impl.queue_delete(callback=None if nowait else delete_ok_result.signal_once,
+                                    queue=queue,
+                                    if_unused=if_unused,
+                                    if_empty=if_empty,
+                                    nowait=nowait)
+            if nowait:
+                self._flush_output()
+            else:
+                self._flush_output(delete_ok_result.is_ready)
 
     def queue_purge(self, queue='', nowait=False):
         """Purge all of the messages from the specified queue
@@ -999,11 +1054,14 @@ class SynchronousChannel(object):
         :param bool nowait: Do not expect a Queue.PurgeOk response
 
         """
-        # TODO define on_queue_purge_ok
-        self._impl.queue_purge(callback=None if nowait else on_queue_purge_ok,
-                               queue=queue,
-                               nowait=nowait)
-        # TODO pump messages; also wait for queue purge-ok if nowait is false
+        with CallbackResult() as purge_ok_result:
+            self._impl.queue_purge(callback=None if nowait else purge_ok_result.signal_once,
+                                   queue=queue,
+                                   nowait=nowait)
+            if nowait:
+                self._flush_output()
+            else:
+                self._flush_output(purge_ok_result.is_ready)
 
     def queue_unbind(self, queue='', exchange=None, routing_key=None,
                      arguments=None):
@@ -1018,13 +1076,16 @@ class SynchronousChannel(object):
         :param dict arguments: Custom key/value pair arguments for the binding
 
         """
-        # TODO define on_queue_unbind_ok
-        self._impl.queue_unbind(callback=None if nowait else on_queue_unbind_ok,
-                                queue=queue,
-                                exchange=exchange,
-                                routing_key=routing_key,
-                                arguments=arguments)
-        # TODO pump messages; also wait for queue unbind-ok if nowait is false
+        with CallbackResult() as unbind_ok_result:
+            self._impl.queue_unbind(callback=None if nowait else unbind_ok_result.signal_once,
+                                    queue=queue,
+                                    exchange=exchange,
+                                    routing_key=routing_key,
+                                    arguments=arguments)
+            if nowait:
+                self._flush_output()
+            else:
+                self._flush_output(unbind_ok_result.is_ready)
 
     def tx_select(self):
         """Select standard transaction mode. This method sets the channel to use
@@ -1032,15 +1093,18 @@ class SynchronousChannel(object):
         a channel before using the Commit or Rollback methods.
 
         """
-        self._impl.tx_select(on_tx_select_ok)
-        # TODO flush output and wait for tx select-ok
+        with CallbackResult() as select_ok_result:
+            self._impl.tx_select(select_ok_result.signal_once)
+            self._flush_output(select_ok_result.is_ready)
 
     def tx_commit(self):
         """Commit a transaction."""
-        self._impl.tx_commit(on_tx_commit_ok)
-        # TODO flush output and wait for tx commit-ok
+        with CallbackResult() as commit_ok_result:
+            self._impl.tx_commit(commit_ok_result.signal_once)
+            self._flush_output(commit_ok_result.is_ready)
 
     def tx_rollback(self):
         """Rollback a transaction."""
-        self._impl.tx_rollback(on_tx_rollback_ok)
-        # TODO flush output and wait for tx rollback-ok
+        with CallbackResult() as rollback_ok_result:
+            self._impl.tx_rollback(rollback_ok_result.signal_once)
+            self._flush_output(rollback_ok_result.is_ready)
