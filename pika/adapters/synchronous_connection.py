@@ -419,9 +419,6 @@ class SynchronousChannel(object):
         self._impl.add_on_return_callback(self._on_message_returned)
 
         # TODO register for channel callbacks (on-error, on-cancel, etc.)
-        # TODO register add_on_return_callback: here, if
-        #  _delivery_confirmation is False, we log.warn and drop returned
-        #  messages.
         # TODO Register on_channel_close via Channel.add_on_close_callback()
         # TODO Register callback for Basic.GetEmpty via Channel.add_callback()
         #  callback should expect only one parameter, frame.
