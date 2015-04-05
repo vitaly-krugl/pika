@@ -6,10 +6,11 @@ from collections import namedtuple
 import logging
 import time
 
-from pika.adapters.select_connection import SelectConnection
 import pika.channel
 from pika import exceptions
 import pika.spec
+# NOTE: import SelectConnection after others to avoid circular depenency
+from pika.adapters.select_connection import SelectConnection
 
 LOGGER = logging.getLogger(__name__)
 
@@ -139,20 +140,20 @@ class SynchronousConnection(object):
 
     """
     # Connection-opened callback args
-    _OnOpenedArgs = namedtuple('SynchronousConnection._OnOpenedArgs',
+    _OnOpenedArgs = namedtuple('SynchronousConnection__OnOpenedArgs',
                                'connection')
 
     # Connection-establishment error callback args
-    _OnOpenErrorArgs = namedtuple('SynchronousConnection._OnOpenErrorArgs',
+    _OnOpenErrorArgs = namedtuple('SynchronousConnection__OnOpenErrorArgs',
                                   'connection error_text')
 
     # Connection-closing callback args
-    _OnClosedArgs = namedtuple('SynchronousConnection._OnClosedArgs',
+    _OnClosedArgs = namedtuple('SynchronousConnection__OnClosedArgs',
                                'connection reason_code reason_text')
 
     # Channel-opened callback args
     _OnChannelOpenedArgs = namedtuple(
-        'SynchronousConnection._OnChannelOpenedArgs',
+        'SynchronousConnection__OnChannelOpenedArgs',
         'channel')
 
     def __init__(self, parameters=None):
@@ -455,7 +456,7 @@ class SynchronousChannel(object):
     # `SynchronousChannel.consume_messages()` yields incoming messages as
     # instances of this class
     Delivery = namedtuple(
-        'SynchronousChannel.Delivery'
+        'SynchronousChannel_Delivery',
         [
             'consumer_tag', # str
             'delivery_tag', # str
@@ -469,14 +470,14 @@ class SynchronousChannel(object):
     # `SynchronousChannel.consume_messages()` yields server-initiated consumer
     # cancellation notices as instances of this class
     ConsumerCancellation = namedtuple(
-        'SynchronousChannel.ConsumerCancellation',
+        'SynchronousChannel_ConsumerCancellation',
         [
             'consumer_tag'      # str
         ])
 
     # Basic.Return args from broker
     _OnMessageReturnedArgs = namedtuple(
-        'SynchronousChannel._OnMessageReturnedArgs',
+        'SynchronousChannel__OnMessageReturnedArgs',
         [
             'channel',       # implementation Channel instance
             'method',        # spec.Basic.Return
@@ -487,7 +488,7 @@ class SynchronousChannel(object):
 
     # Basic.Deliver args from broker
     _OnMessageDeliveredArgs = namedtuple(
-        'SynchronousChannel._OnMessageDeliveredArgs',
+        'SynchronousChannel__OnMessageDeliveredArgs',
         [
             'channel',       # implementation Channel instance
             'method',        # Basic.Deliver or Basic.Cancel
@@ -499,7 +500,7 @@ class SynchronousChannel(object):
     # For use by any _CallbackResult that expects method_frame as the only
     # arg
     _MethodFrameCallbackResultArgs = namedtuple(
-        'SynchronousChannel._MethodFrameCallbackResultArgs',
+        'SynchronousChannel__MethodFrameCallbackResultArgs',
         'method_frame')
 
     # Broker's basic-ack/basic-nack when delivery confirmation is enabled;
@@ -516,7 +517,7 @@ class SynchronousChannel(object):
     # holds the broker's non-zero error code and reply_text holds the
     # corresponding error message text.
     _OnChannelClosedByBrokerArgs = namedtuple(
-        'SynchronousChannel._OnChannelClosedByBrokerArgs',
+        'SynchronousChannel__OnChannelClosedByBrokerArgs',
         'channel reply_code reply_text')
 
 
