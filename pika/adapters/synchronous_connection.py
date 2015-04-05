@@ -8,7 +8,6 @@ import time
 
 from pika.adapters.select_connection import SelectConnection
 import pika.channel
-from pika.callback import CallbackResult
 from pika import exceptions
 import pika.spec
 
@@ -24,23 +23,137 @@ class _ChannelWrapper(pika.channel.Channel):
     pass
 
 
+class _CallbackResult(object):
+    """ CallbackResult is a non-thread-safe implementation for receiving
+    callback results; INTERNAL USE ONLY!
+    """
+    def __init__(self, value_class=None):
+        """
+        :param callable value_class: only needed if the CallbackResult
+                                     instance will be used with
+                                     `set_value_once` and `append_element`.
+                                     *args and **kwargs of the value setter
+                                     methods will be passed to this class.
+                                        
+        """
+        self._value_class = value_class
+        self.reset()
+
+    def reset(self):
+        self._ready = False
+        self._values = None
+
+    def __bool__(self):
+        """ Called by python runtime to implement truth value testing and the
+        built-in operation bool(); NOTE: python 3.x
+        """
+        return self.is_ready()
+
+    # NOTE: python 2.x version of __bool__
+    __nonzero__ = __bool__
+
+    def __enter__(self):
+        """ Entry into context manager that automatically resets the object
+        on exit; this usage pattern helps garbage-collection by eliminating
+        potential circular references.
+        """
+        return self
+
+    def __exit__(self, *args, **kwargs):
+        self.reset()
+
+    def is_ready(self):
+        return self._ready
+    
+    @property
+    def ready(self):
+        return self._ready
+
+    def signal_once(self, *_args, **_kwargs):
+        """ Set as ready
+
+        :raises AssertionError: if result was already signalled
+        """
+        assert not self._ready, '_CallbackResult was already set'
+        self._ready = True
+
+    def set_value_once(self, *args, **kwargs):
+        """ Set as ready with value; the value may be retrived via the `value`
+        property getter
+
+        :raises AssertionError: if result was already set
+        """
+        self.signal_once()
+        self._values = (self._value_class(*args, **kwargs),)
+
+    def append_element(self, *args, **kwargs):
+        """
+        """
+        assert not self._ready or isinstance(self._values, list), (
+            '_CallbackResult state is incompatible with append_element: '
+            'ready=%r; values=%r' % (self._ready, self._values))
+
+        value = self._value_class(*args, **kwargs)
+        if self._values is None:
+            self._values = [value]
+        else:
+            self._values.append(value)
+
+        self._ready = True
+
+
+    @property
+    def value(self):
+        """
+        :returns: a reference to the value that was set via `set_value_once`
+        :raises AssertionError: if result was not set or value is incompatible
+                                with `set_value_once`
+        """
+        assert self._ready, '_CallbackResult was not set'
+        assert isinstance(self._values, tuple) and len(self._values) == 1, (
+            '_CallbackResult value is incompatible with set_value_once: %r'
+            % (self._values,))
+
+        return self._values[0]
+
+
+    @property
+    def elements(self):
+        """
+        :returns: a reference to the list containing one or more elements that
+            were added via `append_element`
+        :raises AssertionError: if result was not set or value is incompatible
+                                with `append_element`
+        """
+        assert self._ready, '_CallbackResult was not set'
+        assert isinstance(self._values, list) and len(self._values) > 0, (
+            '_CallbackResult value is incompatible with append_element: %r'
+            % (self._values,))
+
+        return self._values
+
+
 class SynchronousConnection(object):
     """
     TODO flesh out docstring
 
     """
     # Connection-opened callback args
-    _OnOpenedArgs = namedtuple('_OnOpenedArgs', 'connection')
+    _OnOpenedArgs = namedtuple('SynchronousConnection._OnOpenedArgs',
+                               'connection')
 
     # Connection-establishment error callback args
-    _OnOpenErrorArgs = namedtuple('_OnOpenErrorArgs', 'connection error_text')
+    _OnOpenErrorArgs = namedtuple('SynchronousConnection._OnOpenErrorArgs',
+                                  'connection error_text')
 
     # Connection-closing callback args
-    _OnClosedArgs = namedtuple('_OnClosedArgs', 
+    _OnClosedArgs = namedtuple('SynchronousConnection._OnClosedArgs',
                                'connection reason_code reason_text')
 
     # Channel-opened callback args
-    _OnChannelOpenedArgs = namedtuple('_OnChannelOpenedArgs', 'channel')
+    _OnChannelOpenedArgs = namedtuple(
+        'SynchronousConnection._OnChannelOpenedArgs',
+        'channel')
 
     def __init__(self, parameters=None):
         """Create a new instance of the Connection object.
@@ -50,13 +163,13 @@ class SynchronousConnection(object):
 
         """
         # Receives on_open_callback args from Connection
-        self._opened_result = CallbackResult(self._OnOpenedArgs)
+        self._opened_result = _CallbackResult(self._OnOpenedArgs)
 
         # Receives on_open_error_callback args from Connection
-        self._open_error_result= CallbackResult(self._OnOpenErrorArgs)
+        self._open_error_result= _CallbackResult(self._OnOpenErrorArgs)
 
         # Receives on_close_callback args from Connection
-        self._closed_result = CallbackResult(self._OnClosedArgs)
+        self._closed_result = _CallbackResult(self._OnClosedArgs)
 
         # Set to True when when user calls close() on the connection
         # NOTE: this is a workaround to detect socket error because
@@ -85,7 +198,7 @@ class SynchronousConnection(object):
     def _process_io_for_connection_setup(self):
         """ Perform follow-up processing for connection setup request: flush
         connection output and process input while waiting for connection-open
-        or conneciton-error.
+        or connection-error.
 
         :raises AMQPConnectionError: on connection open error
         """
@@ -164,41 +277,6 @@ class SynchronousConnection(object):
         """
         self._impl.add_backpressure_callback(callback_method)
 
-    def add_on_close_callback(self, callback_method_unused):
-        """This is not supported in SynchronousConnection. When a connection is
-        closed in SynchronousConnection, a pika.exceptions.ConnectionClosed
-        exception will be raised instead.
-
-        :param method callback_method_unused: Unused
-        :raises: NotImplementedError
-
-        """
-        raise NotImplementedError('SynchronousConnection will raise '
-                                  'ConnectionClosed exception')
-
-    def add_on_open_callback(self, callback_method_unused):
-        """This method is not supported in SynchronousConnection.
-
-        :param method callback_method_unused: Unused
-        :raises: NotImplementedError
-
-        """
-        raise NotImplementedError('Connection callbacks not supported in '
-                                  'SynchronousConnection')
-
-    def add_on_open_error_callback(self, callback_method_unused,
-                                   remove_default=False):
-        """This method is not supported in SynchronousConnection.
-
-        A pika.exceptions.AMQPConnectionError will be raised instead.
-
-        :param method callback_method_unused: Unused
-        :raises: NotImplementedError
-
-        """
-        raise NotImplementedError('Connection callbacks not supported in '
-                                  'SynchronousConnection')
-
     def add_timeout(self, deadline, callback_method):
         """Add the callback_method to the IOLoop timer to fire after deadline
         seconds. Returns a handle to the timeout. Do not confuse with
@@ -210,7 +288,7 @@ class SynchronousConnection(object):
         :returns: timeout id
 
         """
-        self._impl.add_timeout(deadline, callback_method)
+        return self._impl.add_timeout(deadline, callback_method)
 
     def remove_timeout(self, timeout_id):
         """Remove the timeout from the IOLoop by the ID returned from
@@ -229,7 +307,7 @@ class SynchronousConnection(object):
 
         :rtype: pika.synchronous_connection.SynchronousChannel
         """
-        with CallbackResult(self._OnChannelOpenedArgs) as openedArgs:
+        with _CallbackResult(self._OnChannelOpenedArgs) as openedArgs:
             channel = self._impl.channel(
                 on_open_callback=openedArgs.set_value_once,
                 channel_number=channel_number,
@@ -374,9 +452,31 @@ class SynchronousChannel(object):
 
     """
 
+    # `SynchronousChannel.consume_messages()` yields incoming messages as
+    # instances of this class
+    Delivery = namedtuple(
+        'SynchronousChannel.Delivery'
+        [
+            'consumer_tag', # str
+            'delivery_tag', # str
+            'redelivered',  # bool
+            'exchange',     # str
+            'routing_key',  # str
+            'properties',   # pika.BasicProperties
+            'body'          # str or equivalent
+        ])
+
+    # `SynchronousChannel.consume_messages()` yields server-initiated consumer
+    # cancellation notices as instances of this class
+    ConsumerCancellation = namedtuple(
+        'SynchronousChannel.ConsumerCancellation',
+        [
+            'consumer_tag'      # str
+        ])
+
     # Basic.Return args from broker
     _OnMessageReturnedArgs = namedtuple(
-        '_OnMessageReturnedArgs',
+        'SynchronousChannel._OnMessageReturnedArgs',
         [
             'channel',       # implementation Channel instance
             'method',        # spec.Basic.Return
@@ -384,11 +484,41 @@ class SynchronousChannel(object):
             'body'           # returned message body (None or str/equivalent)
         ])
 
+
+    # Basic.Deliver args from broker
+    _OnMessageDeliveredArgs = namedtuple(
+        'SynchronousChannel._OnMessageDeliveredArgs',
+        [
+            'channel',       # implementation Channel instance
+            'method',        # Basic.Deliver or Basic.Cancel
+            'properties',    # pika.spec.BasicProperties; ignore if Basic.Cancel
+            'body'           # returned message body; ignore if Basic.Cancel
+        ])
+
+
+    # For use by any _CallbackResult that expects method_frame as the only
+    # arg
+    _MethodFrameCallbackResultArgs = namedtuple(
+        'SynchronousChannel._MethodFrameCallbackResultArgs',
+        'method_frame')
+
     # Broker's basic-ack/basic-nack when delivery confirmation is enabled;
     # may concern a single or multiple messages
-    _OnMessageDeliveryReportArgs = namedtuple(
-        '_OnMessageDeliveryReportArgs',
-        'method_frame')
+    _OnMessageConfirmationReportArgs = _MethodFrameCallbackResultArgs
+
+    # Broker-initiated consumer cancel notification args from Basic.Cancel
+    _OnConsumerCanceledByBrokerArgs = _MethodFrameCallbackResultArgs
+
+    # Basic.GetEmpty response args
+    _OnGetEmptyResponseArgs = _MethodFrameCallbackResultArgs
+
+    # Parameters for broker-inititated Channel.Close request: reply_code
+    # holds the broker's non-zero error code and reply_text holds the
+    # corresponding error message text.
+    _OnChannelClosedByBrokerArgs = namedtuple(
+        'SynchronousChannel._OnChannelClosedByBrokerArgs',
+        'channel reply_code reply_text')
+
 
     def __init__(self, channel_impl, connection):
         """Create a new instance of the Channel
@@ -409,20 +539,52 @@ class SynchronousChannel(object):
 
         # Receives message delivery confirmation report (Basic.ack or
         # Basic.nack) from broker when delivery confirmations are enabled
-        self._message_delivery_result = CallbackResult(
-            self._OnMessageDeliveryReportArgs)
+        self._message_confirmation_result = _CallbackResult(
+            self._OnMessageConfirmationReportArgs)
 
-        # Receives Basic.Return results
-        self._message_return_results = CallbackResult(
+        # Receives Basic.Return results when published messages are returned by
+        # broker
+        self._message_return_results = _CallbackResult(
             self._OnMessageReturnedArgs)
 
         self._impl.add_on_return_callback(self._on_message_returned)
 
-        # TODO register for channel callbacks (on-error, on-cancel, etc.)
-        # TODO Register on_channel_close via Channel.add_on_close_callback()
-        # TODO Register callback for Basic.GetEmpty via Channel.add_callback()
-        #  callback should expect only one parameter, frame.
+        # Receives multiple consumer message delivery notifications and is also
+        # overloaded to receive Basic.Cancel notifications from rabbitmq
+        self._message_delivery_results = _CallbackResult(
+            self._OnMessageDeliveredArgs)
+
+        self._impl.add_on_cancel_callback(
+            lambda method_frame:
+                self._message_delivery_results.append_element(
+                    channel=self._impl,
+                    method=method_frame.method,
+                    properties=None,
+                    body=None))
+
+        # Receives (possibly multiple) notifications corresponding
+        # to broker-inititated Basic.Cancel requests
+        #self._consumer_canceled_by_broker_results = _CallbackResult(
+        #    self._OnConsumerCanceledByBrokerArgs)
+
+        # Receives the broker-inititated Channel.Close parameters
+        self._channel_closed_by_broker_result = _CallbackResult(
+            self._OnChannelClosedByBrokerArgs)
+
+        self._impl.add_callback(
+            self._channel_closed_by_broker_result.set_value_once,
+            replies=[pika.spec.Channel.Close],
+            one_shot=True)
+
+        # Receives args from Basic.GetEmpty response
         #  http://www.rabbitmq.com/amqp-0-9-1-reference.html#basic.get
+        self._nothing_to_get_result = _CallbackResult(
+            self._OnGetEmptyResponseArgs)
+
+        self._impl.add_callback(
+            self._nothing_to_get_result.set_value_once,
+            replies=[pika.spec.Basic.GetEmpty],
+            one_shot=False)
 
         LOGGER.info("Created channel=%s", self._impl.channel_number)
 
@@ -472,10 +634,16 @@ class SynchronousChannel(object):
         if self._impl.is_closed:
             raise exceptions.ChannelClosed()
 
-        # TODO: also monitor channel-closed, channel-error and raise as needed
-        self._connection._flush_output(*waiters)
+        self._connection._flush_output(
+            self._channel_closed_by_broker_result.is_ready,
+            *waiters)
 
-    def _on_message_returned(self, args): #,  body):
+        if self._channel_closed_by_broker_result:
+            # Channel was force-closed by broker
+            raise exceptions.ChannelClosed(
+                *self._channel_closed_by_broker_result.value)
+
+    def _on_message_returned(self, args):
         """ Called as the result of Basic.Returns from broker. If
         delivery-confirmation is enabled, appends the info to
         self._message_return_results
@@ -504,7 +672,7 @@ class SynchronousChannel(object):
             args.body[:30] if args.body is not None else None)
 
         if self._delivery_confirmation:
-            self._message_return_results.append_value(*args)
+            self._message_return_results.append_element(*args)
 
     def close(self, reply_code=0, reply_text="Normal Shutdown"):
         """Will invoke a clean shutdown of the channel with the AMQP Broker.
@@ -515,7 +683,7 @@ class SynchronousChannel(object):
         """
         LOGGER.info('Channel.close(%s, %s)', reply_code, reply_text)
         try:
-            with CallbackResult() as close_ok_result:
+            with _CallbackResult() as close_ok_result:
                 self._impl.add_callback(callback=close_ok_result.signal_once,
                                         replies=[pika.spec.Channel.CloseOk],
                                         one_shot=True)
@@ -524,7 +692,7 @@ class SynchronousChannel(object):
                 self._flush_output(close_ok_result.is_ready)
         finally:
             # Clean up members that might inhibit garbage collection
-            self._message_delivery_result.reset()
+            self._message_confirmation_result.reset()
             self._message_return_results.reset()
 
     def basic_ack(self, delivery_tag=0, multiple=False):
@@ -570,124 +738,108 @@ class SynchronousChannel(object):
                               requeue=requeue)
         self._flush_output()
 
-    def basic_consume(self, consumer_callback, queue='', no_ack=False,
-                      exclusive=False, consumer_tag=None, arguments=None):
-        """Sends the AMQP command Basic.Consume to the broker and binds messages
-        for the consumer_tag to the consumer callback. If you do not pass in
-        a consumer_tag, one will be automatically generated for you. Returns
-        the consumer tag.
+    def create_consumer(self, queue='', no_ack=False, exclusive=False,
+                        arguments=None):
+        """Sends the AMQP command Basic.Consume to the broker.
 
         For more information on basic_consume, see:
         http://www.rabbitmq.com/amqp-0-9-1-reference.html#basic.consume
 
-        :param method consumer_callback: The method to callback when consuming
         :param queue: The queue to consume from
         :type queue: str or unicode
         :param bool no_ack: Tell the broker to not expect a response
         :param bool exclusive: Don't allow other consumers on the queue
-        :param consumer_tag: Specify your own consumer tag
-        :type consumer_tag: str or unicode
         :param dict arguments: Custom key/value pair arguments for the consume
+        :returns: consumer tag
         :rtype: str
 
         """
         consumer_tag = self._impl.basic_consume(
-            consumer_callback=consumer_callback,
+            consumer_callback=self._message_delivery_results.append_element,
             queue=queue,
             no_ack=no_ack,
             exclusive=exclusive,
-            consumer_tag=consumer_tag,
             arguments=arguments)
+
         self._flush_output()
-    
 
-    def basic_cancel(self, consumer_tag='', nowait=False):
-        """This method cancels a consumer. This does not affect already
-        delivered messages, but it does mean the server will not send any more
-        messages for that consumer. The client may receive an arbitrary number
-        of messages in between sending the cancel method and receiving the
-        cancel-ok reply. It may also be sent from the server to the client in
-        the event of the consumer being unexpectedly cancelled (i.e. cancelled
-        for any reason other than the server receiving the corresponding
-        basic.cancel from the client). This allows clients to be notified of
-        the loss of consumers due to events such as queue deletion.
+        return consumer_tag
 
-        :param str consumer_tag: Identifier for the consumer
-        :param bool nowait: Do not expect a Basic.CancelOk response
+    def cancel_consumer(self, consumer_tag):
+        """ Cancel consumer with the given consumer_tag
 
+        :param str consumer_tag: consumer tag
         """
-        with CallbackResult() as cancel_ok_result:
+        with _CallbackResult() as cancel_ok_result:
             self._impl.basic_cancel(
-                callback=None if nowait else cancel_ok_result.signal_once,
+                callback=cancel_ok_result.signal_once,
                 consumer_tag=consumer_tag,
-                nowait=nowait)
-            if nowait:
-                self._flush_output()
+                nowait=False)
+            self._flush_output(cancel_ok_result.is_ready)
+
+    def consume_messages(self, inactivity_timeout=None):
+        """ Creates a generator iterator that yields messages from all active
+        consumers. The iterator terminates when there are no more consumers.
+
+        :param float inactivity_timeout: if a number is given (in seconds), will
+            cause the generator to yield None after the given period of
+            inactivity; this permits for pseudo-regular maintenance activities
+            to be carried out by the user while waiting for messages to arrive.
+            NOTE that the underlying implementation doesn't permit a high level
+            of timing granularity.
+        """
+        with _CallbackResult() as timeoutResult:
+            if inactivity_timeout is None:
+                waiters = (self._message_delivery_results.is_ready,)
             else:
-                self._flush_output(cancel_ok_result.is_ready)
+                waiters = (self._message_delivery_results.is_ready,
+                           timeoutResult.is_ready)
 
-    def start_consuming(self):
-        """Starts consuming from registered callbacks."""
-        # TODO
-        pass
-        raise NotImplementedError
+            while self._impl.connection._consumers:
+                if inactivity_timeout is not None:
+                    # Start inactivity timer
+                    timeout_id = self._connection.add_timeout(
+                        inactivity_timeout,
+                        timeoutResult.signal_once)
+                try:
+                    # Wait for message delivery or inactivity timeout, whichever
+                    # occurs first
+                    self._flush_output(*waiters)
+                finally:
+                    if inactivity_timeout is not None:
+                        # Reset timer
+                        timeoutResult.reset()
+                        if not timeoutResult:
+                            self._connection.remove_timeout(timeout_id)
 
-    def stop_consuming(self, consumer_tag=None):
-        """Sends off the Basic.Cancel to let RabbitMQ know to stop consuming and
-        sets our internal state to exit out of the basic_consume.
+                if self._message_delivery_results:
+                    # Got message(s) and/or consumer cancellation(s)
+                    # NOTE: new deliveries may occur as the side-effect of
+                    # user's activity on the channel or connection
+                    events = self._message_delivery_results.elements
+                    self._message_delivery_results.reset()
 
-        """
-        # TODO
-        pass
-        raise NotImplementedError
-
-    def consume(self, queue, no_ack=False, exclusive=False):
-        """Blocking consumption of a queue instead of via a callback. This
-        method is a generator that returns messages a tuple of method,
-        properties, and body.
-
-        NOTE: This is a SynchronousChannel-specific extension of the
-        pika.Channel API
-
-        Example:
-
-            for method, properties, body in channel.consume('queue'):
-                print body
-                channel.basic_ack(method.delivery_tag)
-
-        You should call SynchronousChannel.cancel() when you escape out of the
-        generator loop. Also note this turns on forced data events to make
-        sure that any acked messages actually get acked.
-
-        :param queue: The queue name to consume
-        :type queue: str or unicode
-        :param no_ack: Tell the broker to not expect a response
-        :type no_ack: bool
-        :param exclusive: Don't allow other consumers on the queue
-        :type exclusive: bool
-        :rtype: tuple(spec.Basic.Deliver, spec.BasicProperties, str or unicode)
-
-        """
-        # TODO borrow from BlockingChannel
-        pass
-        raise NotImplementedError
-
-    def cancel(self):
-        """Cancel the consumption of a queue, rejecting all pending messages.
-        This should only work with the generator-based
-        SynchronousChannel.consume method. If you're looking to cancel a
-        consumer issued with SynchronousChannel.basic_consume then you should
-        call SynchronousChannel.basic_cancel.
-
-        NOTE: This is a SynchronousChannel-specific extension of the
-        pika.Channel API
-
-        :return int: The number of messages requeued by Basic.Nack
-
-        """
-        # TODO borrow from BlockingChannel
-        pass
-        raise NotImplementedError
+                    for evt in events:
+                        if evt.method.__class__ is pika.spec.Basic.Deliver:
+                            yield self.Delivery(
+                                consumer_tag=evt.method.consumer_tag,
+                                delivery_tag=evt.method.delivery_tag,
+                                redelivered=evt.method.delivery_tag,
+                                exchange=evt.method.exchange,
+                                routing_key=evt.method.routing_key,
+                                properties=evt.properties,
+                                body=evt.body)
+                        elif evt.method.__class__ is pika.spec.Basic.Cancel:
+                            yield self.ConsumerCancellation(
+                                consumer_tag=evt.method.consumer_tag)
+                        else:
+                            raise RuntimeError("Consumed unexpected event=%r"
+                                               % (evt,))
+                    else:
+                        del events
+                else:
+                    # Inactivity timeout
+                    yield None
 
     def basic_get(self, queue=None, no_ack=False):
         """Get a single message from the AMQP broker. Returns a set with the 
@@ -743,7 +895,7 @@ class SynchronousChannel(object):
 
         self._message_return_results.reset()
 
-        with self._message_return_results, self._message_delivery_result:
+        with self._message_return_results, self._message_confirmation_result:
             self._impl.basic_publish(exchange=exchange,
                                      routing_key=routing_key,
                                      body=body,
@@ -751,8 +903,8 @@ class SynchronousChannel(object):
                                      mandatory=mandatory,
                                      immediate=immediate)
             if self._delivery_confirmation:
-                self._flush_output(self._message_delivery_result.is_ready)
-                conf_method = (self._message_delivery_result.value
+                self._flush_output(self._message_confirmation_result.is_ready)
+                conf_method = (self._message_confirmation_result.value
                                .method_frame
                                .method)
                 if isinstance(conf_method, pika.spec.Basic.Ack):
@@ -808,7 +960,7 @@ class SynchronousChannel(object):
         :param bool all_channels: Should the QoS apply to all channels
 
         """
-        with CallbackResult() as qos_ok_result:
+        with _CallbackResult() as qos_ok_result:
             self._impl.basic_qos(callback=qos_ok_result.signal_once,
                                  prefetch_size=prefetch_size,
                                  prefetch_count=prefetch_count,
@@ -826,7 +978,7 @@ class SynchronousChannel(object):
                              delivering it to an alternative subscriber.
 
         """
-        with CallbackResult() as recover_ok_result:
+        with _CallbackResult() as recover_ok_result:
             self._impl.basic_recover(callback=recover_ok_result.signal_once,
                                      requeue=requeue)
             self._flush_output(recover_ok_result.is_ready)
@@ -870,15 +1022,14 @@ class SynchronousChannel(object):
                             'channel', self._impl.channel_number)
             nowait = False
 
-        with CallbackResult() as select_ok_result:
+        with _CallbackResult() as select_ok_result:
             if not nowait:
                 self._impl.add_callback(callback=select_ok_result.signal_once,
                                         replies=[pika.spec.Confirm.SelectOk],
                                         one_shot=True)
     
-            # TODO define actual on_msg_delivery_confirmation
             self._impl.confirm_delivery(
-                callback=self._message_delivery_result.set_value_once,
+                callback=self._message_confirmation_result.set_value_once,
                 nowait=nowait)
             if nowait:
                 self._flush_output()
@@ -921,7 +1072,7 @@ class SynchronousChannel(object):
         """
         # This is a NO-OP here, since we're fixing the performance issue
         LOGGER.warn("%s.force_data_events() is a NO-OP",
-                    self.__clas__.__name__)
+                    self.__class__.__name__)
         pass
 
     def exchange_bind(self, destination=None, source=None, routing_key='',
@@ -938,7 +1089,7 @@ class SynchronousChannel(object):
         :param dict arguments: Custom key/value pair arguments for the binding
 
         """
-        with CallbackResult() as bind_ok_result:
+        with _CallbackResult() as bind_ok_result:
             self._impl.exchange_bind(
                 callback=None if nowait else bind_ok_result.signal_once,
                 destination=destination,
@@ -980,7 +1131,7 @@ class SynchronousChannel(object):
         """
         assert len(kwargs) <= 1, kwargs
         
-        with CallbackResult() as declare_ok_result:
+        with _CallbackResult() as declare_ok_result:
             self._impl.exchange_declare(
                 callback=None if nowait else declare_ok_result.signal_once,
                 exchange=exchange,
@@ -1006,7 +1157,7 @@ class SynchronousChannel(object):
         :param bool nowait: Do not wait for an Exchange.DeleteOk
 
         """
-        with CallbackResult() as delete_ok_result:
+        with _CallbackResult() as delete_ok_result:
             self._impl.exchange_delete(
                 callback=None if nowait else delete_ok_result.signal_once,
                 exchange=exchange,
@@ -1031,7 +1182,7 @@ class SynchronousChannel(object):
         :param dict arguments: Custom key/value pair arguments for the binding
 
         """
-        with CallbackResult() as unbind_ok_result:
+        with _CallbackResult() as unbind_ok_result:
             self._impl.exchange_unbind(
                 callback=None if nowait else unbind_ok_result.signal_once,
                 destination=destination,
@@ -1058,7 +1209,7 @@ class SynchronousChannel(object):
         :param dict arguments: Custom key/value pair arguments for the binding
 
         """
-        with CallbackResult() as bind_ok_result:
+        with _CallbackResult() as bind_ok_result:
             self._impl.queue_bind(callback=None if nowait else bind_ok_result.signal_once,
                                   queue=queue,
                                   exchange=exchange,
@@ -1090,7 +1241,7 @@ class SynchronousChannel(object):
         :param dict arguments: Custom key/value arguments for the queue
 
         """
-        with CallbackResult() as declare_ok_result:
+        with _CallbackResult() as declare_ok_result:
             self._impl.queue_declare(
                 callback=None if nowait else declare_ok_result.signal_once,
                 queue=queue,
@@ -1116,7 +1267,7 @@ class SynchronousChannel(object):
         :param bool nowait: Do not wait for a Queue.DeleteOk
 
         """
-        with CallbackResult() as delete_ok_result:
+        with _CallbackResult() as delete_ok_result:
             self._impl.queue_delete(callback=None if nowait else delete_ok_result.signal_once,
                                     queue=queue,
                                     if_unused=if_unused,
@@ -1135,7 +1286,7 @@ class SynchronousChannel(object):
         :param bool nowait: Do not expect a Queue.PurgeOk response
 
         """
-        with CallbackResult() as purge_ok_result:
+        with _CallbackResult() as purge_ok_result:
             self._impl.queue_purge(callback=None if nowait else purge_ok_result.signal_once,
                                    queue=queue,
                                    nowait=nowait)
@@ -1157,7 +1308,7 @@ class SynchronousChannel(object):
         :param dict arguments: Custom key/value pair arguments for the binding
 
         """
-        with CallbackResult() as unbind_ok_result:
+        with _CallbackResult() as unbind_ok_result:
             self._impl.queue_unbind(callback=None if nowait else unbind_ok_result.signal_once,
                                     queue=queue,
                                     exchange=exchange,
@@ -1174,18 +1325,18 @@ class SynchronousChannel(object):
         a channel before using the Commit or Rollback methods.
 
         """
-        with CallbackResult() as select_ok_result:
+        with _CallbackResult() as select_ok_result:
             self._impl.tx_select(select_ok_result.signal_once)
             self._flush_output(select_ok_result.is_ready)
 
     def tx_commit(self):
         """Commit a transaction."""
-        with CallbackResult() as commit_ok_result:
+        with _CallbackResult() as commit_ok_result:
             self._impl.tx_commit(commit_ok_result.signal_once)
             self._flush_output(commit_ok_result.is_ready)
 
     def tx_rollback(self):
         """Rollback a transaction."""
-        with CallbackResult() as rollback_ok_result:
+        with _CallbackResult() as rollback_ok_result:
             self._impl.tx_rollback(rollback_ok_result.signal_once)
             self._flush_output(rollback_ok_result.is_ready)
