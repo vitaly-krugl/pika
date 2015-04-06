@@ -2,7 +2,7 @@
 It's implemented as an adapter around SelectConnection.
 """
 
-from collections import namedtuple
+from collections import namedtuple, deque
 import logging
 import time
 
@@ -470,11 +470,12 @@ class SynchronousChannel(object):
     """
 
     # `SynchronousChannel.consume_messages()` yields incoming messages as
-    # instances of this class
-    Delivery = namedtuple(
-        'SynchronousChannel_Delivery',
+    # instances of this class; also used as return value for
+    # `SynchronousChannel.get_one_message`
+    Message = namedtuple(
+        'SynchronousChannel_Message',
         [
-            'consumer_tag', # str
+            'consumer_tag', # str; None in `get_one_message()` result
             'delivery_tag', # str
             'redelivered',  # bool
             'exchange',     # str
@@ -491,25 +492,20 @@ class SynchronousChannel(object):
             'consumer_tag'      # str
         ])
 
-    # Basic.Return args from broker
-    _OnMessageReturnedArgs = namedtuple(
-        'SynchronousChannel__OnMessageReturnedArgs',
+    # Used for Basic.Deliver, Basic.Cancel, Basic.Return and Basic.GetOk from
+    # broker
+    #_OnMessageDeliveredArgs = namedtuple(
+    _RxMessageArgs = namedtuple(
+        'SynchronousChannel__RxMessageArgs',
         [
-            'channel',       # implementation Channel instance
-            'method',        # spec.Basic.Return
-            'properties',    # pika.spec.BasicProperties
-            'body'           # returned message body (None or str/equivalent)
-        ])
-
-
-    # Basic.Deliver args from broker
-    _OnMessageDeliveredArgs = namedtuple(
-        'SynchronousChannel__OnMessageDeliveredArgs',
-        [
-            'channel',       # implementation Channel instance
-            'method',        # Basic.Deliver or Basic.Cancel
-            'properties',    # pika.spec.BasicProperties; ignore if Basic.Cancel
-            'body'           # returned message body; ignore if Basic.Cancel
+            # implementation Channel instance
+            'channel',
+            # Basic.Deliver, Basic.Cancel, Basic.Return or Basic.GetOk
+            'method',
+            # pika.spec.BasicProperties; ignore if Basic.Cancel
+            'properties',
+            # returned message body; ignore if Basic.Cancel
+            'body'
         ])
 
 
@@ -563,14 +559,14 @@ class SynchronousChannel(object):
         # Receives Basic.Return results when published messages are returned by
         # broker
         self._message_return_results = _CallbackResult(
-            self._OnMessageReturnedArgs)
+            self._RxMessageArgs)
 
         self._impl.add_on_return_callback(self._on_message_returned)
 
         # Receives multiple consumer message delivery notifications and is also
         # overloaded to receive Basic.Cancel notifications from rabbitmq
         self._message_delivery_results = _CallbackResult(
-            self._OnMessageDeliveredArgs)
+            self._RxMessageArgs)
 
         self._impl.add_on_cancel_callback(
             lambda method_frame:
@@ -579,6 +575,11 @@ class SynchronousChannel(object):
                     method=method_frame.method,
                     properties=None,
                     body=None))
+
+        # deque of SynchronousChannel.Message and
+        # SynchronousChannel.ConsumerCancellation objects that will be yielded
+        # by `SynchronousChannel.consume_messages()`.
+        self._pending_delivery_messages = deque()
 
         # Receives Basic.ConsumeOk reply from server
         self._basic_consume_ok_result = _CallbackResult()
@@ -598,11 +599,11 @@ class SynchronousChannel(object):
 
         # Receives args from Basic.GetEmpty response
         #  http://www.rabbitmq.com/amqp-0-9-1-reference.html#basic.get
-        self._nothing_to_get_result = _CallbackResult(
+        self._basic_getempty_result = _CallbackResult(
             self._OnGetEmptyResponseArgs)
 
         self._impl.add_callback(
-            self._nothing_to_get_result.set_value_once,
+            self._basic_getempty_result.set_value_once,
             replies=[pika.spec.Basic.GetEmpty],
             one_shot=False)
 
@@ -679,7 +680,7 @@ class SynchronousChannel(object):
                      pika.spec.BasicProperties properties: message properties
                      str body: returned message body (may be None)
         """
-        args = self._OnMessageReturnedArgs(*args)
+        args = self._RxMessageArgs(*args)
         
         assert args.channel is self._impl, (
             args.channel.channel_number, self._impl.channel_number)
@@ -796,25 +797,93 @@ class SynchronousChannel(object):
         """ Cancel consumer with the given consumer_tag
 
         :param str consumer_tag: consumer tag
+        :returns: a (possibly empty) sequence of SynchronousChannel.Message
+            objects corresponding to messages delivered for the given consumer
+            before the cancel operation completed that were not yet yielded by
+            `SynchronousChannel.consume_messages()` generator.
         """
-        if consumer_tag not in self._impl._consumers:
-            LOGGER.error("Attempting to cancel an unknown consumer=%s; "
-                         "already cancelled?", consumer_tag)
-            return
+        was_active = (consumer_tag in self._impl._consumers)
+        if was_active:
+            with _CallbackResult() as cancel_ok_result:
+                self._impl.basic_cancel(
+                    callback=cancel_ok_result.signal_once,
+                    consumer_tag=consumer_tag,
+                    nowait=False)
 
-        with _CallbackResult() as cancel_ok_result:
-            self._impl.basic_cancel(
-                callback=cancel_ok_result.signal_once,
-                consumer_tag=consumer_tag,
-                nowait=False)
-            self._flush_output(cancel_ok_result.is_ready)
+                # Flush output and wait for Basic.CancelOk or broker-initiated
+                # Basic.Cancel
+                self._flush_output(
+                    cancel_ok_result.is_ready,
+                    lambda: consumer_tag not in self._impl._consumers)
+        else:
+            LOGGER.warn("User is attempting to cancel an unknown consumer=%s; "
+                        "already cancelled by user or broker?", consumer_tag)
+
+        # Reap unprocessed messages destined for the cancelled consumer
+
+        # NOTE: new messages may have arrived for this consumer while we were
+        # waiting for Basic.CancelOk; get them into
+        # self._pending_delivery_messages
+        self._reap_consumer_deliveries()
+
+        # Remove any pending messages destined for this consumer
+        remaining_messages = deque()
+        unprocessed_messages = []
+        while self._pending_delivery_messages:
+            evt = self._pending_delivery_messages.popleft()
+            if evt.consumer_tag == consumer_tag:
+                if evt.__class__ is self.Message:
+                    unprocessed_messages.append(evt)
+                else:
+                    # A broker-initiated Basic.Cancel must have arrived before
+                    # our cancel request completed
+                    LOGGER.warn("cancel_consumer: discarding evt=%s", evt)
+            else:
+                remaining_messages.append(evt)
+
+        self._pending_delivery_messages = remaining_messages
+
+        return unprocessed_messages
+
+
+    def _reap_consumer_deliveries(self):
+        """ Reap events from self._message_delivery_results, wrap them in
+        SynchronousChannel.Message and SynchronousChannel.ConsumerCancellation
+        objects and append to self._pending_delivery_messages.
+
+        Reset self._message_delivery_results.
+        """
+        if self._message_delivery_results:
+            events = self._message_delivery_results.elements
+            self._message_delivery_results.reset()
+    
+            for evt in events:
+                if evt.method.__class__ is pika.spec.Basic.Deliver:
+                    self._pending_delivery_messages.append(
+                        self.Message(
+                            consumer_tag=evt.method.consumer_tag,
+                            delivery_tag=evt.method.delivery_tag,
+                            redelivered=evt.method.redelivered,
+                            exchange=evt.method.exchange,
+                            routing_key=evt.method.routing_key,
+                            properties=evt.properties,
+                            body=evt.body))
+
+                elif evt.method.__class__ is pika.spec.Basic.Cancel:
+                    self._pending_delivery_messages.append(
+                        self.ConsumerCancellation(
+                            consumer_tag=evt.method.consumer_tag))
+
+                else:
+                    raise RuntimeError("Consumed unexpected event=%r"
+                                       % (evt,))
 
     def consume_messages(self, inactivity_timeout=None):
         """ Creates a generator iterator that yields events from all active
         consumers. The iterator terminates when there are no more consumers.
         The following events may be yielded:
 
-            SynchronousChannel.Delivery - contains a message.
+            SynchronousChannel.Message - contains a message.
             SynchronousChannel.ConsumerCancellation - broker-initiated consumer
                 cancellation.
             None - upon expiration of inactivity timeout, if one was specified.
@@ -846,60 +915,60 @@ class SynchronousChannel(object):
                 finally:
                     if inactivity_timeout is not None:
                         # Reset timer
-                        timeoutResult.reset()
                         if not timeoutResult:
                             self._connection.remove_timeout(timeout_id)
+                        else:
+                            timeoutResult.reset()
 
-                if self._message_delivery_results:
+                # Process deliveries and broker-initiated consumer cancellations
+                # and append corresponding objects to
+                # self._pending_delivery_messages
+                self._reap_consumer_deliveries()
+
+                if self._pending_delivery_messages:
                     # Got message(s) and/or consumer cancellation(s)
                     # NOTE: new deliveries may occur as the side-effect of
                     # user's activity on the channel or connection
-                    events = self._message_delivery_results.elements
-                    self._message_delivery_results.reset()
-
-                    for evt in events:
-                        if evt.method.__class__ is pika.spec.Basic.Deliver:
-                            yield self.Delivery(
-                                consumer_tag=evt.method.consumer_tag,
-                                delivery_tag=evt.method.delivery_tag,
-                                redelivered=evt.method.redelivered,
-                                exchange=evt.method.exchange,
-                                routing_key=evt.method.routing_key,
-                                properties=evt.properties,
-                                body=evt.body)
-                        elif evt.method.__class__ is pika.spec.Basic.Cancel:
-                            yield self.ConsumerCancellation(
-                                consumer_tag=evt.method.consumer_tag)
-                        else:
-                            raise RuntimeError("Consumed unexpected event=%r"
-                                               % (evt,))
-                    else:
-                        del events
+                    while self._pending_delivery_messages:
+                        yield self._pending_delivery_messages.popleft()
                 else:
                     # Inactivity timeout
                     yield None
 
-    def basic_get(self, queue=None, no_ack=False):
-        """Get a single message from the AMQP broker. Returns a set with the 
-        method frame, header frame and body.
+    def get_one_message(self, queue=None, no_ack=False):
+        """Poll a single message via Basic.Get from the AMQP broker.
 
-        :param queue: The queue to get a message from
+        :param queue: Name of queue to get a message from
         :type queue: str or unicode
         :param bool no_ack: Tell the broker to not expect a reply
-        :rtype: (None, None, None)|(spec.Basic.Get,
-                                    spec.Basic.Properties,
-                                    str or unicode)
-
+        :returns: If a message is available, returns a pair of Message and
+            queue message count; otherwise returns None
+        :rtype: tuple(SynchronousChannel.Message, message_count) or None
         """
-        raise NotImplementedError
-
-        # TODO define actual on_basic_get_ok
-        self._impl.basic_get(callback=None if nowait else on_basic_get_ok,
-                             queue=queue,
-                             no_ack=no_ack)
-        # TODO pump messages and wait for get-ok or Basic.GetEmpty
-        # TODO return value form get_ok_callback or three-tuple with None's
-        #  from Basic.GetEmpty
+        get_ok_result = _CallbackResult(self._RxMessageArgs)
+        assert not self._basic_getempty_result
+        with get_ok_result, self._basic_getempty_result:
+            # TODO define actual on_basic_get_ok
+            self._impl.basic_get(callback=get_ok_result.set_value_once,
+                                 queue=queue,
+                                 no_ack=no_ack)
+            self._flush_output(get_ok_result.is_ready,
+                               self._basic_getempty_result.is_ready)
+            if get_ok_result:
+                evt = get_ok_result.value
+                msg = self.Message(
+                    consumer_tag=None,
+                    delivery_tag=evt.method.delivery_tag,
+                    redelivered=evt.method.redelivered,
+                    exchange=evt.method.exchange,
+                    routing_key=evt.method.routing_key,
+                    properties=evt.properties,
+                    body=evt.body)
+                return (msg, evt.method.message_count)
+            else:
+                assert self._basic_getempty_result, (
+                    "wait completed without GetOk and GetEmpty")
+                return None
 
     def basic_publish(self, exchange, routing_key, body,
                       properties=None, mandatory=False, immediate=False):
