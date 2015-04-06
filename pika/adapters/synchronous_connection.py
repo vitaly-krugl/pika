@@ -948,7 +948,6 @@ class SynchronousChannel(object):
         get_ok_result = _CallbackResult(self._RxMessageArgs)
         assert not self._basic_getempty_result
         with get_ok_result, self._basic_getempty_result:
-            # TODO define actual on_basic_get_ok
             self._impl.basic_get(callback=get_ok_result.set_value_once,
                                  queue=queue,
                                  no_ack=no_ack)
