@@ -50,7 +50,7 @@ class _CallbackResult(object):
         """
         return self.is_ready()
 
-    # NOTE: python 2.x version of __bool__
+    # python 2.x version of __bool__
     __nonzero__ = __bool__
 
     def __enter__(self):
@@ -85,7 +85,13 @@ class _CallbackResult(object):
         :raises AssertionError: if result was already set
         """
         self.signal_once()
-        self._values = (self._value_class(*args, **kwargs),)
+        try:
+            self._values = (self._value_class(*args, **kwargs),)
+        except Exception as e:
+            LOGGER.error(
+                "set_value_once failed: value_class=%r; args=%r; kwargs=%r",
+                self._value_class, args, kwargs)
+            raise
 
     def append_element(self, *args, **kwargs):
         """
@@ -94,7 +100,14 @@ class _CallbackResult(object):
             '_CallbackResult state is incompatible with append_element: '
             'ready=%r; values=%r' % (self._ready, self._values))
 
-        value = self._value_class(*args, **kwargs)
+        try:
+            value = self._value_class(*args, **kwargs)
+        except Exception as e:
+            LOGGER.error(
+                "append_element failed: value_class=%r; args=%r; kwargs=%r",
+                self._value_class, args, kwargs)
+            raise
+
         if self._values is None:
             self._values = [value]
         else:
@@ -242,14 +255,17 @@ class SynchronousConnection(object):
 
         if self._closed_result.ready:
             result = self._closed_result.value
-            LOGGER.critical('Connection close detected; result=%r', result)
             if result.reason_code not in [0, 200]:
+                LOGGER.critical('Connection close detected; result=%r', result)
                 raise exceptions.ConnectionClosed(*result)
             elif not self._user_initiated_close:
                 # NOTE: unfortunately, upon socket error, on_close_callback
                 # presently passes reason_code=0, so we don't detect that as an
                 # error
+                LOGGER.critical('Connection close detected')
                 raise exceptions.ConnectionClosed()
+            else:
+                LOGGER.info('Connection closed; result=%r', result)
 
     def close(self, reply_code=200, reply_text='Normal shutdown'):
         """Disconnect from RabbitMQ. If there are any open channels, it will
@@ -505,20 +521,21 @@ class SynchronousChannel(object):
 
     # Broker's basic-ack/basic-nack when delivery confirmation is enabled;
     # may concern a single or multiple messages
-    _OnMessageConfirmationReportArgs = _MethodFrameCallbackResultArgs
-
-    # Broker-initiated consumer cancel notification args from Basic.Cancel
-    _OnConsumerCanceledByBrokerArgs = _MethodFrameCallbackResultArgs
+    _OnMessageConfirmationReportArgs = namedtuple(
+        'SynchronousChannel__OnMessageConfirmationReportArgs',
+        'method_frame')
 
     # Basic.GetEmpty response args
-    _OnGetEmptyResponseArgs = _MethodFrameCallbackResultArgs
+    _OnGetEmptyResponseArgs = namedtuple(
+        'SynchronousChannel__OnGetEmptyResponseArgs',
+        'method_frame')
 
     # Parameters for broker-inititated Channel.Close request: reply_code
     # holds the broker's non-zero error code and reply_text holds the
     # corresponding error message text.
     _OnChannelClosedByBrokerArgs = namedtuple(
         'SynchronousChannel__OnChannelClosedByBrokerArgs',
-        'channel reply_code reply_text')
+        'method_frame')
 
 
     def __init__(self, channel_impl, connection):
@@ -563,10 +580,12 @@ class SynchronousChannel(object):
                     properties=None,
                     body=None))
 
-        # Receives (possibly multiple) notifications corresponding
-        # to broker-inititated Basic.Cancel requests
-        #self._consumer_canceled_by_broker_results = _CallbackResult(
-        #    self._OnConsumerCanceledByBrokerArgs)
+        # Receives Basic.ConsumeOk reply from server
+        self._basic_consume_ok_result = _CallbackResult()
+        self._impl.add_callback(
+            self._basic_consume_ok_result.signal_once,
+            replies=[pika.spec.Basic.ConsumeOk],
+            one_shot=False)
 
         # Receives the broker-inititated Channel.Close parameters
         self._channel_closed_by_broker_result = _CallbackResult(
@@ -620,6 +639,8 @@ class SynchronousChannel(object):
         """
         return self._impl.is_open
 
+    _ALWAYS_READY_WAITERS = ((lambda: True), )
+
     def _flush_output(self, *waiters):
         """ Flush output and process input while waiting for any of the given
         callbacks to return true. The wait is aborted upon channel-close or
@@ -635,6 +656,9 @@ class SynchronousChannel(object):
         if self._impl.is_closed:
             raise exceptions.ChannelClosed()
 
+        if not waiters:
+            waiters = self._ALWAYS_READY_WAITERS
+
         self._connection._flush_output(
             self._channel_closed_by_broker_result.is_ready,
             *waiters)
@@ -642,7 +666,7 @@ class SynchronousChannel(object):
         if self._channel_closed_by_broker_result:
             # Channel was force-closed by broker
             raise exceptions.ChannelClosed(
-                *self._channel_closed_by_broker_result.value)
+                self._channel_closed_by_broker_result.value)
 
     def _on_message_returned(self, args):
         """ Called as the result of Basic.Returns from broker. If
@@ -713,7 +737,7 @@ class SynchronousChannel(object):
                               delivery tag is zero, this indicates
                               acknowledgement of all outstanding messages.
         """
-        self._imp.basic_ack(delivery_tag=delivery_tag, multiple=multiple)
+        self._impl.basic_ack(delivery_tag=delivery_tag, multiple=multiple)
         self._flush_output()
 
     def basic_nack(self, delivery_tag=None, multiple=False, requeue=True):
@@ -755,14 +779,16 @@ class SynchronousChannel(object):
         :rtype: str
 
         """
-        consumer_tag = self._impl.basic_consume(
-            consumer_callback=self._message_delivery_results.append_element,
-            queue=queue,
-            no_ack=no_ack,
-            exclusive=exclusive,
-            arguments=arguments)
-
-        self._flush_output()
+        with self._basic_consume_ok_result as ok_result:
+            ok_result.reset()
+            consumer_tag = self._impl.basic_consume(
+                consumer_callback=self._message_delivery_results.append_element,
+                queue=queue,
+                no_ack=no_ack,
+                exclusive=exclusive,
+                arguments=arguments)
+    
+            self._flush_output(ok_result.is_ready)
 
         return consumer_tag
 
@@ -771,6 +797,11 @@ class SynchronousChannel(object):
 
         :param str consumer_tag: consumer tag
         """
+        if consumer_tag not in self._impl._consumers:
+            LOGGER.error("Attempting to cancel an unknown consumer=%s; "
+                         "already cancelled?", consumer_tag)
+            return
+
         with _CallbackResult() as cancel_ok_result:
             self._impl.basic_cancel(
                 callback=cancel_ok_result.signal_once,
@@ -779,8 +810,14 @@ class SynchronousChannel(object):
             self._flush_output(cancel_ok_result.is_ready)
 
     def consume_messages(self, inactivity_timeout=None):
-        """ Creates a generator iterator that yields messages from all active
+        """ Creates a generator iterator that yields events from all active
         consumers. The iterator terminates when there are no more consumers.
+        The following events may be yielded:
+
+            SynchronousChannel.Delivery - contains a message.
+            SynchronousChannel.ConsumerCancellation - broker-initiated consumer
+                cancellation.
+            None - upon expiration of inactivity timeout, if one was specified.
 
         :param float inactivity_timeout: if a number is given (in seconds), will
             cause the generator to yield None after the given period of
@@ -796,7 +833,7 @@ class SynchronousChannel(object):
                 waiters = (self._message_delivery_results.is_ready,
                            timeoutResult.is_ready)
 
-            while self._impl.connection._consumers:
+            while self._impl._consumers:
                 if inactivity_timeout is not None:
                     # Start inactivity timer
                     timeout_id = self._connection.add_timeout(
@@ -825,7 +862,7 @@ class SynchronousChannel(object):
                             yield self.Delivery(
                                 consumer_tag=evt.method.consumer_tag,
                                 delivery_tag=evt.method.delivery_tag,
-                                redelivered=evt.method.delivery_tag,
+                                redelivered=evt.method.redelivered,
                                 exchange=evt.method.exchange,
                                 routing_key=evt.method.routing_key,
                                 properties=evt.properties,
