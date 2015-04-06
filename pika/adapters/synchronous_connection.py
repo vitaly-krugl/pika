@@ -894,6 +894,23 @@ class SynchronousChannel(object):
             to be carried out by the user while waiting for messages to arrive.
             NOTE that the underlying implementation doesn't permit a high level
             of timing granularity.
+
+        :example:
+
+        cons1_id = create_consumer(queue="apples")
+        cons2_id = create_consumer(queue="oranges")
+
+        for evt in channel.consume_messages(inactivity_timeout=10):
+            if evt.__class__ is SynchronousChannel.Message:
+                channel.basic_ack(evt.delivery_tag)
+                print "Acked:", evt
+            elif evt.__class__ is SynchronousChannel.ConsumerCancellation:
+                print "Consumer cancelled by broker:", evt
+            elif evt is None:
+                print "INACTIVITY TIMEOUT"
+            else:
+                print "ERROR: unexpected evt=", evt
+
         """
         with _CallbackResult() as timeoutResult:
             if inactivity_timeout is None:
@@ -902,23 +919,34 @@ class SynchronousChannel(object):
                 waiters = (self._message_delivery_results.is_ready,
                            timeoutResult.is_ready)
 
-            while self._impl._consumers:
-                if inactivity_timeout is not None:
-                    # Start inactivity timer
-                    timeout_id = self._connection.add_timeout(
-                        inactivity_timeout,
-                        timeoutResult.signal_once)
-                try:
-                    # Wait for message delivery or inactivity timeout, whichever
-                    # occurs first
-                    self._flush_output(*waiters)
-                finally:
+            # NOTE: New items may have arrived in self._message_delivery_results
+            #  as a side-effect of user activity on the channel or connection
+            #  while control was in user context.
+            # NOTE: self._pending_delivery_messages might be non-empty on entry
+            #  if user abandoned an exesting iterator and later started a new one
+            while (self._impl._consumers or self._message_delivery_results or
+                   self._pending_delivery_messages):
+
+                # Wait for new messages if we don't have pending ones to process
+                if not (self._message_delivery_results or
+                        self._pending_delivery_messages):
+
                     if inactivity_timeout is not None:
-                        # Reset timer
-                        if not timeoutResult:
-                            self._connection.remove_timeout(timeout_id)
-                        else:
-                            timeoutResult.reset()
+                        # Start inactivity timer
+                        timeout_id = self._connection.add_timeout(
+                            inactivity_timeout,
+                            timeoutResult.signal_once)
+                    try:
+                        # Wait for message delivery or inactivity timeout, whichever
+                        # occurs first
+                        self._flush_output(*waiters)
+                    finally:
+                        if inactivity_timeout is not None:
+                            # Reset timer
+                            if not timeoutResult:
+                                self._connection.remove_timeout(timeout_id)
+                            else:
+                                timeoutResult.reset()
 
                 # Process deliveries and broker-initiated consumer cancellations
                 # and append corresponding objects to
