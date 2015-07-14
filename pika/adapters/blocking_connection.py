@@ -839,7 +839,8 @@ class ReturnedMessage(object):  # pylint: disable=R0903
 class _ConsumerInfo(object):
     """Information about an active consumer"""
 
-    __slots__ = ('consumer_tag', 'consumer_cb', 'alternate_event_sink', 'state')
+    __slots__ = ('consumer_tag', 'no_ack', 'consumer_cb',
+                 'alternate_event_sink', 'state')
 
     # Consumer states
     SETTING_UP = 1
@@ -847,12 +848,13 @@ class _ConsumerInfo(object):
     TEARING_DOWN = 3
     CANCELLED_BY_BROKER = 4
 
-    def __init__(self, consumer_tag, consumer_cb=None,
+    def __init__(self, consumer_tag, no_ack, consumer_cb=None,
                  alternate_event_sink=None):
         """
         NOTE: exactly one of consumer_cb/alternate_event_sink musts be non-None.
 
         :param str consumer_tag:
+        :param bool no_ack: the no-ack value for the consumer
         :param callable consumer_cb: The function for dispatching messages to
             user, having the signature:
             consumer_callback(channel, method, properties, body)
@@ -870,6 +872,7 @@ class _ConsumerInfo(object):
             'exactly one of consumer_cb/alternate_event_sink must be non-None',
             consumer_cb, alternate_event_sink)
         self.consumer_tag = consumer_tag
+        self.no_ack = no_ack
         self.consumer_cb = consumer_cb
         self.alternate_event_sink = alternate_event_sink
         self.state = self.SETTING_UP
@@ -1182,7 +1185,7 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
 
         consumer = self._consumer_infos[method_frame.method.consumer_tag]
 
-        # Don't interfere with client-initiated cancellation state
+        # Don't interfere with client-initiated cancellation flow
         if not consumer.tearing_down:
             consumer.state = _ConsumerInfo.CANCELLED_BY_BROKER
 
@@ -1433,6 +1436,7 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
         # Create new consumer
         self._consumer_infos[consumer_tag] = _ConsumerInfo(
             consumer_tag,
+            no_ack=no_ack,
             consumer_cb=consumer_callback,
             alternate_event_sink=alternate_event_sink)
 
@@ -1495,20 +1499,19 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
         except KeyError:
             LOGGER.warn("User is attempting to cancel an unknown consumer=%s; "
                         "already cancelled by user or broker?", consumer_tag)
-            return[]
+            return []
 
         try:
-            if consumer_info.cancelled_by_broker:
-                return[]
-
             # Assertion failure here is most likely due to reentrance
-            assert consumer_info.active, consumer_info.state
+            assert consumer_info.active or consumer_info.cancelled_by_broker, (
+                consumer_info.state)
 
             # Assertion failure here signals disconnect between consumer state
             # in BlockingConnection and Connection
-            assert consumer_tag in self._impl._consumers, consumer_tag
+            assert (consumer_info.cancelled_by_broker or
+                    consumer_tag in self._impl._consumers), consumer_tag
 
-            no_ack = consumer_tag in self._impl._consumers_with_noack
+            no_ack = consumer_info.no_ack
 
             consumer_info.state = _ConsumerInfo.TEARING_DOWN
 
@@ -1549,7 +1552,10 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
             else:
                 # impl takes care of rejecting any incoming deliveries during
                 # cancellation
-                return[]
+                messages = self._remove_pending_deliveries(consumer_tag)
+                assert not messages, messages
+
+                return []
         finally:
             # NOTE: The entry could be purged if channel or connection closes
             if consumer_tag in self._consumer_infos:
@@ -1572,7 +1578,7 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
                 if evt.method.consumer_tag == consumer_tag:
                     unprocessed_messages.append(evt)
                     continue
-            if type(evt) is _ConsumerDeliveryEvt:
+            if type(evt) is _ConsumerCancellationEvt:
                 if evt.method_frame.method.consumer_tag == consumer_tag:
                     # A broker-initiated Basic.Cancel must have arrived
                     # before our cancel request completed

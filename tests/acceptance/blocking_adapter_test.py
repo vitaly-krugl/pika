@@ -1278,7 +1278,7 @@ class TestBasicPublishDeliveredWhenPendingUnroutable(BlockingTestCaseBase):
 
 class TestPublishAndConsumeWithPubacksAndQosOfOne(BlockingTestCaseBase):
 
-    def test(self):  # pylint: disable=R0914
+    def test(self):  # pylint: disable=R0914,R0915
         """BlockingChannel.basic_publish, publish, basic_consume, QoS, \
         Basic.Cancel from broker
         """
@@ -1410,9 +1410,61 @@ class TestPublishAndConsumeWithPubacksAndQosOfOne(BlockingTestCaseBase):
         self.assertEqual(frame.method.consumer_tag, consumer_tag)
 
 
+class TestBasicCancelPurgesPendingConsumerCancellationEvt(BlockingTestCaseBase):
+
+    def test(self):
+        """BlockingChannel.basic_cancel purges pending _ConsumerCancellationEvt""" # pylint: disable=C0301
+        connection = self._connect()
+
+        ch = connection.channel()
+
+        q_name = ('TestBasicCancelPurgesPendingConsumerCancellationEvt_q' +
+                  uuid.uuid1().hex)
+
+        ch.queue_declare(q_name)
+        self.addCleanup(self._connect().channel().queue_delete, q_name)
+
+        ch.publish('', routing_key=q_name, body='via-publish', mandatory=True)
+
+        # Create a consumer
+        rx_messages = []
+        consumer_tag = ch.basic_consume(
+            lambda *args: rx_messages.append(args),
+            q_name,
+            no_ack=False,
+            exclusive=False,
+            arguments=None)
+
+        # Wait for the published message to arrive, but don't consume it
+        while not ch._pending_events:
+            # Issue synchronous command that forces processing of incoming I/O
+            connection.channel().close()
+
+        self.assertEqual(len(ch._pending_events), 1)
+        self.assertIsInstance(ch._pending_events[0],
+                              blocking_connection._ConsumerDeliveryEvt)
+
+        # Delete the queue and wait for broker-initiated consumer cancellation
+        ch.queue_delete(q_name)
+        while len(ch._pending_events) < 2:
+            # Issue synchronous command that forces processing of incoming I/O
+            connection.channel().close()
+
+        self.assertEqual(len(ch._pending_events), 2)
+        self.assertIsInstance(ch._pending_events[1],
+                              blocking_connection._ConsumerCancellationEvt)
+
+        # Issue consumer cancellation and verify that the pending
+        # _ConsumerCancellationEvt instance was removed
+        messages = ch.basic_cancel(consumer_tag)
+        self.assertEqual(messages, [])
+
+        self.assertEqual(len(ch._pending_events), 0)
+
+
 class TestBasicPublishWithoutPubacks(BlockingTestCaseBase):
 
-    def test(self):  # pylint: disable=R0914
+    def test(self):  # pylint: disable=R0914,R0915
         """BlockingChannel.basic_publish without pubacks"""
         connection = self._connect()
 
