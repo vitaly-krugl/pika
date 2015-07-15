@@ -774,7 +774,7 @@ class BlockingConnection(object):  # pylint: disable=R0902
     publisher_confirms = publisher_confirms_supported
 
 
-class _ChannelPendingEvt(object):
+class _ChannelPendingEvt(object):  # pylint: disable=R0903
     """Base class for BlockingChannel pending events"""
     pass
 
@@ -825,12 +825,12 @@ class _ConsumerCancellationEvt(_ChannelPendingEvt):  # pylint: disable=R0903
         return self.method_frame.method
 
 
-class _ReturnedMessageEvt(_ChannelPendingEvt):
+class _ReturnedMessageEvt(_ChannelPendingEvt):  # pylint: disable=R0903
     """This event represents a message returned by broker via `Basic.Return`"""
 
     __slots__ = ('callback', 'channel', 'method', 'properties', 'body')
 
-    def __init__(self, callback, channel, method, properties, body):
+    def __init__(self, callback, channel, method, properties, body):  # pylint: disable=R0913
         """
         :param callable callback: user's callback, having the signature
             callback(channel, method, properties, body), where
@@ -852,8 +852,9 @@ class _ReturnedMessageEvt(_ChannelPendingEvt):
 
     def __repr__(self):
         return ('%s(callback=%r, channel=%r, method=%r, properties=%r, '
-                'body=%.300r') % (self.callback, self.channel, self.method,
-                                  self.properties, self.body)
+                'body=%.300r') % (self.__class__.__name__, self.callback,
+                                  self.channel, self.method, self.properties,
+                                  self.body)
 
     def dispatch(self):
         """Dispatch user's callback"""

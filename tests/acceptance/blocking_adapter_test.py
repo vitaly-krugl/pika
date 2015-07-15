@@ -1161,6 +1161,8 @@ class TestConfirmDeliveryAfterUnroutableMessage(BlockingTestCaseBase):
         self.assertEqual(len(ch._pending_events), 1)
         self.assertIsInstance(ch._pending_events[0],
                               blocking_connection._ReturnedMessageEvt)
+        # Verify that repr of _ReturnedMessageEvt instance does crash
+        repr(ch._pending_events[0])
 
         # Dispach events
         connection.process_data_events()
@@ -1250,6 +1252,8 @@ class TestUnroutableMessageReturnedInPubackMode(BlockingTestCaseBase):
         self.assertEqual(len(ch._pending_events), 1)
         self.assertIsInstance(ch._pending_events[0],
                               blocking_connection._ReturnedMessageEvt)
+        # Verify that repr of _ReturnedMessageEvt instance does crash
+        repr(ch._pending_events[0])
 
         # Dispatch events
         connection.process_data_events()
