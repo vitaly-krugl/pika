@@ -34,6 +34,10 @@ import pika.exceptions
 # pylint: disable=C0103
 
 LOGGER = logging.getLogger(__name__)
+PARAMS_URL_BASE_TEMPLATE = (
+    'amqp://guest:guest@%(host)s:%(port)s/%%2f?socket_timeout=1'
+    '&connection_attempts=%(connection_attempts)s&retry_delay=%(retry_delay)s')
+
 PARAMS_URL_TEMPLATE = (
     'amqp://guest:guest@127.0.0.1:%(port)s/%%2f?socket_timeout=1')
 DEFAULT_URL = PARAMS_URL_TEMPLATE % {'port': 5672}
@@ -220,10 +224,7 @@ class TestNoAccessToFileDescriptorAfterConnectionClosed(BlockingTestCaseBase):
 
 class TestConnectWithDownedBroker(BlockingTestCaseBase):
 
-    def test(self):
-        """ BlockingConnection to downed broker results in AMQPConnectionError
-
-        """
+    def _test_connect_with_attempts(self, connection_attempts):
         # Reserve a port for use in connect
         sock = socket.socket()
         self.addCleanup(sock.close)
@@ -234,9 +235,28 @@ class TestConnectWithDownedBroker(BlockingTestCaseBase):
 
         sock.close()
 
-        with self.assertRaises(pika.exceptions.AMQPConnectionError):
-            self.connection = self._connect(
-                PARAMS_URL_TEMPLATE % {"port": port})
+        connection_url = PARAMS_URL_BASE_TEMPLATE % dict(
+            host="127.0.0.1",
+            port=port,
+            connection_attempts=connection_attempts,
+            retry_delay=0.0001)
+
+        with self.assertRaises(pika.exceptions.AMQPConnectionError) as excCtx:
+            self.connection = self._connect(connection_url)
+
+        self.assertIs(excCtx.exception.__class__, pika.exceptions.AMQPConnectionError)
+
+    def test_with_one_attempt(self):
+        """ BlockingConnection: connection_attempts=1 to downed broker results in AMQPConnectionError
+
+        """
+        self._test_connect_with_attempts(1)
+
+    def test_with_two_attempts(self):
+        """ BlockingConnection: connection_attempts=2 to downed broker results in AMQPConnectionError
+
+        """
+        self._test_connect_with_attempts(2)
 
 
 class TestDisconnectDuringConnectionStart(BlockingTestCaseBase):

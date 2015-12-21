@@ -298,6 +298,7 @@ class BlockingConnection(object):  # pylint: disable=R0902
         :param _impl_class: for tests/debugging only; implementation class;
             None=default
 
+        :raises AMQPConnectionError: on connection open error
         :raises RuntimeError:
 
         """
@@ -370,8 +371,9 @@ class BlockingConnection(object):  # pylint: disable=R0902
 
         :raises AMQPConnectionError: on connection open error
         """
-        self._flush_output(self._opened_result.is_ready,
-                           self._open_error_result.is_ready)
+        if not self._open_error_result.ready:
+            self._flush_output(self._opened_result.is_ready,
+                               self._open_error_result.is_ready)
 
         if self._open_error_result.ready:
             exception_or_message = self._open_error_result.value.error
