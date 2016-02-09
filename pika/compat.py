@@ -1,3 +1,4 @@
+import abc
 import os
 import sys as _sys
 
@@ -73,7 +74,18 @@ if not PY2:
 
         return str(value)
 
+    # Define a base class for deriving abstract base classes for compatibility
+    # between python 2 and 3 (metaclass syntax changed in Python 3). Ideally,
+    # would use `@six.add_metaclass` or `six.with_metaclass`, but pika
+    # traditionally has resisted external dependencies in its core code.
+    #
+    # NOTE: Wrapping in exec, because module containing
+    # `class AbstractBase(metaclass=abc.ABCMeta)` fails to load under python 2.
+    exec('class AbstractBase(metaclass=abc.ABCMeta): pass')  # pylint: disable=W0122
+
 else:
+    # PY2
+
     from urllib import unquote as url_unquote, urlencode
 
     basestring = basestring
@@ -96,6 +108,10 @@ else:
             return str(value)
         except UnicodeEncodeError:
             return str(value.encode('utf-8'))
+
+    class AbstractBase(object):  # pylint: disable=R0903
+        """PY2 Abstract base"""
+        __metaclass__ = abc.ABCMeta
 
 
 def as_bytes(value):
