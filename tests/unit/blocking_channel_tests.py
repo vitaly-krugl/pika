@@ -1,6 +1,6 @@
 # -*- coding: utf8 -*-
 """
-Tests for pika.adapters.blocking_connection.BlockingChannel
+Tests for pika.adapters.blocking_connection_base.BlockingChannel
 
 """
 from collections import deque
@@ -17,12 +17,13 @@ except ImportError:
     import unittest
 
 from pika.adapters import blocking_connection
+from pika.adapters import blocking_connection_base
 from pika import callback
 from pika import channel
 from pika import frame
 from pika import spec
 
-BLOCKING_CHANNEL = 'pika.adapters.blocking_connection.BlockingChannel'
+BLOCKING_CHANNEL = 'pika.adapters.blocking_connection_base.BlockingChannel'
 BLOCKING_CONNECTION = 'pika.adapters.blocking_connection.BlockingConnection'
 
 
@@ -42,8 +43,8 @@ class BlockingChannelTests(unittest.TestCase):
                                     is_closing=False,
                                     is_closed=False,
                                     is_open=True)
-        self.obj = blocking_connection.BlockingChannel(channelImplMock,
-                                                       self.connection)
+        self.obj = blocking_connection_base.BlockingChannel(channelImplMock,
+                                                            self.connection)
     def tearDown(self):
         del self.connection
         del self.obj
@@ -65,4 +66,4 @@ class BlockingChannelTests(unittest.TestCase):
             self.obj.basic_consume(mock.Mock(), "queue")
 
             self.assertEqual(self.obj._consumer_infos['ctag0'].state,
-                             blocking_connection._ConsumerInfo.ACTIVE)
+                             blocking_connection_base._ConsumerInfo.ACTIVE)

@@ -321,6 +321,30 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
 
         self._process_io_for_connection_setup()
 
+    @abc.abstractmethod
+    def _manage_io(self, *waiters):
+        """ Flush output and process input and asyncronous timers while waiting
+        for any of the given  callbacks to return true. The wait is
+        unconditionally aborted upon connection-close. Otherwise, processing
+        continues until the output is flushed AND at least one of the callbacks
+        returns true. If there are no callbacks, then processing ends when all
+        output is flushed.
+
+        Conditions for terminating the processing loop:
+          connection closed
+                OR
+          flushed outbound buffer and no waiters
+                OR
+          flushed outbound buffer and any waiter is ready
+
+
+        :param waiters: sequence of zero or more callables taking no args and
+                        returning true when it's time to stop processing.
+                        Their results are OR'ed together.
+
+        """
+        raise NotImplementedError
+
     def _cleanup(self):
         """Clean up members that might inhibit garbage collection"""
         self._impl.ioloop.deactivate_poller()
@@ -354,53 +378,28 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
 
         :raises AMQPConnectionError: on connection open error
         """
-        if not self._open_error_result.ready:
-            self._flush_output(self._opened_result.is_ready,
-                               self._open_error_result.is_ready)
-
-        if self._open_error_result.ready:
-            try:
-                exception_or_message = self._open_error_result.value.error
-                if isinstance(exception_or_message, Exception):
-                    raise exception_or_message
-                raise exceptions.AMQPConnectionError(exception_or_message)
-            finally:
-                self._cleanup()
+        self._flush_output(self._opened_result.is_ready)
 
         assert self._opened_result.ready
         assert self._opened_result.value.connection is self._impl
 
     def _flush_output(self, *waiters):
         """ Flush output and process input while waiting for any of the given
-        callbacks to return true. The wait is aborted upon connection-close.
-        Otherwise, processing continues until the output is flushed AND at least
-        one of the callbacks returns true. If there are no callbacks, then
-        processing ends when all output is flushed.
+        callbacks to return true. The wait is unconditionally aborted upon
+        connection-close. Otherwise, processing continues until the output is
+        flushed AND at least one of the callbacks returns true. If there are no
+        callbacks, then processing ends when all output is flushed.
 
         :param waiters: sequence of zero or more callables taking no args and
                         returning true when it's time to stop processing.
                         Their results are OR'ed together.
+
+        :raises ConnectionClosed: if connection is or becomes closed
+
         """
+        self._manage_io(*waiters)
+
         if self.is_closed:
-            raise exceptions.ConnectionClosed()
-
-        # Conditions for terminating the processing loop:
-        #   connection closed
-        #         OR
-        #   empty outbound buffer and no waiters
-        #         OR
-        #   empty outbound buffer and any waiter is ready
-        is_done = (lambda:
-                   self._closed_result.ready or
-                   (not self._impl.outbound_buffer and
-                    (not waiters or any(ready() for ready in  waiters))))
-
-        # Process I/O until our completion condition is satisified
-        while not is_done():
-            self._impl.ioloop.poll()
-            self._impl.ioloop.process_timeouts()
-
-        if self._open_error_result.ready or self._closed_result.ready:
             try:
                 if not self._user_initiated_close:
                     if self._open_error_result.ready:
@@ -411,12 +410,16 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
                             raise maybe_exception
                         else:
                             raise exceptions.ConnectionClosed(maybe_exception)
-                    else:
+                    elif self._closed_result.ready:
                         result = self._closed_result.value
                         LOGGER.error('Connection close detected; result=%r',
                                      result)
                         raise exceptions.ConnectionClosed(result.reason_code,
                                                           result.reason_text)
+                    else:
+                        # User must have called after a prior ConnectionClosed
+                        LOGGER.error('Connection already closed')
+                        raise exceptions.ConnectionClosed()
                 else:
                     LOGGER.info('Connection closed; result=%r',
                                 self._closed_result.value)

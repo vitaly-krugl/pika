@@ -15,6 +15,7 @@ from test_utils import retry_assertion
 
 import pika
 from pika.adapters import blocking_connection
+from pika.adapters import blocking_connection_base
 from pika.compat import as_bytes
 import pika.connection
 import pika.exceptions
@@ -390,7 +391,7 @@ class TestConnectionBlockAndUnblock(BlockingTestCaseBase):
         connection.add_on_connection_blocked_callback(lambda frame: None)
 
         blocked_buffer = []
-        evt = blocking_connection._ConnectionBlockedEvt(
+        evt = blocking_connection_base._ConnectionBlockedEvt(
             lambda f: blocked_buffer.append("blocked"),
             pika.frame.Method(1, pika.spec.Connection.Blocked('reason')))
         repr(evt)
@@ -399,7 +400,7 @@ class TestConnectionBlockAndUnblock(BlockingTestCaseBase):
 
         unblocked_buffer = []
         connection.add_on_connection_unblocked_callback(lambda frame: None)
-        evt = blocking_connection._ConnectionUnblockedEvt(
+        evt = blocking_connection_base._ConnectionUnblockedEvt(
             lambda f: unblocked_buffer.append("unblocked"),
             pika.frame.Method(1, pika.spec.Connection.Unblocked()))
         repr(evt)
@@ -440,7 +441,7 @@ class TestAddTimeoutRemoveTimeout(BlockingTestCaseBase):
         self.assertFalse(rx_callback)
 
         # Make sure _TimerEvt repr doesn't crash
-        evt = blocking_connection._TimerEvt(lambda: None)
+        evt = blocking_connection_base._TimerEvt(lambda: None)
         repr(evt)
 
 
@@ -517,7 +518,7 @@ class TestCreateAndCloseChannel(BlockingTestCaseBase):
         connection = self._connect()
 
         ch = connection.channel()
-        self.assertIsInstance(ch, blocking_connection.BlockingChannel)
+        self.assertIsInstance(ch, blocking_connection_base.BlockingChannel)
         self.assertTrue(ch.is_open)
         self.assertFalse(ch.is_closed)
         self.assertFalse(ch.is_closing)
@@ -1208,7 +1209,7 @@ class TestPublishAndBasicPublishWithPubacksUnroutable(BlockingTestCaseBase):
             ch.publish(exg_name, routing_key=routing_key, body='',
                        properties=msg2_properties, mandatory=True)
         (msg,) = cm.exception.messages
-        self.assertIsInstance(msg, blocking_connection.ReturnedMessage)
+        self.assertIsInstance(msg, blocking_connection_base.ReturnedMessage)
         self.assertIsInstance(msg.method, pika.spec.Basic.Return)
         self.assertEqual(msg.method.reply_code, 312)
         self.assertEqual(msg.method.exchange, exg_name)
@@ -1249,7 +1250,7 @@ class TestConfirmDeliveryAfterUnroutableMessage(BlockingTestCaseBase):
         # Verify that unroutable message is in pending events
         self.assertEqual(len(ch._pending_events), 1)
         self.assertIsInstance(ch._pending_events[0],
-                              blocking_connection._ReturnedMessageEvt)
+                              blocking_connection_base._ReturnedMessageEvt)
         # Verify that repr of _ReturnedMessageEvt instance does crash
         repr(ch._pending_events[0])
 
@@ -1363,9 +1364,9 @@ class TestUnroutableMessageReturnedInPubackMode(BlockingTestCaseBase):
         # Verify that unroutable messages are already in pending events
         self.assertEqual(len(ch._pending_events), 2)
         self.assertIsInstance(ch._pending_events[0],
-                              blocking_connection._ReturnedMessageEvt)
+                              blocking_connection_base._ReturnedMessageEvt)
         self.assertIsInstance(ch._pending_events[1],
-                              blocking_connection._ReturnedMessageEvt)
+                              blocking_connection_base._ReturnedMessageEvt)
         # Verify that repr of _ReturnedMessageEvt instance does crash
         repr(ch._pending_events[0])
         repr(ch._pending_events[1])
@@ -1738,7 +1739,7 @@ class TestBasicCancelPurgesPendingConsumerCancellationEvt(BlockingTestCaseBase):
 
         self.assertEqual(len(ch._pending_events), 1)
         self.assertIsInstance(ch._pending_events[0],
-                              blocking_connection._ConsumerDeliveryEvt)
+                              blocking_connection_base._ConsumerDeliveryEvt)
 
         # Delete the queue and wait for broker-initiated consumer cancellation
         ch.queue_delete(q_name)
@@ -1748,7 +1749,7 @@ class TestBasicCancelPurgesPendingConsumerCancellationEvt(BlockingTestCaseBase):
 
         self.assertEqual(len(ch._pending_events), 2)
         self.assertIsInstance(ch._pending_events[1],
-                              blocking_connection._ConsumerCancellationEvt)
+                              blocking_connection_base._ConsumerCancellationEvt)
 
         # Issue consumer cancellation and verify that the pending
         # _ConsumerCancellationEvt instance was removed
