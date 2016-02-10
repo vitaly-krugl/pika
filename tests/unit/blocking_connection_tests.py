@@ -265,6 +265,9 @@ class BlockingConnectionTests(unittest.TestCase):
                                                    ('127.0.0.1', 5672))]):
                         pika.BlockingConnection(parameters=params)
 
+            # Verify specific type
+            self.assertIs(type(ctx.exception), AMQPConnectionError)
+
             # as any attempt will timeout (directly),
             # at the end there must be exactly that count of socket.connect()
             # method calls:

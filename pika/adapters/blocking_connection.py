@@ -60,7 +60,7 @@ class BlockingConnection(blocking_connection_base.BlockingConnectionBase):
         :param _impl_class: for tests/debugging only; implementation class;
             None=default
 
-        :raises RuntimeError:
+        :raises AMQPConnectionError:
 
         """
         super(BlockingConnection, self).__init__(

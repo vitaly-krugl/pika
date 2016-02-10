@@ -276,9 +276,12 @@ class TestConnectWithDownedBroker(BlockingTestCaseBase):
 
         sock.close()
 
-        with self.assertRaises(pika.exceptions.AMQPConnectionError):
+        with self.assertRaises(pika.exceptions.AMQPConnectionError) as excCtx:
             self.connection = self._connect(
                 PARAMS_URL_TEMPLATE % {"port": port})
+
+        self.assertIs(type(excCtx.exception),
+                      pika.exceptions.AMQPConnectionError)
 
 
 class TestDisconnectDuringConnectionStart(BlockingTestCaseBase):

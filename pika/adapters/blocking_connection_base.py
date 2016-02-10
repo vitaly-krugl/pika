@@ -156,13 +156,13 @@ class _CallbackResult(object):
 
 class _IoloopTimerContext(object):  # pylint: disable=R0903
     """Context manager for registering and safely unregistering a
-    SelectConnection ioloop-based timer
+    Connection ioloop-based timer
     """
 
     def __init__(self, duration, connection):
         """
         :param float duration: non-negative timer duration in seconds
-        :param SelectConnection connection:
+        :param Connection connection:
         """
         assert hasattr(connection, 'add_timeout'), connection
         self._duration = duration
@@ -276,10 +276,8 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
         """Create a new instance of the Connection object.
 
         :param pika.connection.Parameters parameters: Connection parameters
-        :param _impl_class: for tests/debugging only; implementation class;
-            None=default
 
-        :raises RuntimeError:
+        :raises AMQPConnectionError:
 
         """
         # Used by the _acquire_event_dispatch decorator; when already greater
@@ -308,6 +306,11 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
         # NOTE: this is a workaround to detect socket error because
         # on_close_callback passes reason_code=0 when called due to socket error
         self._user_initiated_close = False
+
+        # Base class is responsible for setting this member to a
+        # pika.connection.Connection-based instance and invoking
+        # _process_io_for_connection_setup()
+        impl_class = None
 
         impl_class = _impl_class or SelectConnection
         self._impl = impl_class(
@@ -409,7 +412,8 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
                         if isinstance(maybe_exception, Exception):
                             raise maybe_exception
                         else:
-                            raise exceptions.ConnectionClosed(maybe_exception)
+                            raise exceptions.AMQPConnectionError(
+                                maybe_exception)
                     elif self._closed_result.ready:
                         result = self._closed_result.value
                         LOGGER.error('Connection close detected; result=%r',
