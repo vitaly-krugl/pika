@@ -777,10 +777,14 @@ class Connection(object):
             # TODO: remove timeout if connection is closed before timer fires
             self.add_timeout(self.params.retry_delay, self.connect)
         else:
-            self.callbacks.process(0, self.ON_CONNECTION_ERROR, self, self,
-                                   error)
-            self.remaining_connection_attempts = self.params.connection_attempts
             self._set_connection_state(self.CONNECTION_CLOSED)
+
+            try:
+                self.callbacks.process(0, self.ON_CONNECTION_ERROR, self, self,
+                                       error)
+            finally:
+                self.remaining_connection_attempts = (
+                    self.params.connection_attempts)
 
     def remove_timeout(self, callback_method):
         """Adapters should override to call the callback after the
