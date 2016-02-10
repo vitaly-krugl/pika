@@ -63,8 +63,19 @@ class BlockingConnection(blocking_connection_base.BlockingConnectionBase):
         :raises AMQPConnectionError:
 
         """
-        super(BlockingConnection, self).__init__(
-            parameters=parameters, _impl_class=_impl_class)
+        super(BlockingConnection, self).__init__()
+
+        impl_class = _impl_class or SelectConnection
+        self._impl = impl_class(
+            parameters=parameters,
+            on_open_callback=self._opened_result.set_value_once,
+            on_open_error_callback=self._open_error_result.set_value_once,
+            on_close_callback=self._closed_result.set_value_once,
+            stop_ioloop_on_close=False)
+
+        self._impl.ioloop.activate_poller()
+
+        self._process_io_for_connection_setup()
 
     def _manage_io(self, *waiters):
         """ [pure virtual method override] Flush output and process input and
@@ -96,3 +107,9 @@ class BlockingConnection(blocking_connection_base.BlockingConnectionBase):
         while not is_done():
             self._impl.ioloop.poll()
             self._impl.ioloop.process_timeouts()
+
+    def _cleanup(self):
+        """[override base] Clean up members that might inhibit garbage collection"""
+        self._impl.ioloop.deactivate_poller()
+
+        super(BlockingConnection, self)._cleanup()

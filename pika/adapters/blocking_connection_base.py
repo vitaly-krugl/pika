@@ -16,8 +16,6 @@ import pika.channel
 from pika import compat
 from pika import exceptions
 import pika.spec
-# NOTE: import SelectConnection after others to avoid circular depenency
-from pika.adapters.select_connection import SelectConnection
 
 
 LOGGER = logging.getLogger(__name__)
@@ -272,7 +270,7 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
         'BlockingConnection__OnChannelOpenedArgs',
         'channel')
 
-    def __init__(self, parameters=None, _impl_class=None):
+    def __init__(self):
         """Create a new instance of the Connection object.
 
         :param pika.connection.Parameters parameters: Connection parameters
@@ -312,18 +310,6 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
         # _process_io_for_connection_setup()
         impl_class = None
 
-        impl_class = _impl_class or SelectConnection
-        self._impl = impl_class(
-            parameters=parameters,
-            on_open_callback=self._opened_result.set_value_once,
-            on_open_error_callback=self._open_error_result.set_value_once,
-            on_close_callback=self._closed_result.set_value_once,
-            stop_ioloop_on_close=False)
-
-        self._impl.ioloop.activate_poller()
-
-        self._process_io_for_connection_setup()
-
     @abc.abstractmethod
     def _manage_io(self, *waiters):
         """ Flush output and process input and asyncronous timers while waiting
@@ -350,7 +336,6 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
 
     def _cleanup(self):
         """Clean up members that might inhibit garbage collection"""
-        self._impl.ioloop.deactivate_poller()
         self._ready_events.clear()
         self._opened_result.reset()
         self._open_error_result.reset()
@@ -1043,7 +1028,7 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
         """Create a new instance of the Channel
 
         :param channel_impl: Channel implementation object as returned from
-                             SelectConnection.channel()
+                             Connection.channel()
         :param BlockingConnection connection: The connection object
 
         """

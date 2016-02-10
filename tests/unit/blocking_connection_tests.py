@@ -52,7 +52,7 @@ class SelectConnectionTemplate(blocking_connection.SelectConnection):
 class BlockingConnectionTests(unittest.TestCase):
     """TODO: test properties"""
 
-    @patch.object(blocking_connection_base, 'SelectConnection',
+    @patch.object(blocking_connection, 'SelectConnection',
                   spec_set=SelectConnectionTemplate)
     def test_constructor(self, select_connection_class_mock):
         with mock.patch.object(blocking_connection.BlockingConnection,
@@ -68,7 +68,7 @@ class BlockingConnectionTests(unittest.TestCase):
 
         self.assertEqual(connection._impl.ioloop.activate_poller.call_count, 1)
 
-    @patch.object(blocking_connection_base, 'SelectConnection',
+    @patch.object(blocking_connection, 'SelectConnection',
                   spec_set=SelectConnectionTemplate)
     def test_process_io_for_connection_setup(self, select_connection_class_mock):
         with mock.patch.object(blocking_connection.BlockingConnection,
@@ -84,7 +84,7 @@ class BlockingConnectionTests(unittest.TestCase):
                 spec_set=blocking_connection.BlockingConnection._flush_output):
             connection._process_io_for_connection_setup()
 
-    @patch.object(blocking_connection_base, 'SelectConnection',
+    @patch.object(blocking_connection, 'SelectConnection',
                   spec_set=SelectConnectionTemplate)
     def test_process_io_for_connection_setup_fails_with_open_error(
             self, select_connection_class_mock):
@@ -107,7 +107,7 @@ class BlockingConnectionTests(unittest.TestCase):
 
             self.assertEqual(cm.exception, exc_value)
 
-    @patch.object(blocking_connection_base, 'SelectConnection',
+    @patch.object(blocking_connection, 'SelectConnection',
                   spec_set=SelectConnectionTemplate,
                   is_closed=False, outbound_buffer=[])
     def test_flush_output(self, select_connection_class_mock):
@@ -120,7 +120,7 @@ class BlockingConnectionTests(unittest.TestCase):
 
         connection._flush_output(lambda: False, lambda: True)
 
-    @patch.object(blocking_connection_base, 'SelectConnection',
+    @patch.object(blocking_connection, 'SelectConnection',
                   spec_set=SelectConnectionTemplate,
                   is_closed=False, outbound_buffer=[])
     def test_flush_output_user_initiated_close(self,
@@ -143,7 +143,7 @@ class BlockingConnectionTests(unittest.TestCase):
         self.assertEqual(connection._impl.ioloop.deactivate_poller.call_count,
                          1)
 
-    @patch.object(blocking_connection_base, 'SelectConnection',
+    @patch.object(blocking_connection, 'SelectConnection',
                   spec_set=SelectConnectionTemplate,
                   is_closed=False, outbound_buffer=[])
     def test_flush_output_server_initiated_error_close(
@@ -170,7 +170,7 @@ class BlockingConnectionTests(unittest.TestCase):
         self.assertEqual(connection._impl.ioloop.deactivate_poller.call_count,
                          1)
 
-    @patch.object(blocking_connection_base, 'SelectConnection',
+    @patch.object(blocking_connection, 'SelectConnection',
                   spec_set=SelectConnectionTemplate,
                   is_closed=False, outbound_buffer=[])
     def test_flush_output_server_initiated_no_error_close(
@@ -198,7 +198,7 @@ class BlockingConnectionTests(unittest.TestCase):
         self.assertEqual(connection._impl.ioloop.deactivate_poller.call_count,
                          1)
 
-    @patch.object(blocking_connection_base, 'SelectConnection',
+    @patch.object(blocking_connection, 'SelectConnection',
                   spec_set=SelectConnectionTemplate)
     def test_close(self, select_connection_class_mock):
         select_connection_class_mock.return_value.is_closed = False
@@ -219,7 +219,7 @@ class BlockingConnectionTests(unittest.TestCase):
         select_connection_class_mock.return_value.close.assert_called_once_with(
             200, 'text')
 
-    @patch.object(blocking_connection_base, 'SelectConnection',
+    @patch.object(blocking_connection, 'SelectConnection',
                   spec_set=SelectConnectionTemplate)
     @patch.object(blocking_connection_base, 'BlockingChannel',
                   spec_set=blocking_connection_base.BlockingChannel)
@@ -235,7 +235,7 @@ class BlockingConnectionTests(unittest.TestCase):
                 spec_set=blocking_connection.BlockingConnection._flush_output):
             connection.channel()
 
-    @patch.object(blocking_connection_base, 'SelectConnection',
+    @patch.object(blocking_connection, 'SelectConnection',
                   spec_set=SelectConnectionTemplate)
     def test_sleep(self, select_connection_class_mock):  # pylint: disable=W0613
         with mock.patch.object(blocking_connection.BlockingConnection,
