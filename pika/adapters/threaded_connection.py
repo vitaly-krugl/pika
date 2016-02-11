@@ -28,6 +28,7 @@ import threading
 
 from pika.adapters import blocking_connection_base
 import pika.connection
+import pika.exceptions
 
 # NOTE: import SelectConnection after others to avoid circular depenency
 from pika.adapters import select_connection
@@ -130,7 +131,6 @@ class _ThreadSafeChannelNumberPool(object):
         # Allocated channel numbers
         self._allocated_channels = set()
 
-
     def reserve(self):
         """Reserve a channel number, making it unavailable until it is returned
         back to channel number pool via `_ThreadSafeChannelNumberPool.release`
@@ -147,11 +147,10 @@ class _ThreadSafeChannelNumberPool(object):
 
         with self._lock:
             if len(self._allocated_channels) >= self._max_channels:
-                raise exceptions.NoFreeChannels()
+                raise pika.exceptions.NoFreeChannels()
 
-            for n in xrange(1, len(self._allocated_channels) + 1):
-                if n not in self._allocated_channels:
-                    channel_number = n
+            for channel_number in xrange(1, len(self._allocated_channels) + 1):
+                if channel_number not in self._allocated_channels:
                     break
             else:
                 channel_number = len(self._allocated_channels) + 1
@@ -421,7 +420,7 @@ class _ClientUnregEvent(RpcEvent):
             is the value provided by responder.
 
         """
-        super(_ClientRegEvent, self).__init__(on_result_rx)
+        super(_ClientUnregEvent, self).__init__(on_result_rx)
         self.client = client
 
 
@@ -487,7 +486,7 @@ class _DataToBrokerEvent(RpcEvent):
             is the value provided by responder.
 
         """
-        super(_ClientRegEvent, self).__init__(on_result_rx)
+        super(_DataToBrokerEvent, self).__init__(on_result_rx)
         self.client = client
         self.buffers = buffers
 
