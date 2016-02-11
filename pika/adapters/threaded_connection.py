@@ -27,6 +27,8 @@ from pika.adapters import blocking_connection_base
 import pika.connection
 import pika.exceptions
 
+from pika.adapters import bg_connection_service
+
 # NOTE: import SelectConnection after others to avoid circular depenency
 from pika.adapters import select_connection
 
@@ -34,6 +36,70 @@ from pika.adapters import select_connection
 LOGGER = logging.getLogger(__name__)
 
 
+def verify_overrides(cls):
+    """Class Decorator to verify that methods tagged by
+    the `overrides_instance_method` decorator actually override corresonding
+    methods in one of the base classes
+
+    :raises TypeError: if an unbound method doesn't override another one.
+    """
+
+    for name in dir(cls):
+        method = getattr(cls, name)
+
+        if not hasattr(method, 'check_method_override'):
+            continue
+
+        if not callable(method):
+            raise TypeError('{} is not callable', method)
+
+        if not hasattr(method, 'im_self'):
+            raise TypeError('{} does not have `im_self` member'.format(method))
+
+        if method.im_self is not None:
+            raise TypeError('{} is not an unbound method'.format(method))
+
+        for base_cls in method.im_class.__bases__:
+            base_method = getattr(base_cls, method.__name__, None)
+
+            if base_method is None:
+                continue
+
+            if not callable(base_method):
+                raise TypeError('{} attempts to override non-callable {}'
+                                .format(method, base_method))
+
+            if not hasattr(base_method, 'im_self'):
+                raise TypeError(
+                    '{}\'s base {} does not have `im_self` member'.format(
+                        method, base_method))
+
+            if base_method.im_self is not None:
+                raise TypeError('{}\'s base {} is not an unbound method'.format(
+                    method, base_method))
+
+            break
+        else:
+            raise TypeError('Nothing to override for {}'.format(method))
+
+
+    return cls
+
+
+def overrides_instance_method(func):
+    """Method decorator that marks the method for verifying that it overrides
+    an instance method. The verification is performed by class decorator
+    `verify_overrides`
+
+    :raises TypeError: if func is not an unbound instance method
+
+    """
+    func.check_method_override = True
+
+    return func
+
+
+@verify_overrides
 class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
     """The `ThreadedConnection` adapter module implements blocking semantics on
     top of Pika's core AMQP driver. API-wise, it's a drop-in replacement for
@@ -83,6 +149,7 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
         """
         pass
 
+    @overrides_instance_method
     def _manage_io(self, *waiters):
         """ [pure virtual method override] Flush output and process input and
         asyncronous timers while waiting for any of the given  callbacks to
@@ -106,6 +173,7 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
         """
         pass
 
+    @overrides_instance_method
     def _cleanup(self):
         """[override base] Clean up members that might inhibit garbage
         collection
@@ -128,9 +196,9 @@ class _ThreadSafeChannelNumberPool(object):
         # Allocated channel numbers
         self._allocated_channels = set()
 
-    def reserve(self):
+    def allocate(self):
         """Reserve a channel number, making it unavailable until it is returned
-        back to channel number pool via `_ThreadSafeChannelNumberPool.release`
+        back to channel number pool via `_ThreadSafeChannelNumberPool.free`
 
         :returns: channel number
         :rtype: int
@@ -156,7 +224,7 @@ class _ThreadSafeChannelNumberPool(object):
 
         return channel_number
 
-    def release(self, channel_number):
+    def free(self, channel_number):
         """Release a channel number, making it available to for allocation
 
         :param int channel_number: channel number to release; must be in
@@ -168,6 +236,7 @@ class _ThreadSafeChannelNumberPool(object):
             self._allocated_channels.remove(channel_number)
 
 
+@verify_overrides
 class _ProxyConnection(pika.connection.Connection):
     """`_ProxyConnection` serves as a proxy for the background AMQP connection.
     It provides the asyncronous ("_impl") connection services expected by
@@ -202,6 +271,7 @@ class _ProxyConnection(pika.connection.Connection):
             on_open_error_callback=on_open_error_callback,
             on_close_callback=on_close_callback)
 
+    @overrides_instance_method
     def connect(self):
         """[replace base] Replace the connection machinery. `_ProxyConnection`
         connects to AMQP broker indirectly via `BackgroundConnectionService`.
@@ -212,6 +282,7 @@ class _ProxyConnection(pika.connection.Connection):
         """
         pass
 
+    @overrides_instance_method
     def _send_connection_close(self, reply_code, reply_text):
         """[replace base] Send a Connection.Close method frame.
 
@@ -221,6 +292,7 @@ class _ProxyConnection(pika.connection.Connection):
         """
         pass
 
+    @overrides_instance_method
     def add_on_connection_blocked_callback(self, callback_method):
         """[supplement base] Add a callback to be notified when RabbitMQ has
         sent a `Connection.Blocked` frame indicating that RabbitMQ is low on
@@ -236,6 +308,7 @@ class _ProxyConnection(pika.connection.Connection):
         """
         pass
 
+    @overrides_instance_method
     def add_on_connection_unblocked_callback(self, callback_method):
         """[supplement base] Add a callback to be notified when RabbitMQ has
         sent a `Connection.Unblocked` frame letting publishers know it's ok to
@@ -249,6 +322,7 @@ class _ProxyConnection(pika.connection.Connection):
 
         """
 
+    @overrides_instance_method
     def channel(self, on_open_callback, channel_number=None):
         """[supplement base] Create a new channel with the next available
         channel number or pass in a channel number to use. Must be non-zero if
@@ -263,6 +337,7 @@ class _ProxyConnection(pika.connection.Connection):
         """
         pass
 
+    @overrides_instance_method
     def add_timeout(self, deadline, callback_method):
         """[override pure virtual] Create a single-shot timer to fire after
         deadline seconds. Do not confuse with Tornado's timeout where you pass
@@ -278,6 +353,7 @@ class _ProxyConnection(pika.connection.Connection):
         """
         return self._ioloop.add_timeout(deadline, callback_method)
 
+    @overrides_instance_method
     def remove_timeout(self, timer):
         """[override pure virtual] Remove a timer that hasn't been dispatched
         yet
@@ -287,6 +363,7 @@ class _ProxyConnection(pika.connection.Connection):
         """
         self._ioloop.remove_timeout(timer)
 
+    @overrides_instance_method
     def _adapter_connect(self):
         """[override pure virtual] Subclasses should override to set up the
         outbound socket connection.
@@ -294,6 +371,7 @@ class _ProxyConnection(pika.connection.Connection):
         """
         pass
 
+    @overrides_instance_method
     def _adapter_disconnect(self):
         """[override pure virtual] Subclasses should override this to cause the
         underlying transport (socket) to close.
@@ -301,6 +379,7 @@ class _ProxyConnection(pika.connection.Connection):
         """
         pass
 
+    @overrides_instance_method
     def _flush_outbound(self):
         """[override pure virtual] Adapters should override to flush the
         contents of outbound_buffer out along the socket.
