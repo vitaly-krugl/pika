@@ -18,9 +18,6 @@ classes.
 # a friend of those instances
 # pylint: disable=W0212
 
-# Disable pylint messages concerning "Too few public methods"
-# pylint: disable=R0903
-
 
 import logging
 ##import Queue
@@ -207,7 +204,7 @@ class _ProxyConnection(pika.connection.Connection):
 
     def connect(self):
         """[replace base] Replace the connection machinery. `_ProxyConnection`
-        connects to AMQP broker indirectly via `_BackgroundConnectionService`.
+        connects to AMQP broker indirectly via `BackgroundConnectionService`.
 
         This method is invoked by the base `Connection` class to initiate
         connection-establishment with AMQP broker
@@ -224,8 +221,7 @@ class _ProxyConnection(pika.connection.Connection):
         """
         pass
 
-    def add_on_connection_blocked_callback(self,  # pylint: disable=C0103
-                                           callback_method):
+    def add_on_connection_blocked_callback(self, callback_method):
         """[supplement base] Add a callback to be notified when RabbitMQ has
         sent a `Connection.Blocked` frame indicating that RabbitMQ is low on
         resources. Publishers can use this to voluntarily suspend publishing,
@@ -240,8 +236,7 @@ class _ProxyConnection(pika.connection.Connection):
         """
         pass
 
-    def add_on_connection_unblocked_callback(self,  # pylint: disable=C0103
-                                             callback_method):
+    def add_on_connection_unblocked_callback(self, callback_method):
         """[supplement base] Add a callback to be notified when RabbitMQ has
         sent a `Connection.Unblocked` frame letting publishers know it's ok to
         start publishing again. The callback will be passed the
@@ -312,193 +307,3 @@ class _ProxyConnection(pika.connection.Connection):
 
         """
         pass
-
-
-class _BackgroundConnectionService(object):
-    """`_BackgroundConnectionService` runs the true AMQP connection instance in
-    a background thread. It communicates with `ThreadedConnection` via
-    thread-safe queues and an inbound event socket for efficient event-driven
-    I/O.
-
-    """
-    pass
-
-
-class _ServiceProxy(object):
-    """Interface to `_BackgroundConnectionService` for use by
-    `ThreadedConnection`
-    """
-
-    def __init__(self, queue, notify):
-        """
-        :param Queue.Queue queue: Thread-safe queue for depositing events
-            destined for `_BackgroundConnectionService`
-        :param callable notify: Function for notifying
-            `_BackgroundConnectionService` that an event is available; it has
-            the signature`notify()`
-
-        """
-        self._evt_queue = queue
-        self._notify = notify
-
-    def send(self, event):
-        """Send an event to `_BackgroundConnectionService`
-
-        :param event: event object destined for client
-
-        """
-        self._evt_queue.put(event)
-        self._notify()
-
-
-class _ClientProxy(object):
-    """Interface to `ThreadedConnection` for use by
-    `_BackgroundConnectionService`
-
-    """
-
-    def __init__(self, queue):
-        """
-        :param Queue.Queue queue: Thread-safe queue for depositing events
-            destined for the client
-
-        """
-        self._evt_queue = queue
-
-
-    def send(self, event):
-        """Send an event to client
-
-        :param event: event object destined for client
-
-        """
-        self._evt_queue.put(event)
-
-
-class RpcEvent(object):
-    """Base class for service-destined event that solicits a reply"""
-
-    def __init__(self, on_result_rx):
-        """
-        :param callable on_result_rx: callable for handling the result in user
-            context, having the signature `on_result_rx(result)`, where `result`
-            is the value provided by responder.
-        """
-        self.on_result_rx = on_result_rx
-
-        # Result to be set by responder
-        self.result = None
-
-
-class _ClientRegEvent(RpcEvent):
-    """Client registration event for registering a client with
-    `_BackgroundConnectionService`.
-    """
-
-    def __init__(self, client, on_result_rx):
-        """
-        :param _ClientProxy:
-        :param callable on_result_rx: callable for handling the result in user
-            context, having the signature `on_result_rx(result)`, where `result`
-            is the value provided by responder.
-
-        """
-        super(_ClientRegEvent, self).__init__(on_result_rx)
-        self.client = client
-
-
-class _ClientUnregEvent(RpcEvent):
-    """Client de-registration event for unregistering a client with
-    `_BackgroundConnectionService`.
-    """
-
-    def __init__(self, client, on_result_rx):
-        """
-        :param _ClientProxy:
-        :param callable on_result_rx: callable for handling the result in user
-            context, having the signature `on_result_rx(result)`, where `result`
-            is the value provided by responder.
-
-        """
-        super(_ClientUnregEvent, self).__init__(on_result_rx)
-        self.client = client
-
-
-class _ChannelRegEvent(object):
-    """Channel registration event for informing `_BackgroundConnectionService`
-    of the association between channel number and client
-
-    """
-
-    def __init__(self, client, channel_number):
-        """
-        :param int channel_number:
-        :param _ClientProxy:
-
-        """
-        self.channel_number = channel_number
-        self.client = client
-
-
-class _ChannelUnregEvent(object):
-    """Channel de-registration event for informing
-    `_BackgroundConnectionService` to remove the association between the given
-    channel number and client
-
-    """
-
-    def __init__(self, client, channel_number):
-        """
-        :param int channel_number:
-        :param _ClientProxy:
-
-        """
-        self.channel_number = channel_number
-        self.client = client
-
-
-class _BlockedConnectionSubscribeEvent(object):
-    """Request from a client for receiving "blocked/unblocked" connection
-    frames from `_BackgroundConnectionService`
-    """
-
-    def __init__(self, client):
-        """
-        :param _ClientProxy:
-
-        """
-        self.client = client
-
-
-class _DataToBrokerEvent(RpcEvent):
-    """Container for serialized frames destined for AMQP broker. This type of
-    event is dispatched by `ThreadedConnection` to
-    `_BackgroundConnectionService`.
-
-    """
-
-    def __init__(self, client, buffers, on_result_rx):
-        """
-        :param _ClientProxy:
-        :param buffers: sequence of serialized frames destined for AMQP broker
-        :param callable on_result_rx: callable for handling the result in user
-            context, having the signature `on_result_rx(result)`, where `result`
-            is the value provided by responder.
-
-        """
-        super(_DataToBrokerEvent, self).__init__(on_result_rx)
-        self.client = client
-        self.buffers = buffers
-
-
-class _FramesToClientEvent(object):
-    """Container for frames destined for client. This type of event is
-    dispatched by `_BackgroundConnectionService` to `ThreadedConnection`
-    """
-
-    def __init__(self, frames):
-        """
-        :param frames: sequence of `pika.spec` frames destined for client
-
-        """
-        self.frames = frames
