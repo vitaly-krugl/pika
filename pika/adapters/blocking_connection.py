@@ -14,16 +14,7 @@ classes.
 # a friend of those instances
 # pylint: disable=W0212
 
-from collections import namedtuple, deque
-import contextlib
-import functools
 import logging
-import time
-
-import pika.channel
-from pika import compat
-from pika import exceptions
-import pika.spec
 
 from pika.adapters import blocking_connection_base
 
@@ -56,7 +47,8 @@ class BlockingConnection(blocking_connection_base.BlockingConnectionBase):
     def __init__(self, parameters=None, _impl_class=None):
         """Create a new instance of the Connection object.
 
-        :param pika.connection.Parameters parameters: Connection parameters
+        :param pika.connection.Parameters parameters: Connection parameters;
+           None for default parameters.
         :param _impl_class: for tests/debugging only; implementation class;
             None=default
 
@@ -109,7 +101,10 @@ class BlockingConnection(blocking_connection_base.BlockingConnectionBase):
             self._impl.ioloop.process_timeouts()
 
     def _cleanup(self):
-        """[override base] Clean up members that might inhibit garbage collection"""
+        """[override base] Clean up members that might inhibit garbage
+        collection
+
+        """
         self._impl.ioloop.deactivate_poller()
 
         super(BlockingConnection, self)._cleanup()

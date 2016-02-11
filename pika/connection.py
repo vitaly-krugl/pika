@@ -711,6 +711,8 @@ class Connection(object):
         :param int deadline: The number of seconds to wait to call callback
         :param method callback_method: The callback method
 
+        :returns: opaque timer
+
         """
         raise NotImplementedError
 
@@ -786,12 +788,12 @@ class Connection(object):
                 self.remaining_connection_attempts = (
                     self.params.connection_attempts)
 
-    def remove_timeout(self, callback_method):
+    def remove_timeout(self, timer):
         """Adapters should override to call the callback after the
         specified number of seconds have elapsed, using a timer, or a
         thread, or similar.
 
-        :param method callback_method: The callback to remove a timeout for
+        :param timer: The opaque timer to remove
 
         """
         raise NotImplementedError

@@ -308,7 +308,7 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
         # Base class is responsible for setting this member to a
         # pika.connection.Connection-based instance and invoking
         # _process_io_for_connection_setup()
-        impl_class = None
+        self._impl = None
 
     @abc.abstractmethod
     def _manage_io(self, *waiters):
@@ -570,7 +570,7 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
         return timer_id
 
     def remove_timeout(self, timeout_id):
-        """Remove a timer if it's still in the timeout stack
+        """Remove a timer that hasn't been dispatched yet
 
         :param timeout_id: The opaque timer id to remove
 
@@ -695,7 +695,7 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
         # Prepare `with` context
         return self
 
-    def __exit__(self, tp, value, traceback):
+    def __exit__(self, exc_type, value, traceback):
         # Close connection after `with` context
         self.close()
 
@@ -2240,8 +2240,8 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
           `spec.Exchange.BindOk`
 
         """
-        with _CallbackResult(
-                self._MethodFrameCallbackResultArgs) as bind_ok_result:
+        with _CallbackResult(self._MethodFrameCallbackResultArgs) \
+                as bind_ok_result:
             self._impl.exchange_bind(
                 callback=bind_ok_result.set_value_once,
                 destination=destination,
@@ -2307,8 +2307,8 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
           `spec.Queue.DeclareOk`
 
         """
-        with _CallbackResult(
-                self._MethodFrameCallbackResultArgs) as declare_ok_result:
+        with _CallbackResult(self._MethodFrameCallbackResultArgs) \
+                as declare_ok_result:
             self._impl.queue_declare(
                 callback=declare_ok_result.set_value_once,
                 queue=queue,
@@ -2335,8 +2335,8 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
           `spec.Queue.DeleteOk`
 
         """
-        with _CallbackResult(
-                self._MethodFrameCallbackResultArgs) as delete_ok_result:
+        with _CallbackResult(self._MethodFrameCallbackResultArgs) \
+                as delete_ok_result:
             self._impl.queue_delete(callback=delete_ok_result.set_value_once,
                                     queue=queue,
                                     if_unused=if_unused,
@@ -2357,8 +2357,8 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
           `spec.Queue.PurgeOk`
 
         """
-        with _CallbackResult(
-                self._MethodFrameCallbackResultArgs) as purge_ok_result:
+        with _CallbackResult(self._MethodFrameCallbackResultArgs) \
+                as purge_ok_result:
             self._impl.queue_purge(callback=purge_ok_result.set_value_once,
                                    queue=queue,
                                    nowait=False)
@@ -2412,8 +2412,8 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
           `spec.Queue.UnbindOk`
 
         """
-        with _CallbackResult(
-                self._MethodFrameCallbackResultArgs) as unbind_ok_result:
+        with _CallbackResult(self._MethodFrameCallbackResultArgs) \
+                as unbind_ok_result:
             self._impl.queue_unbind(callback=unbind_ok_result.set_value_once,
                                     queue=queue,
                                     exchange=exchange,
@@ -2432,8 +2432,8 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
           `spec.Tx.SelectOk`
 
         """
-        with _CallbackResult(
-                self._MethodFrameCallbackResultArgs) as select_ok_result:
+        with _CallbackResult(self._MethodFrameCallbackResultArgs) \
+                as select_ok_result:
             self._impl.tx_select(select_ok_result.set_value_once)
 
             self._flush_output(select_ok_result.is_ready)
@@ -2447,8 +2447,8 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
           `spec.Tx.CommitOk`
 
         """
-        with _CallbackResult(
-                self._MethodFrameCallbackResultArgs) as commit_ok_result:
+        with _CallbackResult(self._MethodFrameCallbackResultArgs) \
+                as commit_ok_result:
             self._impl.tx_commit(commit_ok_result.set_value_once)
 
             self._flush_output(commit_ok_result.is_ready)
@@ -2462,8 +2462,8 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
           `spec.Tx.CommitOk`
 
         """
-        with _CallbackResult(
-                self._MethodFrameCallbackResultArgs) as rollback_ok_result:
+        with _CallbackResult(self._MethodFrameCallbackResultArgs) \
+                as rollback_ok_result:
             self._impl.tx_rollback(rollback_ok_result.set_value_once)
 
             self._flush_output(rollback_ok_result.is_ready)
