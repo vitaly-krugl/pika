@@ -53,11 +53,13 @@ def verify_overrides(cls):
         if not callable(method):
             raise TypeError('{} is not callable', method)
 
-        if not hasattr(method, 'im_self'):
-            raise TypeError('{} does not have `im_self` member'.format(method))
+        if not hasattr(method, '__self__'):
+            raise TypeError('{} does not have `__self__` member'.format(method))
 
-        if method.im_self is not None:
-            raise TypeError('{} is not an unbound method'.format(method))
+        if method.__self__ is not None:
+            raise TypeError(
+                '{} is not an unbound method: `__self__` {} is not None'
+                .format(method, method.__self__))
 
         for base_cls in method.im_class.__bases__:
             base_method = getattr(base_cls, method.__name__, None)
@@ -69,14 +71,15 @@ def verify_overrides(cls):
                 raise TypeError('{} attempts to override non-callable {}'
                                 .format(method, base_method))
 
-            if not hasattr(base_method, 'im_self'):
+            if not hasattr(base_method, '__self__'):
                 raise TypeError(
-                    '{}\'s base {} does not have `im_self` member'.format(
+                    '{}\'s base {} does not have `__self__` member'.format(
                         method, base_method))
 
-            if base_method.im_self is not None:
-                raise TypeError('{}\'s base {} is not an unbound method'.format(
-                    method, base_method))
+            if base_method.__self__ is not None:
+                raise TypeError('{}\'s base {} is not an unbound method: '
+                                '`__self__` {} is not None'.format(
+                                    method, base_method, base_method.__self__))
 
             break
         else:
