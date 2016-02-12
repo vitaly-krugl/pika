@@ -479,7 +479,7 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
         :param callable user_callback: callback_method passed to
            `add_on_connection_unblocked_callback`
         :param pika.frame.Method method_frame: method frame having `method`
-            member of type `pika.spec.Connection.Blocked`
+            member of type `pika.spec.Connection.Unblocked`
         """
         self._ready_events.append(
             _ConnectionUnblockedEvt(user_callback, method_frame))

@@ -527,7 +527,7 @@ class _PollerBase(pika.compat.AbstractBase):  # pylint: disable=R0902
                 # consitency.
                 os.write(self._w_interrupt.fileno(), b'X')
             except OSError as err:
-                if err.errno != errno.EWOULDBLOCK:
+                if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
                     raise
             except Exception as err:
                 # There's nothing sensible to do here, we'll exit the interrupt
@@ -651,7 +651,7 @@ class _PollerBase(pika.compat.AbstractBase):  # pylint: disable=R0902
         try:
             os.read(interrupt_fd, 512)
         except OSError as err:
-            if err.errno != errno.EAGAIN:
+            if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
                 raise
 
 
