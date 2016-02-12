@@ -14,14 +14,15 @@ and the :class:`~pika.adapters.blocking_connection_base.BlockingChannel`
 classes.
 
 """
-# Disable "access to protected member warnings: this wrapper implementation is
-# a friend of those instances
-# pylint: disable=W0212
+
+# Suppress pylint messages concerning "Too few public methods"
+# pylint: disable=R0903
 
 
 import logging
 ##import Queue
 import threading
+import time
 
 from pika.adapters import blocking_connection_base
 import pika.connection
@@ -122,6 +123,8 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
     Communication with the background connection is facilitated by thread-safe
     queues and signaling socket.
     """
+    # Suppress warnings concerning "Access to a protected member"
+    # pylint: disable=W0212
 
     def __init__(self, parameters=None):
         """Create a new instance of the `ThreadedConnection` object.
@@ -389,3 +392,126 @@ class _ProxyConnection(pika.connection.Connection):
 
         """
         pass
+
+
+class _Timer(object):
+    """Represents a timer created via `_TimerManager`"""
+
+    def __init__(self, timer_mgr, deadline, callback):
+        """
+        :param _TimerManager timer_mgr:
+        :param float deadline: timer expiration as epoch timestamp
+        """
+
+        self._timer_mgr = timer_mgr
+
+        self._deadline = deadline
+
+        self._callback = callback
+
+        LOGGER.debug('%r created timer %r with deadline %s and callback %r',
+                     self._timer_mgr, self, self._deadline, self._callback)
+
+    def cancel(self):
+        """Deactivate the timer; it's an error to cancel a triggered or
+        deactivated timer """
+
+        # Suppress warnings concerning "Access to a protected member"
+        # pylint: disable=W0212
+
+        if self._timer_mgr is not None:
+            self._timer_mgr._cancel_timer(self)
+            self._timer_mgr = None
+        else:
+            LOGGER.error('Attempted to cancel deactivated timer %r', self)
+
+
+class _TimerManager(object):
+    """Manage timers for use in ioloop"""
+
+    # Suppress warnings concerning "Access to a protected member"
+    # pylint: disable=W0212
+
+    def __init__(self):
+        self._timers = set()
+        self._next_timeout = None
+
+    def add_timeout(self, period, callback):
+        """Schedule a one-shot timer.
+
+        NOTE: you may cancel the timer before dispatch of the callback. Timer
+            Manager cancels the timer upon dispatch of the callback.
+
+        :param float period: The number of seconds from now until expiration
+        :param method callback: The callback method
+
+        :rtype: _Timer
+
+        """
+        deadline = time.time() + period
+
+        timer = _Timer(timer_mgr=self, deadline=deadline, callback=callback)
+
+        self._timers.add(timer)
+
+        if self._next_timeout is None or deadline < self._next_timeout:
+            self._next_timeout = deadline
+
+        LOGGER.debug('add_timeout: added timer %r; period=%s at %s',
+                     timer, period, deadline)
+
+        return timer
+
+    def _cancel_timer(self, timer):
+        """Cancel the timer
+
+        :param _Timer timer: The timer to cancel
+
+        """
+        self._timers.remove(timer)
+
+        if timer._deadline == self._next_timeout:
+            self._next_timeout = None
+
+        LOGGER.debug('_cancel_timer: removed %r', timer)
+
+    def get_remaining_interval(self):
+        """Get the interval to the next timer expiration
+
+        :returns: number of seconds until next timer expiration; None if there
+            are no timers
+        :rtype: float
+
+        """
+        if self._next_timeout is not None:
+            # Compensate in case time was adjusted
+            interval = max((self._next_timeout - time.time(), 0))
+
+        elif self._timers:
+            self._next_timeout = min(t._deadline for t in self._timers)
+            interval = max((self._next_timeout - time.time(), 0))
+
+        else:
+            interval = None
+
+        return interval
+
+    def process_timeouts(self):
+        """Process pending timeouts, invoking callbacks for those whose time has
+        come
+
+        """
+        now = time.time()
+
+        to_run = sorted((timer for timer in self._timers
+                         if timer._deadline <= now),
+                        key=lambda item: item._deadline)
+
+        for timer in to_run:
+            if timer._timer_mgr is None:
+                # Previous invocation(s) deleted the timer.
+                continue
+
+            timer.cancel()
+
+            timer._callback()

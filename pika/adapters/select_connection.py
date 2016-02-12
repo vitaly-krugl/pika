@@ -330,8 +330,8 @@ class _PollerBase(pika.compat.AbstractBase):  # pylint: disable=R0902
             timeout = max((self._next_timeout - time.time(), 0))
 
         elif self._timeouts:
-            deadlines = [t['deadline'] for t in self._timeouts.values()]
-            self._next_timeout = min(deadlines)
+            self._next_timeout = min(
+                t['deadline'] for t in self._timeouts.values())
             timeout = max((self._next_timeout - time.time(), 0))
 
         else:
