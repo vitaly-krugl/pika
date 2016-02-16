@@ -6,7 +6,6 @@ import logging
 import math
 import numbers
 import platform
-import threading
 import warnings
 
 if sys.version_info > (3,):
@@ -609,8 +608,6 @@ class Connection(object):
             on_close_callback(connection, reason_code, reason_text)
 
         """
-        self._write_lock = threading.Lock()
-
         # Define our callback dictionary
         self.callbacks = callback.CallbackManager()
 
@@ -1633,15 +1630,12 @@ class Connection(object):
 
         """
         if not content:
-            with self._write_lock:
-                self._send_frame(frame.Method(channel_number, method_frame))
-                return
-        self._send_message(channel_number, method_frame, content)
+            self._send_frame(frame.Method(channel_number, method_frame))
+        else:
+            self._send_message(channel_number, method_frame, content)
 
     def _send_message(self, channel_number, method_frame, content=None):
-        """Send the message directly, bypassing the single _send_frame
-        invocation by directly appending to the output buffer and flushing
-        within a lock.
+        """Publish a message.
 
         :param int channel_number: The channel number for the frame
         :param pika.object.Method method_frame: The method frame to send
@@ -1663,12 +1657,11 @@ class Connection(object):
                 write_buffer.append(frame.Body(channel_number,
                                                content[1][s:e]).marshal())
 
-        with self._write_lock:
-            self.outbound_buffer += write_buffer
-            self.frames_sent += len(write_buffer)
-            self._flush_outbound()
-            if self.params.backpressure_detection:
-                self._detect_backpressure()
+        self.outbound_buffer += write_buffer
+        self.frames_sent += len(write_buffer)
+        self._flush_outbound()
+        if self.params.backpressure_detection:
+            self._detect_backpressure()
 
     def _set_connection_state(self, connection_state):
         """Set the connection state.

@@ -30,9 +30,6 @@ import pika.exceptions
 
 from pika.adapters import bg_connection_service
 
-# NOTE: import SelectConnection after others to avoid circular depenency
-from pika.adapters import select_connection
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -113,11 +110,11 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
     for sharing a single AMQP connection by multiple threads via connection
     cloning.
 
-    `ThreadedConnection`'s engine consits of an asynchronous proxy connection
+    `ThreadedConnection`'s engine consits of an asynchronous connection proxy
     based on `pika.connection.Connection` that executes in the context of user's
     thread and a true AMQP connection based on `SelectConnection` that executes
     on a separate thread. `ThreadedConnection` shuttles channel-level AMQP
-    messages between the proxy connection's channels and the true connection
+    messages between the connection proxy's channels and the true connection
     using event-driven semantics.
 
     Communication with the background connection is facilitated by thread-safe
@@ -126,31 +123,55 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
     # Suppress warnings concerning "Access to a protected member"
     # pylint: disable=W0212
 
-    def __init__(self, parameters=None):
+    def __init__(self, parameters=None, **kwargs):
         """Create a new instance of the `ThreadedConnection` object.
 
         :param pika.connection.Parameters parameters: Connection parameters;
             None for default parameters.
+        :param bg_connection_service.ServiceProxy service_proxy: private arg via
+            kwargs only. `ThreadedConnection.clone` passes this arg to
+            initialize the cloned connection
+        :param _ThreadsafeChannelNumberAllocator channel_number_allocator:
+            private arg via kwargs only.  `ThreadedConnection.clone` passes this
+            arg to initialize the cloned connection
 
         :raises AMQPConnectionError:
 
         """
         super(ThreadedConnection, self).__init__()
 
-        self._impl = self._establish_amqp_connection(parameters)
-        self._impl._ioloop.activate_poller()
+        service_proxy = kwargs.pop('service_proxy')
+        channel_number_allocator = kwargs.pop('channel_number_allocator')
+
+        if kwargs:
+            raise TypeError('ThreadedConnection received unexpected kwargs {!r}'
+                            .format(kwargs))
+
+        self._impl = self._establish_amqp_connection(
+            parameters=parameters,
+            service_proxy=service_proxy,
+            channel_number_allocator=channel_number_allocator)
 
         self._process_io_for_connection_setup()
 
-    def _establish_amqp_connection(self, parameters):
-        """Establish AMQP connection with broker and set up proxy connection
+    def _establish_amqp_connection(self,
+                                   parameters,
+                                   service_proxy,
+                                   channel_number_allocator):
+        """Establish AMQP connection with broker and set up _ConnectionProxy
 
         :param pika.connection.Parameters parameters: Connection parameters;
             None for default parameters.
+        :param bg_connection_service.ServiceProxy service_proxy: Service Proxy
+            of source connection when cloning; None when creating a connection
+            from scratch.
+        :param _ThreadsafeChannelNumberAllocator channel_number_allocator:
+            shared `_ThreadsafeChannelNumberAllocator` instance when cloning;
+            None when creating a connection from scratch.
 
-        :returns: initialized proxy connection reflecting state of connection
+        :returns: initialized connection proxy reflecting state of connection
             establishment
-        :rtype: _ProxyConnection
+        :rtype: _ConnectionProxy
 
         """
         pass
@@ -185,66 +206,13 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
         collection
 
         """
-        self._impl._ioloop.deactivate_poller()
-
         super(ThreadedConnection, self)._cleanup()
 
 
-class _ThreadSafeChannelNumberPool(object):
-    """Thread-safe channel number allocator"""
-
-    def __init__(self, max_channels):
-
-        self._max_channels = max_channels
-
-        self._lock = threading.Lock()
-
-        # Allocated channel numbers
-        self._allocated_channels = set()
-
-    def allocate(self):
-        """Reserve a channel number, making it unavailable until it is returned
-        back to channel number pool via `_ThreadSafeChannelNumberPool.free`
-
-        :returns: channel number
-        :rtype: int
-
-        :raises pika.exceptions.NoFreeChannels: if no more channels are
-            available
-
-        """
-
-        channel_number = None
-
-        with self._lock:
-            if len(self._allocated_channels) >= self._max_channels:
-                raise pika.exceptions.NoFreeChannels()
-
-            for channel_number in xrange(1, len(self._allocated_channels) + 1):
-                if channel_number not in self._allocated_channels:
-                    break
-            else:
-                channel_number = len(self._allocated_channels) + 1
-
-            self._allocated_channels.add(channel_number)
-
-        return channel_number
-
-    def free(self, channel_number):
-        """Release a channel number, making it available to for allocation
-
-        :param int channel_number: channel number to release; must be in
-            reserved set
-        :raises KeyError: if `channel_number` is not in reserved set
-
-        """
-        with self._lock:
-            self._allocated_channels.remove(channel_number)
-
 
 @verify_overrides
-class _ProxyConnection(pika.connection.Connection):
-    """`_ProxyConnection` serves as a proxy for the background AMQP connection.
+class _ConnectionProxy(pika.connection.Connection):
+    """`_ConnectionProxy` serves as a proxy for the background AMQP connection.
     It provides the asyncronous ("_impl") connection services expected by
     `BlockingConnectionBase`, such as timers, creation of channels, and
     registration of callbacks for connection-level events
@@ -269,9 +237,9 @@ class _ProxyConnection(pika.connection.Connection):
             on_close_callback(connection, reason_code, reason_text)
 
         """
-        self._ioloop = select_connection.IOLoop()
+        self._ioloop = _IOLoop()
 
-        super(_ProxyConnection, self).__init__(
+        super(_ConnectionProxy, self).__init__(
             parameters=parameters,
             on_open_callback=on_open_callback,
             on_open_error_callback=on_open_error_callback,
@@ -279,7 +247,7 @@ class _ProxyConnection(pika.connection.Connection):
 
     @overrides_instance_method
     def connect(self):
-        """[replace base] Replace the connection machinery. `_ProxyConnection`
+        """[replace base] Replace the connection machinery. `_ConnectionProxy`
         connects to AMQP broker indirectly via `BackgroundConnectionService`.
 
         This method is invoked by the base `Connection` class to initiate
@@ -394,6 +362,57 @@ class _ProxyConnection(pika.connection.Connection):
         pass
 
 
+class _ThreadsafeChannelNumberAllocator(object):
+    """Thread-safe channel number allocator"""
+
+    def __init__(self, max_channels):
+
+        self._max_channels = max_channels
+
+        self._lock = threading.Lock()
+
+        # Allocated channel numbers
+        self._allocated_channels = set()
+
+    def allocate(self):
+        """Reserve a channel number, making it unavailable until it is returned
+        back to channel number pool via `_ThreadsafeChannelNumberPool.free`
+
+        :returns: channel number
+        :rtype: int
+
+        :raises pika.exceptions.NoFreeChannels: if no more channels are
+            available
+
+        """
+
+        channel_number = None
+
+        with self._lock:
+            if len(self._allocated_channels) >= self._max_channels:
+                raise pika.exceptions.NoFreeChannels()
+
+            for channel_number in xrange(1, len(self._allocated_channels) + 1):
+                if channel_number not in self._allocated_channels:
+                    break
+            else:
+                channel_number = len(self._allocated_channels) + 1
+
+            self._allocated_channels.add(channel_number)
+
+        return channel_number
+
+    def free(self, channel_number):
+        """Release a channel number, making it available to for allocation
+
+        :param int channel_number: channel number to release; must be in
+            reserved set
+        :raises KeyError: if `channel_number` is not in reserved set
+
+        """
+        with self._lock:
+            self._allocated_channels.remove(channel_number)
+
 class _Timer(object):
     """Represents a timer created via `_TimerManager`"""
 
@@ -443,7 +462,8 @@ class _TimerManager(object):
             Manager cancels the timer upon dispatch of the callback.
 
         :param float period: The number of seconds from now until expiration
-        :param method callback: The callback method
+        :param method callback: The callback method, having the signature
+            `callback()`
 
         :rtype: _Timer
 
@@ -515,3 +535,42 @@ class _TimerManager(object):
             timer.cancel()
 
             timer._callback()
+
+
+
+class _IOLoop(object):
+    """Bare-bones ioloop for `ThreadedConnection`"""
+
+    def __init__(self):
+        self._timer_mgr = _TimerManager()
+
+    def add_timeout(self, deadline, callback_method):
+        """Schedule a one-shot timer.
+
+        NOTE: you may cancel the timer before dispatch of the callback. _IOLoop
+            cancels the timer upon dispatch of the callback.
+
+        :param float period: The number of seconds from now until expiration
+        :param method callback: The callback method, having the signature
+            `callback()`
+
+        :returns: opaque timer handle
+
+        """
+        return self._timer_mgr.add_timeout(deadline, callback)
+
+    def remove_timeout(self, timer):
+        """Cancel a timer; may be called only on a timer that hasn't been
+        called/cancelled yet.
+
+        :param timer: The timer handle created by `add_timeout`.
+
+        """
+        timer.cancel()
+
+    def process_timeouts(self):
+        """Process pending timeouts, invoking callbacks for those whose time has
+        come
+
+        """
+        self._timer_mgr.process_timeouts()

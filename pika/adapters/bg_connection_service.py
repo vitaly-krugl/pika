@@ -421,6 +421,10 @@ class ClientProxy(object):
         """
         self._evt_queue = queue
 
+        # Flag for use only by `BackgroundConnectionProxy` to track whether a
+        # client proxy instance completed its connection sequence.
+        self.connected = False
+
 
     def send(self, event):
         """Send an event to client
