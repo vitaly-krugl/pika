@@ -1634,19 +1634,19 @@ class Connection(object):
         else:
             self._send_message(channel_number, method_frame, content)
 
-    def _send_message(self, channel_number, method_frame, content=None):
+    def _send_message(self, channel_number, method_frame, content):
         """Publish a message.
 
         :param int channel_number: The channel number for the frame
         :param pika.object.Method method_frame: The method frame to send
-        :param tuple content: If set, is a content frame, is tuple of
-                              properties and body.
+        :param tuple content: A content frame, which is tuple of properties and
+                              body.
 
         """
         length = len(content[1])
-        write_buffer = [frame.Method(channel_number, method_frame).marshal(),
-                        frame.Header(channel_number, length,
-                                     content[0]).marshal()]
+        self._send_frame(frame.Method(channel_number, method_frame))
+        self._send_frame(frame.Header(channel_number, length, content[0]))
+
         if content[1]:
             chunks = int(math.ceil(float(length) / self._body_max_length))
             for chunk in range(0, chunks):
@@ -1654,14 +1654,7 @@ class Connection(object):
                 e = s + self._body_max_length
                 if e > length:
                     e = length
-                write_buffer.append(frame.Body(channel_number,
-                                               content[1][s:e]).marshal())
-
-        self.outbound_buffer += write_buffer
-        self.frames_sent += len(write_buffer)
-        self._flush_outbound()
-        if self.params.backpressure_detection:
-            self._detect_backpressure()
+                self._send_frame(frame.Body(channel_number, content[1][s:e]))
 
     def _set_connection_state(self, connection_state):
         """Set the connection state.
