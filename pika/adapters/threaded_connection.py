@@ -19,12 +19,14 @@ classes.
 # pylint: disable=R0903
 
 
+import copy
 import logging
-##import Queue
+import Queue
 import threading
 import time
 
 from pika.adapters import blocking_connection_base
+import pika.channel
 import pika.connection
 import pika.exceptions
 
@@ -140,45 +142,44 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
         """
         super(ThreadedConnection, self).__init__()
 
-        service_proxy = kwargs.pop('service_proxy')
-        channel_number_allocator = kwargs.pop('channel_number_allocator')
+        self._gw_event_rx_queue = Queue.Queue()
+        self._client_proxy = bg_connection_service.ClientProxy(
+            self._gw_event_rx_queue)
+
+        self._service_proxy = kwargs.pop('service_proxy')
+        self._channel_number_allocator = kwargs.pop('channel_number_allocator')
 
         if kwargs:
             raise TypeError('ThreadedConnection received unexpected kwargs {!r}'
                             .format(kwargs))
 
-        self._impl = self._establish_amqp_connection(
+        if self._service_proxy is None:
+            assert self._channel_number_allocator is None, (
+                repr(self._channel_number_allocator))
+
+            # Start Connection Gateway
+            self._service_proxy = (
+                bg_connection_service.BackgroundConnectionService(
+                    parameters=copy.deepcopy(parameters)).start())
+
+        # Initiate client connection setup
+        self._impl = _ConnectionProxy(
             parameters=parameters,
-            service_proxy=service_proxy,
-            channel_number_allocator=channel_number_allocator)
+            on_open_callback=self._opened_result.set_value_once,
+            on_open_error_callback=self._open_error_result.set_value_once,
+            on_close_callback=self._closed_result.set_value_once,
+            client_proxy=self._client_proxy,
+            service_proxy=self._service_proxy)
 
         self._process_io_for_connection_setup()
 
-    def _establish_amqp_connection(self,
-                                   parameters,
-                                   service_proxy,
-                                   channel_number_allocator):
-        """Establish AMQP connection with broker and set up _ConnectionProxy
-
-        :param pika.connection.Parameters parameters: Connection parameters;
-            None for default parameters.
-        :param bg_connection_service.ServiceProxy service_proxy: Service Proxy
-            of source connection when cloning; None when creating a connection
-            from scratch.
-        :param _ThreadsafeChannelNumberAllocator channel_number_allocator:
-            shared `_ThreadsafeChannelNumberAllocator` instance when cloning;
-            None when creating a connection from scratch.
-
-        :returns: initialized connection proxy reflecting state of connection
-            establishment
-        :rtype: _ConnectionProxy
-
-        """
-        pass
+        if self._channel_number_allocator is None:
+            self._channel_number_allocator = _ThreadsafeChannelNumberAllocator(
+                self._impl.params.channel_max or pika.channel.MAX_CHANNELS)
 
     @overrides_instance_method
     def _manage_io(self, *waiters):
-        """ [pure virtual method override] Flush output and process input and
+        """[implement pure virtual method] Flush output and process input and
         asyncronous timers while waiting for any of the given  callbacks to
         return true. The wait is unconditionally aborted upon connection-close.
         Otherwise, processing continues until the output is flushed AND at least
@@ -198,16 +199,69 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
                         Their results are OR'ed together.
 
         """
-        pass
+        # Process I/O until our completion condition is satisified
+        is_done = None
+        while True:
+            if self._impl._outbound_frames:
+                # Outbound frames were added, need to update is_done
+                is_done = None
 
-    @overrides_instance_method
-    def _cleanup(self):
-        """[override base] Clean up members that might inhibit garbage
-        collection
+            if is_done is None:
+                frames_sent_result = blocking_connection_base._CallbackResult()
 
+                # Dispatch pending frames to Connection Gateway
+                if self._impl._outbound_frames:
+                    # Dispatch pending outbound frames to Connection Gateway
+                    event = bg_connection_service.FramesToBrokerEvent(
+                        client=self._client_proxy,
+                        frames=self._impl._outbound_frames,
+                        on_result_rx=frames_sent_result.signal_once)
+
+                    self._impl._outbound_frames = []
+
+                    self._service_proxy.dispatch(event)
+                else:
+                    frames_sent_result.signal_once()
+
+                is_done = (
+                    lambda:
+                    self.is_closed or
+                    (frames_sent_result.ready and
+                     (not waiters or any(ready() for ready in  waiters))))
+
+            if is_done():
+                break
+
+            # Wait for event from Connection Gateway
+            try:
+                event = self._gw_event_rx_queue.get(
+                    timeout=self._impl.ioloop.get_remaining_interval())
+            except Queue.Empty:
+                pass
+            else:
+                self._on_event_from_gateway(event)
+
+                # Process all other events that are available right now
+                for _ in xrange(self._gw_event_rx_queue.qsize()):
+                    self._on_event_from_gateway(
+                        self._gw_event_rx_queue.get(block=False))
+
+            self._impl.ioloop.process_timeouts()
+
+    def _on_event_from_gateway(self, event):
+        """Process an event received from Connection Gateway
+
+        :param event: event from Connection Gateway
         """
-        super(ThreadedConnection, self)._cleanup()
-
+        if isinstance(event, bg_connection_service.RpcEventFamily):
+            event.on_result_rx(event.result)
+        elif isinstance(event, bg_connection_service.FramesToClientEvent):
+            for frame in event.frames:
+                # TODO Register Connection for blocked/unblocked
+                # TODO and decouple internal blocked/unblocked reg from user reg
+                self._impl._process_frame(frame)
+        else:
+            raise TypeError('Unexpected event type {!r}'.format(event))
 
 
 @verify_overrides
@@ -220,10 +274,12 @@ class _ConnectionProxy(pika.connection.Connection):
     """
 
     def __init__(self,
-                 parameters=None,
-                 on_open_callback=None,
-                 on_open_error_callback=None,
-                 on_close_callback=None):
+                 parameters,
+                 on_open_callback,
+                 on_open_error_callback,
+                 on_close_callback,
+                 client_proxy,
+                 service_proxy):
         """
         Available Parameters classes are the `ConnectionParameters` class and
         `URLParameters` class.
@@ -235,9 +291,21 @@ class _ConnectionProxy(pika.connection.Connection):
             be established: on_open_error_callback(connection, str|exception)
         :param method on_close_callback: Called when the connection is closed:
             on_close_callback(connection, reason_code, reason_text)
+        :param bg_connection_service.ClientProxy client_proxy: Connection
+            Gateway's interface to client
+        :param bg_connection_service.ServiceProxy service_proxy: Client's
+            interface to Connection Gateway
 
         """
-        self._ioloop = _IOLoop()
+        # Initialize ahead of super, because Connection constructor uses adapter
+        # services
+        self.ioloop = _IOLoop()
+        self._client_proxy = client_proxy
+        self._service_proxy = service_proxy
+
+        # Frames to be dispatched to Connection Gateway during next
+        # ThreadedConnection._manage_io cycle
+        self._outbound_frames = []
 
         super(_ConnectionProxy, self).__init__(
             parameters=parameters,
@@ -245,75 +313,81 @@ class _ConnectionProxy(pika.connection.Connection):
             on_open_error_callback=on_open_error_callback,
             on_close_callback=on_close_callback)
 
-    @overrides_instance_method
-    def connect(self):
-        """[replace base] Replace the connection machinery. `_ConnectionProxy`
-        connects to AMQP broker indirectly via `BackgroundConnectionService`.
+        # Detect if Connection code attempts to add to outbound_buffer directly
+        # without going through _send_frame, which we override
+        assert not self.outbound_buffer
+        self.outbound_buffer = None
 
-        This method is invoked by the base `Connection` class to initiate
-        connection-establishment with AMQP broker
-
-        """
-        pass
-
-    @overrides_instance_method
-    def _send_connection_close(self, reply_code, reply_text):
-        """[replace base] Send a Connection.Close method frame.
-
-        :param int reply_code: The reason for the close
-        :param str reply_text: The text reason for the close
-
-        """
-        pass
-
-    @overrides_instance_method
-    def add_on_connection_blocked_callback(self, callback_method):
-        """[supplement base] Add a callback to be notified when RabbitMQ has
-        sent a `Connection.Blocked` frame indicating that RabbitMQ is low on
-        resources. Publishers can use this to voluntarily suspend publishing,
-        instead of relying on back pressure throttling. The callback will be
-        passed the `Connection.Blocked` method frame.
-
-        :param method callback_method: Callback to call on `Connection.Blocked`,
-            having the signature callback_method(pika.frame.Method), where the
-            method frame's `method` member is of type
-            `pika.spec.Connection.Blocked`
-
-        """
-        pass
-
-    @overrides_instance_method
-    def add_on_connection_unblocked_callback(self, callback_method):
-        """[supplement base] Add a callback to be notified when RabbitMQ has
-        sent a `Connection.Unblocked` frame letting publishers know it's ok to
-        start publishing again. The callback will be passed the
-        `Connection.Unblocked` method frame.
-
-        :param method callback_method: Callback to call on
-            `Connection.Unblocked`, having the signature
-            callback_method(pika.frame.Method), where the method frame's
-            `method` member is of type `pika.spec.Connection.Unblocked`
-
-        """
-
-    @overrides_instance_method
-    def channel(self, on_open_callback, channel_number=None):
-        """[supplement base] Create a new channel with the next available
-        channel number or pass in a channel number to use. Must be non-zero if
-        you would like to specify but it is recommended that you let Pika manage
-        the channel numbers.
-
-        :param method on_open_callback: The callback when the channel is opened
-        :param int channel_number: The channel number to use, defaults to the
-                                   next available.
-        :rtype: pika.channel.Channel
-
-        """
-        pass
+##    @overrides_instance_method
+##    def connect(self):
+##        """[supplement base] Replace the connection machinery.
+##        `_ConnectionProxy` connects to AMQP broker indirectly via
+##        `BackgroundConnectionService`.
+##
+##        This method is invoked by the base `Connection` class to initiate
+##        connection-establishment with AMQP broker
+##
+##        """
+##        pass
+##
+##    @overrides_instance_method
+##    def _send_connection_close(self, reply_code, reply_text):
+##        """[replace base] Send a Connection.Close method frame.
+##
+##        :param int reply_code: The reason for the close
+##        :param str reply_text: The text reason for the close
+##
+##        """
+##        pass
+##
+##    @overrides_instance_method
+##    def add_on_connection_blocked_callback(self, callback_method):
+##        """[supplement base] Add a callback to be notified when RabbitMQ has
+##        sent a `Connection.Blocked` frame indicating that RabbitMQ is low on
+##        resources. Publishers can use this to voluntarily suspend publishing,
+##        instead of relying on back pressure throttling. The callback will be
+##        passed the `Connection.Blocked` method frame.
+##
+##        :param method callback_method: Callback to call on `Connection.Blocked`,
+##            having the signature callback_method(pika.frame.Method), where the
+##            method frame's `method` member is of type
+##            `pika.spec.Connection.Blocked`
+##
+##        """
+##        pass
+##
+##    @overrides_instance_method
+##    def add_on_connection_unblocked_callback(self, callback_method):
+##        """[supplement base] Add a callback to be notified when RabbitMQ has
+##        sent a `Connection.Unblocked` frame letting publishers know it's ok to
+##        start publishing again. The callback will be passed the
+##        `Connection.Unblocked` method frame.
+##
+##        :param method callback_method: Callback to call on
+##            `Connection.Unblocked`, having the signature
+##            callback_method(pika.frame.Method), where the method frame's
+##            `method` member is of type `pika.spec.Connection.Unblocked`
+##
+##        """
+##
+##    @overrides_instance_method
+##    def channel(self, on_open_callback, channel_number=None):
+##        """[supplement base] Create a new channel with the next available
+##        channel number or pass in a channel number to use. Must be non-zero if
+##        you would like to specify but it is recommended that you let Pika manage
+##        the channel numbers.
+##
+##        :param method on_open_callback: The callback when the channel is opened
+##        :param int channel_number: The channel number to use, defaults to the
+##                                   next available.
+##        :rtype: pika.channel.Channel
+##
+##        """
+##        pass
 
     @overrides_instance_method
     def add_timeout(self, deadline, callback_method):
-        """[override pure virtual] Create a single-shot timer to fire after
+        """[implement pure virtual] Create a single-shot timer to fire after
         deadline seconds. Do not confuse with Tornado's timeout where you pass
         in the time you want to have your callback called. Only pass in the
         seconds until it's to be called.
@@ -325,41 +399,76 @@ class _ConnectionProxy(pika.connection.Connection):
         :returns: opaque timer
 
         """
-        return self._ioloop.add_timeout(deadline, callback_method)
+        return self.ioloop.add_timeout(deadline, callback_method)
 
     @overrides_instance_method
     def remove_timeout(self, timer):
-        """[override pure virtual] Remove a timer that hasn't been dispatched
+        """[implement pure virtual] Remove a timer that hasn't been dispatched
         yet
 
         :param timer: The opaque timer to remove
 
         """
-        self._ioloop.remove_timeout(timer)
+        self.ioloop.remove_timeout(timer)
 
     @overrides_instance_method
     def _adapter_connect(self):
-        """[override pure virtual] Subclasses should override to set up the
+        """[implement pure virtual] Subclasses should override to set up the
         outbound socket connection.
 
         """
-        pass
+        # Register this client with the Connection Gateway
+        self._service_proxy.dispatch(
+            bg_connection_service.ClientRegEvent(self._client_proxy))
+
+        return None
 
     @overrides_instance_method
     def _adapter_disconnect(self):
-        """[override pure virtual] Subclasses should override this to cause the
+        """[implement pure virtual] Subclasses should override this to cause the
         underlying transport (socket) to close.
 
         """
-        pass
+        # Unegister this client from the Connection Gateway
+        self._service_proxy.dispatch(
+            bg_connection_service.ClientUnregEvent(self._client_proxy))
 
     @overrides_instance_method
     def _flush_outbound(self):
-        """[override pure virtual] Adapters should override to flush the
+        """[implement pure virtual] Adapters should override to flush the
         contents of outbound_buffer out along the socket.
 
         """
-        pass
+        return
+
+    @overrides_instance_method
+    def _send_frame(self, frame_value):
+        """[replace base] Append the frame to the "outbound frames" list to be
+        dispatched to the Connection Gateway at the next
+        `ThreadedConnection._manage_io` cycle.
+
+        :param frame_value: The frame to write
+        :type frame_value:  pika.frame.Frame|pika.frame.ProtocolHeader
+        :raises: exceptions.ConnectionClosed
+
+        """
+        self._outbound_frames.append(frame_value)
+
+    @overrides_instance_method
+    def _send_message(self, channel_number, method_frame, content):
+        """[supplement base] Make a deep copy of the messages properties to
+        guard against race condition between user code and Connection Gateway.
+
+        :param int channel_number: The channel number for the frame
+        :param pika.object.Method method_frame: The method frame to send
+        :param tuple content: A content frame, which is tuple of properties and
+                              body.
+
+        """
+        return super(_ConnectionProxy, self)._send_message(
+            channel_number,
+            method_frame,
+            (copy.deepcopy(content[0]), content[1]))
 
 
 class _ThreadsafeChannelNumberAllocator(object):
@@ -574,3 +683,13 @@ class _IOLoop(object):
 
         """
         self._timer_mgr.process_timeouts()
+
+    def get_remaining_interval(self):
+        """Get the interval to the next timer expiration
+
+        :returns: number of seconds until next timer expiration; None if there
+            are no timers
+        :rtype: float
+
+        """
+        return self._timer_mgr.get_remaining_interval()

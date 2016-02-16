@@ -15,6 +15,7 @@ I/O.
 # pylint: disable=C0103
 
 
+import copy
 import collections
 import copy
 import errno
@@ -184,15 +185,15 @@ class BackgroundConnectionService(threading.Thread):
             if self._shutting_down:
                 continue
 
-            if isinstance(event, ClientOpEvent):
+            if isinstance(event, ClientOpEventFamily):
                 self._on_client_op_event(event)
-            elif isinstance(event, ChannelOpEvent):
+            elif isinstance(event, ChannelOpEventFamily):
                 self._on_channel_op_event(event)
             elif isinstance(event, BlockedConnectionSubscribeEvent):
                 self._on_blocked_connection_sub_event(event)
-            elif isinstance(event, DataToBrokerEvent):
+            elif isinstance(event, FramesToBrokerEvent):
                 # TODO _on_data_to_broker_event
-                self._on_data_to_broker_event(event)
+                self._on_frames_to_broker_event(event)
 
             else:
                 raise TypeError('Unexpected event type {!r}'.format(event))
@@ -200,7 +201,7 @@ class BackgroundConnectionService(threading.Thread):
     def _on_client_op_event(self, event):
         """Handle client reg/unreg events
 
-        :param ClientOpEvent event:
+        :param ClientOpEventFamily event:
 
         """
         client = event.client
@@ -264,7 +265,7 @@ class BackgroundConnectionService(threading.Thread):
     def _on_channel_op_event(self, event):
         """Handle channel reg/unreg events
 
-        :param ChannelOpEvent event:
+        :param ChannelOpEventFamily event:
 
         """
         client = event.client
@@ -435,7 +436,7 @@ class ClientProxy(object):
         self._evt_queue.put(event)
 
 
-class RpcEvent(object):
+class RpcEventFamily(object):
     """Base class for service-destined event that solicits a reply"""
 
     def __init__(self, on_result_rx):
@@ -450,7 +451,7 @@ class RpcEvent(object):
         self.result = None
 
 
-class AsyncEvent(object):
+class AsyncEventFamily(object):
     """Base class for client or service-destined event that has no reply"""
     pass
 
@@ -460,14 +461,14 @@ class ConnectionStateEvent(object):
     pass
 
 
-class ConnectionReadyEvent(ConnectionStateEvent, AsyncEvent):
+class ConnectionReadyEvent(ConnectionStateEvent, AsyncEventFamily):
     """Informs client that connection is ready"""
 
     def __init__(self, info):
         self.info = copy.deepcopy(info)
 
 
-class ConnectionGoneEvent(ConnectionStateEvent, AsyncEvent):
+class ConnectionGoneEvent(ConnectionStateEvent, AsyncEventFamily):
     """Informs client that AMQP connection is unavailable"""
     def __init__(self, exc):
         """
@@ -478,12 +479,12 @@ class ConnectionGoneEvent(ConnectionStateEvent, AsyncEvent):
         self.exc = exc
 
 
-class ClientOpEvent(object):
+class ClientOpEventFamily(object):
     """Designates subclass as client operation event """
     pass
 
 
-class ClientRegEvent(ClientOpEvent, AsyncEvent):
+class ClientRegEvent(ClientOpEventFamily, AsyncEventFamily):
     """Client registration event for registering a client with
     `BackgroundConnectionService`.
     """
@@ -496,7 +497,7 @@ class ClientRegEvent(ClientOpEvent, AsyncEvent):
         self.client = client
 
 
-class ClientUnregEvent(ClientOpEvent, AsyncEvent):
+class ClientUnregEvent(ClientOpEventFamily, AsyncEventFamily):
     """Client de-registration event for unregistering a client with
     `BackgroundConnectionService`.
     """
@@ -509,12 +510,12 @@ class ClientUnregEvent(ClientOpEvent, AsyncEvent):
         self.client = client
 
 
-class ChannelOpEvent(object):
+class ChannelOpEventFamily(object):
     """Designates subclass as channel operation event """
     pass
 
 
-class ChannelRegEvent(ChannelOpEvent, AsyncEvent):
+class ChannelRegEvent(ChannelOpEventFamily, AsyncEventFamily):
     """Channel registration event for informing `BackgroundConnectionService`
     of the association between channel number and client
 
@@ -530,7 +531,7 @@ class ChannelRegEvent(ChannelOpEvent, AsyncEvent):
         self.channel_number = channel_number
 
 
-class ChannelUnregEvent(ChannelOpEvent, AsyncEvent):
+class ChannelUnregEvent(ChannelOpEventFamily, AsyncEventFamily):
     """Channel de-registration event for informing
     `BackgroundConnectionService` to remove the association between the given
     channel number and client
@@ -547,7 +548,7 @@ class ChannelUnregEvent(ChannelOpEvent, AsyncEvent):
         self.channel_number = channel_number
 
 
-class BlockedConnectionSubscribeEvent(AsyncEvent):
+class BlockedConnectionSubscribeEvent(AsyncEventFamily):
     """Request from a client for receiving "blocked/unblocked" connection
     frames from `BackgroundConnectionService`
     """
@@ -560,28 +561,28 @@ class BlockedConnectionSubscribeEvent(AsyncEvent):
         self.client = client
 
 
-class DataToBrokerEvent(RpcEvent):
+class FramesToBrokerEvent(RpcEventFamily):
     """Container for serialized frames destined for AMQP broker. This type of
     event is dispatched by `ThreadedConnection` to
     `BackgroundConnectionService`.
 
     """
 
-    def __init__(self, client, buffers, on_result_rx):
+    def __init__(self, client, frames, on_result_rx):
         """
         :param ClientProxy:
-        :param buffers: sequence of serialized frames destined for AMQP broker
+        :param frames: sequence of frames destined for AMQP broker
         :param callable on_result_rx: callable for handling the result in user
             context, having the signature `on_result_rx(result)`, where `result`
             is the value provided by responder.
 
         """
-        super(DataToBrokerEvent, self).__init__(on_result_rx)
+        super(FramesToBrokerEvent, self).__init__(on_result_rx)
         self.client = client
-        self.buffers = buffers
+        self.frames = frames
 
 
-class FramesToClientEvent(AsyncEvent):
+class FramesToClientEvent(AsyncEventFamily):
     """Container for frames destined for client. This type of event is
     dispatched by `BackgroundConnectionService` to `ThreadedConnection`
     """
