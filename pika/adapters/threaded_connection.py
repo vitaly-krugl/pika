@@ -321,11 +321,6 @@ class _ConnectionProxy(pika.connection.Connection):
             on_open_error_callback=on_open_error_callback,
             on_close_callback=on_close_callback)
 
-        # Detect if Connection code attempts to add to outbound_buffer directly
-        # without going through _send_frame, which we override
-        assert not self.outbound_buffer
-        self.outbound_buffer = None
-
 ##    @overrides_instance_method
 ##    def connect(self):
 ##        """[supplement base] Replace the connection machinery.
@@ -476,10 +471,10 @@ class _ConnectionProxy(pika.connection.Connection):
         return
 
     @overrides_instance_method
-    def _send_frame(self, frame_value):
+    def _append_outbound_frame(self, frame_value):
         """[replace base] Append the frame to the "outbound frames" list to be
         dispatched to the Connection Gateway at the next
-        `ThreadedConnection._manage_io` cycle.
+        `ThreadedConnection._manage_io` cycle and update `self.frames_sent`.
 
         :param frame_value: The frame to write
         :type frame_value:  pika.frame.Frame|pika.frame.ProtocolHeader
@@ -487,6 +482,7 @@ class _ConnectionProxy(pika.connection.Connection):
 
         """
         self._outbound_frames.append(frame_value)
+        self.frames_sent += 1
 
     @overrides_instance_method
     def _send_message(self, channel_number, method_frame, content):

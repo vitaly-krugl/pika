@@ -925,6 +925,20 @@ class Connection(object):
         """
         self._frame_buffer += value
 
+    def _append_outbound_frame(self, frame_value):
+        """This is a helper method shared by `_send_frame` and `_send_message`:
+        marshal the given frame, append it to `outbound_buffer`, and update
+        statistics (`bytes_sent` and `frames_sent`).
+
+        :param frame_value: The frame to write
+        :type frame_value:  pika.frame.Frame|pika.frame.ProtocolHeader
+
+        """
+        marshaled_frame = frame_value.marshal()
+        self.bytes_sent += len(marshaled_frame)
+        self.frames_sent += 1
+        self.outbound_buffer.append(marshaled_frame)
+
     @property
     def _buffer_size(self):
         """Return the suggested buffer size from the connection state/tune or
@@ -1658,11 +1672,10 @@ class Connection(object):
             LOGGER.critical('Attempted to send frame when closed')
             raise exceptions.ConnectionClosed
 
-        marshaled_frame = frame_value.marshal()
-        self.bytes_sent += len(marshaled_frame)
-        self.frames_sent += 1
-        self.outbound_buffer.append(marshaled_frame)
+        self._append_outbound_frame(frame_value)
+
         self._flush_outbound()
+
         if self.params.backpressure_detection:
             self._detect_backpressure()
 
@@ -1690,8 +1703,9 @@ class Connection(object):
 
         """
         length = len(content[1])
-        self._send_frame(frame.Method(channel_number, method_frame))
-        self._send_frame(frame.Header(channel_number, length, content[0]))
+        self._append_outbound_frame(frame.Method(channel_number, method_frame))
+        self._append_outbound_frame(frame.Header(channel_number,
+                                                 length, content[0]))
 
         if content[1]:
             chunks = int(math.ceil(float(length) / self._body_max_length))
@@ -1700,7 +1714,13 @@ class Connection(object):
                 e = s + self._body_max_length
                 if e > length:
                     e = length
-                self._send_frame(frame.Body(channel_number, content[1][s:e]))
+                self._append_outbound_frame(frame.Body(channel_number,
+                                                       content[1][s:e]))
+
+        self._flush_outbound()
+
+        if self.params.backpressure_detection:
+            self._detect_backpressure()
 
     def _set_connection_state(self, connection_state):
         """Set the connection state.
