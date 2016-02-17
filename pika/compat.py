@@ -74,6 +74,9 @@ if not PY2:
 
         return str(value)
 
+    def is_integer(value):
+        return isinstance(value, int)
+
     # Define a base class for deriving abstract base classes for compatibility
     # between python 2 and 3 (metaclass syntax changed in Python 3). Ideally,
     # would use `@six.add_metaclass` or `six.with_metaclass`, but pika
@@ -108,6 +111,9 @@ else:
             return str(value)
         except UnicodeEncodeError:
             return str(value.encode('utf-8'))
+
+    def is_integer(value):
+        return isinstance(value, (int, long))
 
     class AbstractBase(object):  # pylint: disable=R0903
         """PY2 Abstract base"""
