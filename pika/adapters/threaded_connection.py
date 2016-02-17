@@ -18,6 +18,9 @@ classes.
 # Suppress pylint messages concerning "Too few public methods"
 # pylint: disable=R0903
 
+# Suppress pylint messages concerning "Too many arguments"
+# pylint: disable=R0913
+
 
 import copy
 import logging
@@ -177,6 +180,8 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
             self._channel_number_allocator = _ThreadsafeChannelNumberAllocator(
                 self._impl.params.channel_max or pika.channel.MAX_CHANNELS)
 
+        self._impl.set_channel_number_allocator(self._channel_number_allocator)
+
     @overrides_instance_method
     def _manage_io(self, *waiters):
         """[implement pure virtual method] Flush output and process input and
@@ -307,6 +312,9 @@ class _ConnectionProxy(pika.connection.Connection):
         # ThreadedConnection._manage_io cycle
         self._outbound_frames = []
 
+        # Will be assigned by set_channel_number_allocator
+        self._channel_number_allocator = None
+
         super(_ConnectionProxy, self).__init__(
             parameters=parameters,
             on_open_callback=on_open_callback,
@@ -369,21 +377,47 @@ class _ConnectionProxy(pika.connection.Connection):
 ##            `method` member is of type `pika.spec.Connection.Unblocked`
 ##
 ##        """
-##
-##    @overrides_instance_method
-##    def channel(self, on_open_callback, channel_number=None):
-##        """[supplement base] Create a new channel with the next available
-##        channel number or pass in a channel number to use. Must be non-zero if
-##        you would like to specify but it is recommended that you let Pika manage
-##        the channel numbers.
-##
-##        :param method on_open_callback: The callback when the channel is opened
-##        :param int channel_number: The channel number to use, defaults to the
-##                                   next available.
-##        :rtype: pika.channel.Channel
-##
-##        """
-##        pass
+
+    def set_channel_number_allocator(self, channel_number_allocator):
+        """Assign the thread-safe channel number allocator
+
+        :param _ThreadsafeChannelNumberAllocator channel_number_allocator:
+
+        """
+        self._channel_number_allocator = channel_number_allocator
+
+    def _free_channel_number(self, chan):
+        """Free the channel number of the given channel
+
+        :param pika.channel.Channel chan:
+
+        """
+        self._channel_number_allocator.free(chan.channel_number)
+
+    @overrides_instance_method
+    def channel(self, on_open_callback, channel_number=None):
+        """[supplement base] Allocate/reserve channel number thread-safely
+
+        Create a new channel with the next available
+        channel number or pass in a channel number to use. Must be non-zero if
+        you would like to specify but it is recommended that you let Pika manage
+        the channel numbers.
+
+        :param method on_open_callback: The callback when the channel is opened
+        :param int channel_number: The channel number to use, defaults to the
+                                   next available.
+        :rtype: pika.channel.Channel
+
+        """
+        channel_number = self._channel_number_allocator.allocate(channel_number)
+
+        chan = super(_ConnectionProxy, self).channel(
+            on_open_callback=on_open_callback,
+            channel_number=channel_number)
+
+        chan._add_on_cleanup_callback(self._free_channel_number)  # pylint: disable=W0212
+
+        return chan
 
     @overrides_instance_method
     def add_timeout(self, deadline, callback_method):
@@ -483,30 +517,43 @@ class _ThreadsafeChannelNumberAllocator(object):
         # Allocated channel numbers
         self._allocated_channels = set()
 
-    def allocate(self):
+    def allocate(self, channel_number=None):
         """Reserve a channel number, making it unavailable until it is returned
         back to channel number pool via `_ThreadsafeChannelNumberPool.free`
 
+        :param channel_number: If None, a new channel number will be allocated;
+            if not None, the given channel number will be reserved
+        :type channel_number: int or None
         :returns: channel number
         :rtype: int
 
         :raises pika.exceptions.NoFreeChannels: if no more channels are
             available
+        :raises ValueError: if requesting an explicit channel number that is
+            already reserved.
 
         """
 
         channel_number = None
 
         with self._lock:
+            if channel_number is not None:
+                if channel_number in self._allocated_channels:
+                    raise ValueError('The requested explicit channel_number={} '
+                                     'is in use'.format(channel_number))
+
             if len(self._allocated_channels) >= self._max_channels:
                 raise pika.exceptions.NoFreeChannels()
 
-            for channel_number in xrange(1, len(self._allocated_channels) + 1):
-                if channel_number not in self._allocated_channels:
-                    break
-            else:
-                channel_number = len(self._allocated_channels) + 1
+            if channel_number is None:
+                # Allocate a new channel number
+                for channel_number in xrange(1, len(self._allocated_channels) + 1):
+                    if channel_number not in self._allocated_channels:
+                        break
+                else:
+                    channel_number = len(self._allocated_channels) + 1
 
+            # Reserve the requested/allocated channel number
             self._allocated_channels.add(channel_number)
 
         return channel_number
@@ -660,15 +707,15 @@ class _IOLoop(object):
             cancels the timer upon dispatch of the callback.
 
         :param float period: The number of seconds from now until expiration
-        :param method callback: The callback method, having the signature
-            `callback()`
+        :param callable callback_method: The callback method, having the
+            signature `callback_method()`
 
         :returns: opaque timer handle
 
         """
-        return self._timer_mgr.add_timeout(deadline, callback)
+        return self._timer_mgr.add_timeout(deadline, callback_method)
 
-    def remove_timeout(self, timer):
+    def remove_timeout(self, timer):  # pylint: disable=R0201
         """Cancel a timer; may be called only on a timer that hasn't been
         called/cancelled yet.
 
