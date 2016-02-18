@@ -29,6 +29,8 @@ import threading
 import time
 
 from pika.adapters import blocking_connection_base
+from pika.adapters.subclass_utils import verify_overrides
+from pika.adapters.subclass_utils import overrides_instance_method
 import pika.channel
 import pika.connection
 import pika.exceptions
@@ -39,70 +41,6 @@ from pika.adapters import bg_connection_service
 LOGGER = logging.getLogger(__name__)
 
 
-def verify_overrides(cls):
-    """Class Decorator to verify that methods tagged by
-    the `overrides_instance_method` decorator actually override corresonding
-    methods in one of the base classes
-
-    :raises TypeError: if an unbound method doesn't override another one.
-    """
-
-    for name in dir(cls):
-        method = getattr(cls, name)
-
-        if not hasattr(method, 'check_method_override'):
-            continue
-
-        if not callable(method):
-            raise TypeError('{} is not callable', method)
-
-        if not hasattr(method, '__self__'):
-            raise TypeError('{} does not have `__self__` member'.format(method))
-
-        if method.__self__ is not None:
-            raise TypeError(
-                '{} is not an unbound method: `__self__` {} is not None'
-                .format(method, method.__self__))
-
-        for base_cls in method.im_class.__bases__:
-            base_method = getattr(base_cls, method.__name__, None)
-
-            if base_method is None:
-                continue
-
-            if not callable(base_method):
-                raise TypeError('{} attempts to override non-callable {}'
-                                .format(method, base_method))
-
-            if not hasattr(base_method, '__self__'):
-                raise TypeError(
-                    '{}\'s base {} does not have `__self__` member'.format(
-                        method, base_method))
-
-            if base_method.__self__ is not None:
-                raise TypeError('{}\'s base {} is not an unbound method: '
-                                '`__self__` {} is not None'.format(
-                                    method, base_method, base_method.__self__))
-
-            break
-        else:
-            raise TypeError('Nothing to override for {}'.format(method))
-
-
-    return cls
-
-
-def overrides_instance_method(func):
-    """Method decorator that marks the method for verifying that it overrides
-    an instance method. The verification is performed by class decorator
-    `verify_overrides`
-
-    :raises TypeError: if func is not an unbound instance method
-
-    """
-    func.check_method_override = True
-
-    return func
 
 
 @verify_overrides
@@ -145,6 +83,15 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
         """
         super(ThreadedConnection, self).__init__()
 
+        # Retain a copy of connection parameters for connection cloning
+        self._connection_params = copy.deepcopy(
+            parameters or
+            pika.connection.ConnectionParameters())
+
+        # Whether we subscribed to blocked/unblocked connection notifications
+        # from Connection Gateway
+        self._subscribed_to_blocked_state = False
+
         self._gw_event_rx_queue = Queue.Queue()
         self._client_proxy = bg_connection_service.ClientProxy(
             self._gw_event_rx_queue)
@@ -163,9 +110,15 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
             # Start Connection Gateway
             self._service_proxy = (
                 bg_connection_service.BackgroundConnectionService(
-                    parameters=copy.deepcopy(parameters)).start())
+                    parameters=copy.deepcopy(self._connection_params)).start())
 
-        # Initiate client connection setup
+        # Initiate connection proxy setup with disabled heartbeats (the
+        # gateway connection will manage heartbeats as needed)
+
+        parameters = copy.deepcopy(self._connection_params)
+        parameters.heartbeat = 0
+        # TODO Disable blocked_connection_timeout after PR #701 is merged
+
         self._impl = _ConnectionProxy(
             parameters=parameters,
             on_open_callback=self._opened_result.set_value_once,
@@ -262,11 +215,60 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
             event.on_result_rx(event.result)
         elif isinstance(event, bg_connection_service.FramesToClientEvent):
             for frame in event.frames:
-                # TODO Register Connection for blocked/unblocked
-                # TODO and decouple internal blocked/unblocked reg from user reg
                 self._impl._process_frame(frame)
         else:
             raise TypeError('Unexpected event type {!r}'.format(event))
+
+    def _subscribe_to_blocked_state(self):
+        """Subscribe to receive connection blocked/unblocked transition events
+        from Connection Gateway
+
+        """
+        if not self._subscribed_to_blocked_state:
+            self._service_proxy.dispatch(
+                bg_connection_service.BlockedConnectionSubscribeEvent(
+                    self._client_proxy))
+
+            self._subscribed_to_blocked_state = True
+
+    @overrides_instance_method
+    def add_on_connection_blocked_callback(self,  # pylint: disable=C0103
+                                           callback_method):
+        """[supplement base] Add a callback to be notified when RabbitMQ has
+        sent a `Connection.Blocked` frame indicating that RabbitMQ is low on
+        resources. Publishers can use this to voluntarily suspend publishing,
+        instead of relying on back pressure throttling. The callback will be
+        passed the `Connection.Blocked` method frame.
+
+        :param method callback_method: Callback to call on `Connection.Blocked`,
+            having the signature callback_method(pika.frame.Method), where the
+            method frame's `method` member is of type
+            `pika.spec.Connection.Blocked`
+
+        """
+        self._subscribe_to_blocked_state()
+
+        return (super(ThreadedConnection, self)
+                .add_on_connection_blocked_callback(callback_method))
+
+    @overrides_instance_method
+    def add_on_connection_unblocked_callback(self,  # pylint: disable=C0103
+                                             callback_method):
+        """[supplement base] Add a callback to be notified when RabbitMQ has
+        sent a `Connection.Unblocked` frame letting publishers know it's ok to
+        start publishing again. The callback will be passed the
+        `Connection.Unblocked` method frame.
+
+        :param method callback_method: Callback to call on
+            `Connection.Unblocked`, having the signature
+            callback_method(pika.frame.Method), where the method frame's
+            `method` member is of type `pika.spec.Connection.Unblocked`
+
+        """
+        self._subscribe_to_blocked_state()
+
+        return (super(ThreadedConnection, self)
+                .add_on_connection_unblocked_callback(callback_method))
 
 
 @verify_overrides
@@ -342,36 +344,6 @@ class _ConnectionProxy(pika.connection.Connection):
 ##
 ##        """
 ##        pass
-##
-##    @overrides_instance_method
-##    def add_on_connection_blocked_callback(self, callback_method):
-##        """[supplement base] Add a callback to be notified when RabbitMQ has
-##        sent a `Connection.Blocked` frame indicating that RabbitMQ is low on
-##        resources. Publishers can use this to voluntarily suspend publishing,
-##        instead of relying on back pressure throttling. The callback will be
-##        passed the `Connection.Blocked` method frame.
-##
-##        :param method callback_method: Callback to call on `Connection.Blocked`,
-##            having the signature callback_method(pika.frame.Method), where the
-##            method frame's `method` member is of type
-##            `pika.spec.Connection.Blocked`
-##
-##        """
-##        pass
-##
-##    @overrides_instance_method
-##    def add_on_connection_unblocked_callback(self, callback_method):
-##        """[supplement base] Add a callback to be notified when RabbitMQ has
-##        sent a `Connection.Unblocked` frame letting publishers know it's ok to
-##        start publishing again. The callback will be passed the
-##        `Connection.Unblocked` method frame.
-##
-##        :param method callback_method: Callback to call on
-##            `Connection.Unblocked`, having the signature
-##            callback_method(pika.frame.Method), where the method frame's
-##            `method` member is of type `pika.spec.Connection.Unblocked`
-##
-##        """
 
     def set_channel_number_allocator(self, channel_number_allocator):
         """Assign the thread-safe channel number allocator
@@ -444,6 +416,8 @@ class _ConnectionProxy(pika.connection.Connection):
     def _adapter_connect(self):
         """[implement pure virtual] Subclasses should override to set up the
         outbound socket connection.
+
+        :returns: None on success; error message string or exception on error
 
         """
         # Register this client with the Connection Gateway

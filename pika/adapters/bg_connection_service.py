@@ -5,6 +5,10 @@ I/O.
 
 """
 
+# Disable "access to protected member" warnings: this wrapper implementation is
+# a friend of those instances
+# pylint: disable=W0212
+
 # Suppress pylint messages concerning "Too few public methods"
 # pylint: disable=R0903
 
@@ -15,7 +19,6 @@ I/O.
 # pylint: disable=C0103
 
 
-import copy
 import collections
 import copy
 import errno
@@ -25,9 +28,12 @@ import Queue
 import sys
 import threading
 
-import pika.exceptions
-
+from pika.adapters.subclass_utils import verify_overrides
+from pika.adapters.subclass_utils import overrides_instance_method
 from pika.compat import xrange  # pylint: disable=W0622
+import pika.exceptions
+import pika.frame
+import pika.spec
 
 # NOTE: import SelectConnection after others to avoid circular depenency
 from pika.adapters import select_connection
@@ -66,7 +72,7 @@ class BackgroundConnectionService(threading.Thread):
         self._attention_lock = threading.Lock()
         self._attention_pending = False
         self._r_attention, self._w_attention = (
-            select_connection._PollerBase._get_interrupt_pair())  # pylint: disable=W0212
+            select_connection._PollerBase._get_interrupt_pair())
 
         # Exception object representing reason for establishment failure
         self._conn_end_exc = None
@@ -122,12 +128,11 @@ class BackgroundConnectionService(threading.Thread):
         """Execute the service; called from background thread
 
         """
-        self._conn = select_connection.SelectConnection(
+        self._conn = _GatewayConnection(
             parameters=self._conn_parameters,
             on_open_callback=self._on_connection_established,
             on_open_error_callback=self._on_connection_open_error,
-            on_close_callback=self._on_connection_closed,
-            stop_ioloop_on_close=False)
+            on_close_callback=self._on_connection_closed)
 
         self._conn.ioloop.add_handler(self._r_attention.fileno(),
                                       self._on_attention,
@@ -192,7 +197,6 @@ class BackgroundConnectionService(threading.Thread):
             elif isinstance(event, BlockedConnectionSubscribeEvent):
                 self._on_blocked_connection_sub_event(event)
             elif isinstance(event, FramesToBrokerEvent):
-                # TODO _on_data_to_broker_event
                 self._on_frames_to_broker_event(event)
 
             else:
@@ -211,16 +215,6 @@ class BackgroundConnectionService(threading.Thread):
                 '{!r} already registered'.format(client))
 
             self._clients.add(client)
-
-            # Send connection events to new client
-            if self._conn.is_open:
-                self._send_connection_ready_to_client(client)
-
-                if self._conn_blocked_frame is not None:
-                    client.send(FramesToClientEvent([self._conn_blocked_frame]))
-
-            elif self._conn.is_closed:
-                client.send(ConnectionGoneEvent(self._conn_end_exc))
 
             LOGGER.info('Registered client %r', client)
 
@@ -308,8 +302,9 @@ class BackgroundConnectionService(threading.Thread):
 
         self._conn_blocked_subscribers.add(client)
 
+        # Notify client if connection is already in blocked state
         if not self._conn.is_closed and self._conn_blocked_frame is not None:
-            client.send(FramesToClientEvent([self._conn_blocked_frame]))
+            self._send_blocked_state_to_client(client, self._conn_blocked_frame)
 
         LOGGER.info('Subscribed %r to Connection.Blocked/Unblocked', client)
 
@@ -320,8 +315,8 @@ class BackgroundConnectionService(threading.Thread):
 
         """
         # Notify clients
-        for client in self._clients:
-            self._send_connection_ready_to_client(client)
+        # TODO Resume protocol setup with clients that requested it
+        pass
 
     def _on_connection_open_error(self, connection, error):  # pylint: disable=W0613
         """Called by `SelectConnection` if the connection can't be established
@@ -336,8 +331,7 @@ class BackgroundConnectionService(threading.Thread):
         self._conn_end_exc = error
 
         # Notify clients
-        for client in self._clients:
-            client.send(ConnectionGoneEvent(self._conn_end_exc))
+        # TODO Notify clients that are in protocol state about open error
 
     def _on_connection_closed(self, connection, reason_code, reason_text):  # pylint: disable=W0613
         """Called when closing of connection completes, including when
@@ -354,8 +348,7 @@ class BackgroundConnectionService(threading.Thread):
             self._conn_end_exc = pika.exceptions.ConnectionClosed(reason_code,
                                                                   reason_text)
             # Notify clients
-            for client in self._clients:
-                client.send(ConnectionGoneEvent(self._conn_end_exc))
+            # TODO Notify clients that are in protocol state about conn closed
 
         if self._shutting_down:
             self._conn.ioloop.stop()
@@ -370,8 +363,8 @@ class BackgroundConnectionService(threading.Thread):
         self._conn_blocked_frame = method_frame
 
         # Notify clients
-        for client in self._clients:
-            client.send(FramesToClientEvent([method_frame]))
+        for client in self._conn_blocked_subscribers:
+            self._send_blocked_state_to_client(client, method_frame)
 
     def _on_connection_unblocked(self, method_frame):
         """Handle Connection.Unblocked notification from RabbitMQ broker
@@ -383,15 +376,89 @@ class BackgroundConnectionService(threading.Thread):
         self._conn_blocked_frame = None
 
         # Notify clients
-        for client in self._clients:
-            client.send(FramesToClientEvent([method_frame]))
+        for client in self._conn_blocked_subscribers:
+            self._send_blocked_state_to_client(client, method_frame)
 
-    def _send_connection_ready_to_client(self, client):
-        """Send `ConnectionReadyEvent with connection information to client`"""
+    def _on_frames_to_broker_event(self, event):
+        """Handle `FramesToBrokerEvent`
 
-        # TODO need actual value once we figure out what client needs
-        self = self
-        client.send(ConnectionReadyEvent(info={'dummy': 'info'}))
+        :param FramesToBrokerEvent event:
+
+        """
+        client = event.client
+
+        for frame in event.frames:
+            LOGGER.debug('_on_frames_to_broker_event: %r from client %r',
+                         frame, client)
+
+            if client.conn_state != ClientProxy.CONN_STATE_HANDSHAKE_DONE:
+                if isinstance(frame, pika.frame.ProtocolHeader):
+                    client.conn_state = ClientProxy.CONN_STATE_HANDSHAKE
+                    # TODO Send spec.Connection.Start if connected
+                    # TODO Send spec.Connection.Close if connection failed
+                    continue
+                elif isinstance(frame, pika.frame.Method):
+                    if isinstance(frame.method, pika.spec.Connection.StartOk):
+                        # TODO Send spec.Connection.Tune
+                        continue
+                    elif isinstance(frame.method, pika.spec.Connection.TuneOk):
+                        # Nothing to do here; expect spec.Connection.Open next
+                        continue
+                    elif isinstance(frame.method, pika.spec.Connection.Open):
+                        # TODO Send spec.Connection.OpenOk
+                        client.conn_state = (
+                            ClientProxy.CONN_STATE_HANDSHAKE_DONE)
+                        continue
+
+                raise TypeError('Unexpected frame during connection setup from '
+                                'client {!r}: {!r}'.format(client, frame))
+
+            # Forward all other frames to broker
+            self._conn._append_outbound_frame(frame)
+
+
+        self._conn._flush_outbound()
+
+        if self._conn.params.backpressure_detection:
+            self._conn._detect_backpressure()
+
+    @staticmethod
+    def _send_blocked_state_to_client(client, method_frame):
+        """Send `FramesToClientEvent` with the given method frame to client
+
+        :param ClientProxy client:
+        :param pika.frame.Method method_frame: method frame having `method`
+            member of type `pika.spec.Connection.Blocked` or
+            `pika.spec.Connection.Unblocked`
+
+        """
+        client.send(FramesToClientEvent([method_frame]))
+
+
+@verify_overrides
+class _GatewayConnection(select_connection.SelectConnection):
+    """Connection that serves as the gateway to the broker"""
+
+    def __init__(self,
+                 parameters,
+                 on_open_callback,
+                 on_open_error_callback,
+                 on_close_callback):
+        """
+        :param pika.connection.Parameters parameters: Connection parameters
+        :param method on_open_callback: Method to call on connection open
+        :param method on_open_error_callback: Called if the connection can't
+            be established: on_open_error_callback(connection, str|exception)
+        :param method on_close_callback: Called when the connection is closed:
+            on_close_callback(connection, reason_code, reason_text)
+
+        """
+        super(_GatewayConnection, self).__init__(
+            parameters=parameters,
+            on_open_callback=on_open_callback,
+            on_open_error_callback=on_open_error_callback,
+            on_close_callback=on_close_callback,
+            stop_ioloop_on_close=False)
 
 
 class ServiceProxy(object):
@@ -414,6 +481,10 @@ class ClientProxy(object):
 
     """
 
+    CONN_STATE_PENDING = 0  # expecting pika.frame.ProtocolHeader
+    CONN_STATE_HANDSHAKE = 1  # Performing connection handshake
+    CONN_STATE_HANDSHAKE_DONE = 2
+
     def __init__(self, queue):
         """
         :param Queue.Queue queue: Thread-safe queue for depositing events
@@ -422,10 +493,9 @@ class ClientProxy(object):
         """
         self._evt_queue = queue
 
-        # Flag for use only by `BackgroundConnectionProxy` to track whether a
-        # client proxy instance completed its connection sequence.
-        self.connected = False
-
+        # Connection state for use only by `BackgroundConnectionProxy` to track
+        # connection-establishment: CONN_STATE_*
+        self.conn_state = self.CONN_STATE_PENDING
 
     def send(self, event):
         """Send an event to client
@@ -459,24 +529,6 @@ class AsyncEventFamily(object):
 class ConnectionStateEvent(object):
     """Base class for client-destined events about connection state"""
     pass
-
-
-class ConnectionReadyEvent(ConnectionStateEvent, AsyncEventFamily):
-    """Informs client that connection is ready"""
-
-    def __init__(self, info):
-        self.info = copy.deepcopy(info)
-
-
-class ConnectionGoneEvent(ConnectionStateEvent, AsyncEventFamily):
-    """Informs client that AMQP connection is unavailable"""
-    def __init__(self, exc):
-        """
-        :param Exception exc: a `pika.exception.*` exception corresponding to
-            cause
-
-        """
-        self.exc = exc
 
 
 class ClientOpEventFamily(object):

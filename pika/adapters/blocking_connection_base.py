@@ -1,7 +1,8 @@
 """The blocking connection base provides a an abstract base class that
 implements majority of the interface and logic for blocking adapter semantics.
 """
-# Disable "access to protected member warnings: this wrapper implementation is
+
+# Disable "access to protected member" warnings: this wrapper implementation is
 # a friend of those instances
 # pylint: disable=W0212
 
