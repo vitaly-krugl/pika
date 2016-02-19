@@ -431,7 +431,7 @@ class BaseConnection(connection.Connection):
                 LOGGER.debug("Would block, requeuing frame")
                 self.outbound_buffer.appendleft(frame)
             else:
-                return self._handle_error(error)
+                self._handle_error(error)
 
         return bytes_written
 

@@ -11,7 +11,7 @@ import pika.frame as frame
 import pika.exceptions as exceptions
 import pika.spec as spec
 from pika.utils import is_callable
-from pika.compat import unicode_type, dictkeys, as_bytes, is_integer
+from pika.compat import unicode_type, dictkeys, is_integer
 
 
 LOGGER = logging.getLogger(__name__)

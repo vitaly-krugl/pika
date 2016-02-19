@@ -917,8 +917,8 @@ class Connection(object):
         """Add a callback for when a Connection.Tune frame is received."""
         self.callbacks.add(0, spec.Connection.Tune, self._on_connection_tune)
 
-    def _append_frame_buffer(self, value):
-        """Append the bytes to the frame buffer.
+    def _append_to_rx_frame_buffer(self, value):
+        """Append the bytes to the incoming frame buffer.
 
         :param str value: The bytes to append to the frame buffer
 
@@ -935,8 +935,8 @@ class Connection(object):
 
         """
         marshaled_frame = frame_value.marshal()
-        self.bytes_sent += len(marshaled_frame)
-        self.frames_sent += 1
+        self.tx_bytes_buffered += len(marshaled_frame)
+        self.tx_frames_buffered += 1
         self.outbound_buffer.append(marshaled_frame)
 
     @property
@@ -1062,13 +1062,16 @@ class Connection(object):
         """
         if not value.channel_number in self._channels:
             if self._is_basic_deliver_frame(value):
+                # TODO How is this possible? Closing of a connection/channel
+                #   should flush any Basic.Deliver messages before the channel
+                #   is decoupled from the Connection instance.
                 self._reject_out_of_band_delivery(value.channel_number,
                                                   value.method.delivery_tag)
             else:
                 LOGGER.warning("Received %r for non-existing channel %i", value,
                                value.channel_number)
             return
-        return self._channels[value.channel_number]._handle_content_frame(value)
+        self._channels[value.channel_number]._handle_content_frame(value)
 
     def _detect_backpressure(self):
         """Attempt to calculate if TCP backpressure is being applied due to
@@ -1076,8 +1079,8 @@ class Connection(object):
         a window of frames.
 
         """
-        avg_frame_size = self.bytes_sent / self.frames_sent
-        buffer_size = sum([len(frame) for frame in self.outbound_buffer])
+        avg_frame_size = self.tx_bytes_buffered / self.tx_frames_buffered
+        buffer_size = sum(len(frame) for frame in self.outbound_buffer)
         if buffer_size > (avg_frame_size * self._backpressure):
             LOGGER.warning(BACKPRESSURE_WARNING, buffer_size,
                            int(buffer_size / avg_frame_size))
@@ -1166,9 +1169,9 @@ class Connection(object):
         self.remaining_connection_attempts = self.params.connection_attempts
 
         # Data used for Heartbeat checking and back-pressure detection
-        self.bytes_sent = 0
+        self.tx_bytes_buffered = 0   # bytes added to outbound_buffer
+        self.tx_frames_buffered = 0  # frames added to outbound_buffer
         self.bytes_received = 0
-        self.frames_sent = 0
         self.frames_received = 0
         self.heartbeat = None
 
@@ -1300,7 +1303,7 @@ class Connection(object):
         raise exceptions.AMQPConnectionError(error_message or
                                              self.params.connection_attempts)
 
-    def _on_connection_open(self, method_frame):
+    def _on_connection_open_ok(self, method_frame):
         """
         This is called once we have tuned the connection with the server and
         called the Connection.Open on the server and it has replied with
@@ -1417,7 +1420,7 @@ class Connection(object):
         :param str data_in: The data that is available to read
 
         """
-        self._append_frame_buffer(data_in)
+        self._append_to_rx_frame_buffer(data_in)
         while self._frame_buffer:
             consumed_count, frame_value = self._read_frame()
             if not frame_value:
@@ -1639,7 +1642,7 @@ class Connection(object):
         """Send a Connection.Open frame"""
         self._rpc(0, spec.Connection.Open(self.params.virtual_host,
                                           insist=True),
-                  self._on_connection_open, [spec.Connection.OpenOk])
+                  self._on_connection_open_ok, [spec.Connection.OpenOk])
 
     def _send_connection_start_ok(self, authentication_type, response):
         """Send a Connection.StartOk frame

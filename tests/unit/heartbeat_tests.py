@@ -34,7 +34,7 @@ class HeartbeatTests(unittest.TestCase):
     def setUp(self):
         self.mock_conn = mock.Mock(spec=connection.Connection)
         self.mock_conn.bytes_received = 100
-        self.mock_conn.bytes_sent = 100
+        self.mock_conn.tx_bytes_buffered = 100
         self.mock_conn.heartbeat = mock.Mock(spec=heartbeat.HeartbeatChecker)
         self.obj = heartbeat.HeartbeatChecker(self.mock_conn, self.INTERVAL)
 
@@ -193,6 +193,6 @@ class HeartbeatTests(unittest.TestCase):
         self.assertEqual(self.obj._bytes_received, 256)
 
     def test_update_counters_bytes_sent(self):
-        self.mock_conn.bytes_sent = 256
+        self.mock_conn.tx_bytes_buffered = 256
         self.obj._update_counters()
         self.assertEqual(self.obj._bytes_sent, 256)

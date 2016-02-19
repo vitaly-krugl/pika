@@ -172,5 +172,5 @@ class HeartbeatChecker(object):
         number of frames received
 
         """
-        self._bytes_sent = self._connection.bytes_sent
+        self._bytes_sent = self._connection.tx_bytes_buffered
         self._bytes_received = self._connection.bytes_received

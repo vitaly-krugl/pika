@@ -35,7 +35,7 @@ import pika.channel
 import pika.connection
 import pika.exceptions
 
-from pika.adapters import bg_connection_service
+from pika.adapters import gw_connection_service
 
 
 LOGGER = logging.getLogger(__name__)
@@ -66,12 +66,17 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
     # Suppress warnings concerning "Access to a protected member"
     # pylint: disable=W0212
 
+    # Maximum amount of time to block waiting for an event from the gateway
+    # service; this gives our I/O loop to check on the health of the gateway
+    # once in a while, but not too often
+    _MAX_RX_EVENT_BLOCK_SEC = 5
+
     def __init__(self, parameters=None, **kwargs):
         """Create a new instance of the `ThreadedConnection` object.
 
         :param pika.connection.Parameters parameters: Connection parameters;
             None for default parameters.
-        :param bg_connection_service.ServiceProxy service_proxy: private arg via
+        :param gw_connection_service.ServiceProxy service_proxy: private arg via
             kwargs only. `ThreadedConnection.clone` passes this arg to
             initialize the cloned connection
         :param _ThreadsafeChannelNumberAllocator channel_number_allocator:
@@ -93,11 +98,12 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
         self._subscribed_to_blocked_state = False
 
         self._gw_event_rx_queue = Queue.Queue()
-        self._client_proxy = bg_connection_service.ClientProxy(
+        self._client_proxy = gw_connection_service.ClientProxy(
             self._gw_event_rx_queue)
 
-        self._service_proxy = kwargs.pop('service_proxy')
-        self._channel_number_allocator = kwargs.pop('channel_number_allocator')
+        self._service_proxy = kwargs.pop('service_proxy', None)
+        self._channel_number_allocator = kwargs.pop('channel_number_allocator',
+                                                    None)
 
         if kwargs:
             raise TypeError('ThreadedConnection received unexpected kwargs {!r}'
@@ -109,14 +115,13 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
 
             # Start Connection Gateway
             self._service_proxy = (
-                bg_connection_service.BackgroundConnectionService(
+                gw_connection_service.GatewayConnectionService(
                     parameters=copy.deepcopy(self._connection_params)).start())
 
-        # Initiate connection proxy setup with disabled heartbeats (the
-        # gateway connection will manage heartbeats as needed)
-
+        # Initiate connection proxy setup
         parameters = copy.deepcopy(self._connection_params)
         parameters.heartbeat = 0
+        parameters.backpressure_detection = False
         # TODO Disable blocked_connection_timeout after PR #701 is merged
 
         self._impl = _ConnectionProxy(
@@ -134,6 +139,22 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
                 self._impl.params.channel_max or pika.channel.MAX_CHANNELS)
 
         self._impl.set_channel_number_allocator(self._channel_number_allocator)
+
+    def clone_connection(self):
+        """Create a clone of the connection that may be used from another
+        thread. The cloned connection will share the same underlying AMQP
+        connection.
+
+        :returns: connection object
+        :rtype: ThreadedConnection
+
+        :raises AMQPConnectionError:
+
+        """
+        return ThreadedConnection(
+            self._connection_params,
+            service_proxy=self._service_proxy,
+            channel_number_allocator=self._channel_number_allocator)
 
     @overrides_instance_method
     def _manage_io(self, *waiters):
@@ -170,7 +191,7 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
                 # Dispatch pending frames to Connection Gateway
                 if self._impl._outbound_frames:
                     # Dispatch pending outbound frames to Connection Gateway
-                    event = bg_connection_service.FramesToBrokerEvent(
+                    event = gw_connection_service.FramesToBrokerEvent(
                         client=self._client_proxy,
                         frames=self._impl._outbound_frames,
                         on_result_rx=frames_sent_result.signal_once)
@@ -178,6 +199,9 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
                     self._impl._outbound_frames = []
 
                     self._service_proxy.dispatch(event)
+                    LOGGER.debug('_manage_io: %r dispatched %r to gateway',
+                                 self._client_proxy, event)
+                    del event  # facilitate garbage collection
                 else:
                     frames_sent_result.signal_once()
 
@@ -192,10 +216,19 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
 
             # Wait for event from Connection Gateway
             try:
-                event = self._gw_event_rx_queue.get(
-                    timeout=self._impl.ioloop.get_remaining_interval())
+                timeout = min(self._MAX_RX_EVENT_BLOCK_SEC,
+                              self._impl.ioloop.get_remaining_interval())
+                timeout = (self._MAX_RX_EVENT_BLOCK_SEC if timeout is None
+                           else min(self._MAX_RX_EVENT_BLOCK_SEC, timeout))
+                event = self._gw_event_rx_queue.get(timeout=timeout)
             except Queue.Empty:
-                pass
+                # Check gateway's health
+                try:
+                    self._service_proxy.check_health()
+                except gw_connection_service.GatewayStoppedError as exc:
+                    LOGGER.error('Gateway Connection Service stopped: %r', exc)
+                    self._impl._on_terminate(reason_code=exc.args[0][0],
+                                             reason_text=exc.args[0][1])
             else:
                 self._on_event_from_gateway(event)
 
@@ -211,9 +244,9 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
 
         :param event: event from Connection Gateway
         """
-        if isinstance(event, bg_connection_service.RpcEventFamily):
+        if isinstance(event, gw_connection_service.RpcEventFamily):
             event.on_result_rx(event.result)
-        elif isinstance(event, bg_connection_service.FramesToClientEvent):
+        elif isinstance(event, gw_connection_service.FramesToClientEvent):
             for frame in event.frames:
                 self._impl._process_frame(frame)
         else:
@@ -226,7 +259,7 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
         """
         if not self._subscribed_to_blocked_state:
             self._service_proxy.dispatch(
-                bg_connection_service.BlockedConnectionSubscribeEvent(
+                gw_connection_service.BlockedConnectionSubscribeEvent(
                     self._client_proxy))
 
             self._subscribed_to_blocked_state = True
@@ -298,9 +331,9 @@ class _ConnectionProxy(pika.connection.Connection):
             be established: on_open_error_callback(connection, str|exception)
         :param method on_close_callback: Called when the connection is closed:
             on_close_callback(connection, reason_code, reason_text)
-        :param bg_connection_service.ClientProxy client_proxy: Connection
+        :param gw_connection_service.ClientProxy client_proxy: Connection
             Gateway's interface to client
-        :param bg_connection_service.ServiceProxy service_proxy: Client's
+        :param gw_connection_service.ServiceProxy service_proxy: Client's
             interface to Connection Gateway
 
         """
@@ -323,68 +356,30 @@ class _ConnectionProxy(pika.connection.Connection):
             on_open_error_callback=on_open_error_callback,
             on_close_callback=on_close_callback)
 
-##    @overrides_instance_method
-##    def connect(self):
-##        """[supplement base] Replace the connection machinery.
-##        `_ConnectionProxy` connects to AMQP broker indirectly via
-##        `BackgroundConnectionService`.
-##
-##        This method is invoked by the base `Connection` class to initiate
-##        connection-establishment with AMQP broker
-##
-##        """
-##        pass
-##
-##    @overrides_instance_method
-##    def _send_connection_close(self, reply_code, reply_text):
-##        """[replace base] Send a Connection.Close method frame.
-##
-##        :param int reply_code: The reason for the close
-##        :param str reply_text: The text reason for the close
-##
-##        """
-##        pass
-
     def set_channel_number_allocator(self, channel_number_allocator):
-        """Assign the thread-safe channel number allocator
+        """Assign the thread-safe channel number allocator; called by
+        `ThreadedConnection` after connection is established.
 
         :param _ThreadsafeChannelNumberAllocator channel_number_allocator:
 
         """
         self._channel_number_allocator = channel_number_allocator
 
-    def _free_channel_number(self, chan):
-        """Free the channel number of the given channel
-
-        :param pika.channel.Channel chan:
-
-        """
-        self._channel_number_allocator.free(chan.channel_number)
-
     @overrides_instance_method
     def channel(self, on_open_callback, channel_number=None):
-        """[supplement base] Allocate/reserve channel number thread-safely
-
-        Create a new channel with the next available
-        channel number or pass in a channel number to use. Must be non-zero if
-        you would like to specify but it is recommended that you let Pika manage
-        the channel numbers.
-
-        :param method on_open_callback: The callback when the channel is opened
-        :param int channel_number: The channel number to use, defaults to the
-                                   next available.
-        :rtype: pika.channel.Channel
+        """[supplement base] Allocate/reserve channel number thread-safely and
+        register channel number with gateway connection
 
         """
         channel_number = self._channel_number_allocator.allocate(channel_number)
 
-        chan = super(_ConnectionProxy, self).channel(
+        self._service_proxy.dispatch(
+            gw_connection_service.ChannelRegEvent(self._client_proxy,
+                                                  channel_number))
+
+        return super(_ConnectionProxy, self).channel(
             on_open_callback=on_open_callback,
             channel_number=channel_number)
-
-        chan._add_on_cleanup_callback(self._free_channel_number)  # pylint: disable=W0212
-
-        return chan
 
     @overrides_instance_method
     def add_timeout(self, deadline, callback_method):
@@ -401,6 +396,21 @@ class _ConnectionProxy(pika.connection.Connection):
 
         """
         return self.ioloop.add_timeout(deadline, callback_method)
+
+    @overrides_instance_method
+    def _on_channel_cleanup(self, channel):
+        """[supplement base] We extend base method to unregister the channel
+        number with gateway connection and release the channel number of
+        the given channel after base connection class no longer references it.
+        """
+        channel_number = channel.channel_number
+        try:
+            return super(_ConnectionProxy, self)._on_channel_cleanup(channel)
+        finally:
+            self._service_proxy.dispatch(
+                gw_connection_service.ChannelUnregEvent(self._client_proxy,
+                                                        channel_number))
+            self._channel_number_allocator.free(channel_number)
 
     @overrides_instance_method
     def remove_timeout(self, timer):
@@ -420,10 +430,8 @@ class _ConnectionProxy(pika.connection.Connection):
         :returns: None on success; error message string or exception on error
 
         """
-        # Register this client with the Connection Gateway
-        self._service_proxy.dispatch(
-            bg_connection_service.ClientRegEvent(self._client_proxy))
-
+        # There is nothing to do here for us
+        LOGGER.debug('_adapter_connect called')
         return None
 
     @overrides_instance_method
@@ -432,9 +440,8 @@ class _ConnectionProxy(pika.connection.Connection):
         underlying transport (socket) to close.
 
         """
-        # Unegister this client from the Connection Gateway
-        self._service_proxy.dispatch(
-            bg_connection_service.ClientUnregEvent(self._client_proxy))
+        # There is nothing to do here for us
+        LOGGER.debug('_adapter_disconnect called')
 
     @overrides_instance_method
     def _flush_outbound(self):
@@ -448,7 +455,8 @@ class _ConnectionProxy(pika.connection.Connection):
     def _append_outbound_frame(self, frame_value):
         """[replace base] Append the frame to the "outbound frames" list to be
         dispatched to the Connection Gateway at the next
-        `ThreadedConnection._manage_io` cycle and update `self.frames_sent`.
+        `ThreadedConnection._manage_io` cycle and update
+        `self.tx_frames_buffered`.
 
         :param frame_value: The frame to write
         :type frame_value:  pika.frame.Frame|pika.frame.ProtocolHeader
@@ -456,7 +464,9 @@ class _ConnectionProxy(pika.connection.Connection):
 
         """
         self._outbound_frames.append(frame_value)
-        self.frames_sent += 1
+        self.tx_frames_buffered += 1
+        # NOTE we can't update tx_bytes_buffered here, because it's impractical
+        # to marshall the frames
 
     @overrides_instance_method
     def _send_message(self, channel_number, method_frame, content):
