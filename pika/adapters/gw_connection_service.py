@@ -234,9 +234,13 @@ class GatewayConnectionService(threading.Thread):
         LOGGER.info('Registered client %r', client)
 
     def _unregister_client(self, client):
-        """Unregister previously-registered client
+        """Unregister a previously-registered client. If it's the last client,
+        initiate closing of AMQP connection and set `self._shutting_down` to
+        block processing of events from clients.
 
         :param ClientProxy client:
+
+        :raises AssertionError:
 
         """
         assert client in self._clients, (
@@ -252,7 +256,7 @@ class GatewayConnectionService(threading.Thread):
 
         LOGGER.info('Unregistered client %r', client)
 
-        if not self._clients and not self._shutting_down:
+        if not self._clients:
             # No more clients, it's time to close the connection
 
             LOGGER.info('No more clients, closing/shutting-down')
@@ -266,8 +270,10 @@ class GatewayConnectionService(threading.Thread):
             assert not self._channel_to_client_map, (
                 self._channel_to_client_map)
 
+            # Block processing of events from clients
             self._shutting_down = True
 
+            # Close the AMQP connection
             if self._conn.is_open:
                 self._conn.close()
             elif self._conn.is_closed:
@@ -356,7 +362,10 @@ class GatewayConnectionService(threading.Thread):
 
     def _on_connection_closed(self, connection, reason_code, reason_text):  # pylint: disable=W0613
         """Called when closing of connection completes, including when
-        connection-establishment fails (alongside `_on_connection_open_error`)
+        connection-establishment fails (alongside `_on_connection_open_error`).
+
+        - Notify and unregiseter all registered clients, which triggers request
+          to stop the ioloop.
 
         :param SelectConnection connection:
         :param int reason_code:
@@ -370,26 +379,21 @@ class GatewayConnectionService(threading.Thread):
             LOGGER.error('Gateway AMQP connection closed: %s (%s)', reason_code,
                          reason_text)
 
-        # Set flag so we won't process any more client events until ioloop
-        # exits
-        self._shutting_down = True
+        assert self._conn.is_closed, self._conn
 
         # _on_connection_open_error has precedence, since _on_connection_closed
         # gets called on any disconnect, including after open error callback.
         if self._conn_end_exc is None:
             self._conn_end_exc = pika.exceptions.ConnectionClosed(reason_code,
                                                                   reason_text)
-        # Notify remaining clients about closing and unregister them
+        # Notify remaining clients about closing and unregister them.
         for client in list(self._clients):
             self._send_connection_close_to_client(client,
                                                   reason_code,
                                                   reason_text)
+            # NOTE This will set self._shutting_down and request ioloop to stop
+            # when the final client is unregistered
             self._unregister_client(client)
-
-        # Stop the service
-
-        # Issue asynchronous request to stop ioloop
-        self._conn.ioloop.stop()
 
     def _on_connection_blocked(self, method_frame):
         """Handle Connection.Blocked notification from RabbitMQ broker
