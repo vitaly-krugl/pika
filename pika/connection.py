@@ -776,6 +776,7 @@ class Connection(object):
             # TODO: remove timeout if connection is closed before timer fires
             self.add_timeout(self.params.retry_delay, self.connect)
         else:
+            # TODO This should use _on_terminate for consistent behavior
             self._set_connection_state(self.CONNECTION_CLOSED)
 
             try:
@@ -959,6 +960,8 @@ class Connection(object):
         """
         if (value.method.version_major,
             value.method.version_minor) != spec.PROTOCOL_VERSION[0:2]:
+            # TODO This should call _on_terminate for proper callbacks and
+            # cleanup
             raise exceptions.ProtocolVersionMismatch(frame.ProtocolHeader(),
                                                      value)
 
@@ -1120,6 +1123,8 @@ class Connection(object):
         (auth_type,
          response) = self.params.credentials.response_for(method_frame.method)
         if not auth_type:
+            # TODO this should call _on_terminate for proper callbacks and
+            # cleanup
             raise exceptions.AuthenticationError(self.params.credentials.TYPE)
         self.params.credentials.erase_credentials()
         return auth_type, response
@@ -1436,28 +1441,6 @@ class Connection(object):
           or -1 for other errors (such as socket errors)
         :param str reason_text: human-readable text message describing the error
         """
-        LOGGER.warning(
-            'Disconnected from RabbitMQ at %s:%i (%s): %s',
-            self.params.host, self.params.port, reason_code,
-            reason_text)
-
-        if not isinstance(reason_code, numbers.Integral):
-            raise TypeError('reason_code must be an integer, but got %r'
-                            % (reason_code,))
-
-        # Stop the heartbeat checker if it exists
-        self._remove_heartbeat()
-
-        # Remove connection management callbacks
-        # TODO: This call was moved here verbatim from legacy code and the
-        # following doesn't seem to be right: `Connection.Open` here is
-        # unexpected, we don't appear to ever register it, and the broker
-        # shouldn't be sending `Connection.Open` to us, anyway.
-        self._remove_callbacks(0, [spec.Connection.Close, spec.Connection.Start,
-                                   spec.Connection.Open])
-
-        # Close the socket
-        self._adapter_disconnect()
 
         # Determine whether this was an error during connection setup
         connection_error = None
@@ -1486,6 +1469,48 @@ class Connection(object):
             LOGGER.warning('Unexpected connection state on disconnect: %i',
                            self.connection_state)
 
+        self._on_terminate_with_digested_errors(
+            open_exc=connection_error,
+            reason_code=reason_code,
+            reason_text=reason_text)
+
+    def _on_terminate_with_digested_errors(self, open_exc,
+                                           reason_code, reason_text):
+        """Terminate the connection and notify registered ON_CONNECTION_ERROR
+        and/or ON_CONNECTION_CLOSED callbacks.
+
+        :param open_exc: `AMQPConnectionError`-based exception representing
+            failure during connection establishment; None if failure or closing
+            occurred post-connection establishment.
+        :param integer reason_code: RFC 2821 reply code (AMQP reply codes
+            conform to the definition "Reply Code Severities and Theory" from
+            IETF RFC 2821) or -1 for other errors (such as socket errors)
+        :param str reason_text: human-readable text message describing the
+            reason for closing
+
+        """
+        LOGGER.info('Disconnected from RabbitMQ at %s:%i (%s): %s',
+                    self.params.host, self.params.port, reason_code,
+                    reason_text)
+
+        if not isinstance(reason_code, numbers.Integral):
+            raise TypeError('reason_code must be an integer, but got %r'
+                            % (reason_code,))
+
+        # Stop the heartbeat checker if it exists
+        self._remove_heartbeat()
+
+        # Remove connection management callbacks
+        # TODO: This call was moved here verbatim from legacy code and the
+        # following doesn't seem to be right: `Connection.Open` here is
+        # unexpected, we don't appear to ever register it, and the broker
+        # shouldn't be sending `Connection.Open` to us, anyway.
+        self._remove_callbacks(0, [spec.Connection.Close, spec.Connection.Start,
+                                   spec.Connection.Open])
+
+        # Close the socket
+        self._adapter_disconnect()
+
         # Transition to closed state
         self._set_connection_state(self.CONNECTION_CLOSED)
 
@@ -1499,12 +1524,12 @@ class Connection(object):
             self._channels[channel]._on_close(method_frame)
 
         # Inform interested parties
-        if connection_error is not None:
-            LOGGER.error('Connection setup failed due to %r', connection_error)
+        if open_exc is not None:
+            LOGGER.error('Connection setup failed due to %r', open_exc)
             self.callbacks.process(0,
                                    self.ON_CONNECTION_ERROR,
                                    self, self,
-                                   connection_error)
+                                   open_exc)
 
         self.callbacks.process(0, self.ON_CONNECTION_CLOSED, self, self,
                                reason_code, reason_text)

@@ -129,7 +129,7 @@ class BlockingConnectionTests(unittest.TestCase):
                                '_process_io_for_connection_setup'):
             connection = blocking_connection.BlockingConnection('params')
 
-        connection._user_initiated_close = True
+        connection._user_initiated_close_reason = (200, 'success')
         connection._closed_result.set_value_once(
             select_connection_class_mock.return_value,
             200, 'success')
@@ -154,7 +154,7 @@ class BlockingConnectionTests(unittest.TestCase):
                                '_process_io_for_connection_setup'):
             connection = blocking_connection.BlockingConnection('params')
 
-        connection._user_initiated_close = False
+        connection._user_initiated_close_reason = None
         connection._closed_result.set_value_once(
             select_connection_class_mock.return_value, 404, 'not found')
 
@@ -181,7 +181,7 @@ class BlockingConnectionTests(unittest.TestCase):
                                '_process_io_for_connection_setup'):
             connection = blocking_connection.BlockingConnection('params')
 
-        connection._user_initiated_close = False
+        connection._user_initiated_close_reason = None
         connection._closed_result.set_value_once(
             select_connection_class_mock.return_value,
             200, 'ok')

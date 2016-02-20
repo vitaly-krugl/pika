@@ -29,6 +29,8 @@ import threading
 import time
 
 from pika.adapters import blocking_connection_base
+from pika.adapters.blocking_connection_base import DEFAULT_CLOSE_REASON_CODE
+from pika.adapters.blocking_connection_base import DEFAULT_CLOSE_REASON_TEXT
 from pika.adapters.subclass_utils import verify_overrides
 from pika.adapters.subclass_utils import overrides_instance_method
 import pika.channel
@@ -39,7 +41,6 @@ from pika.adapters import gw_connection_service
 
 
 LOGGER = logging.getLogger(__name__)
-
 
 
 
@@ -157,6 +158,38 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
             channel_number_allocator=self._channel_number_allocator)
 
     @overrides_instance_method
+    def close(self,
+              reply_code=DEFAULT_CLOSE_REASON_CODE,
+              reply_text=DEFAULT_CLOSE_REASON_TEXT,
+              **kwargs):
+        """Disconnect from RabbitMQ. If there are any open channels, it will
+        attempt to close them prior to fully disconnecting. Channels which
+        have active consumers will attempt to send a Basic.Cancel to RabbitMQ
+        to cleanly stop the delivery of messages prior to closing the channel.
+
+        :param int reply_code: The code number for the close
+        :param str reply_text: The text reason for the close
+        :param bool force: kwarg only; optional, defaults to False; if True,
+            will force the shared AMQP connection to shut down even if there are
+            other open clones in existence. The other clones will be notifed of
+            the closing through the standard mechanisms.
+
+        :raises AMQPConnectionError: if something goes wrong during close
+
+        """
+        force = kwargs.pop('force', False)
+
+        if kwargs:
+            raise TypeError('Unexpected kwargs {!r}'.format(kwargs))
+
+        if force:
+            LOGGER.info('%r of %r is forcing close of shared AMQP connection',
+                        self._client_proxy, self)
+            self._client_proxy.force_close = True
+
+        return super(ThreadedConnection, self).close(reply_code, reply_text)
+
+    @overrides_instance_method
     def _manage_io(self, *waiters):
         """[implement pure virtual method] Flush output and process input and
         asyncronous timers while waiting for any of the given  callbacks to
@@ -215,11 +248,14 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
                 break
 
             # Wait for event from Connection Gateway
+            event = None
             try:
-                timeout = min(self._MAX_RX_EVENT_BLOCK_SEC,
-                              self._impl.ioloop.get_remaining_interval())
+                timeout = self._impl.ioloop.get_remaining_interval()
                 timeout = (self._MAX_RX_EVENT_BLOCK_SEC if timeout is None
                            else min(self._MAX_RX_EVENT_BLOCK_SEC, timeout))
+
+                # TODO this is really slow when timeout!=None. Try implementing
+                # our own simpler queue
                 event = self._gw_event_rx_queue.get(timeout=timeout)
             except Queue.Empty:
                 # Check gateway's health
@@ -227,9 +263,12 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
                     self._service_proxy.check_health()
                 except gw_connection_service.GatewayStoppedError as exc:
                     LOGGER.error('Gateway Connection Service stopped: %r', exc)
-                    self._impl._on_terminate(reason_code=exc.args[0][0],
-                                             reason_text=exc.args[0][1])
-            else:
+
+                    event = gw_connection_service.ConnectionClosedEvent(
+                        open_exc=exc.args[0],
+                        close_reason_pair=exc.args[1])
+
+            if event is not None:
                 self._on_event_from_gateway(event)
 
                 # Process all other events that are available right now
@@ -249,6 +288,11 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
         elif isinstance(event, gw_connection_service.FramesToClientEvent):
             for frame in event.frames:
                 self._impl._process_frame(frame)
+        elif isinstance(event, gw_connection_service.ConnectionClosedEvent):
+            self._impl._on_terminate_with_digested_errors(
+                open_exc=event.open_exc,
+                reason_code=event.close_reason_pair[0],
+                reason_text=event.close_reason_pair[1])
         else:
             raise TypeError('Unexpected event type {!r}'.format(event))
 
@@ -641,11 +685,11 @@ class _TimerManager(object):
         """
         if self._next_timeout is not None:
             # Compensate in case time was adjusted
-            interval = max((self._next_timeout - time.time(), 0))
+            interval = max(self._next_timeout - time.time(), 0)
 
         elif self._timers:
             self._next_timeout = min(t._deadline for t in self._timers)
-            interval = max((self._next_timeout - time.time(), 0))
+            interval = max(self._next_timeout - time.time(), 0)
 
         else:
             interval = None

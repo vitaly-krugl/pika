@@ -51,8 +51,15 @@ _UNKNOWN_CLOSE_REASON_CODE = -99
 
 class GatewayStoppedError(Exception):
     """Raised by ServiceProxy health check method if the service thread stopped.
-    The only arg of this exception is an instance of AMQPConnectionError or of a
-    derived class.
+    This exception has two args:
+
+    - The first arg (at index=0) is an instance of `AMQPConnectionError` (or its
+      subclass) representing the reason for connection-establishment failure.
+      None if failure or closing of the connection occurred after successful
+      establishment of the connection.
+    - The second arg (at index=1) is a two-tuple (code-int, text-str)
+      representing the reason for the connection's closing or failure (including
+      during connection-establishment).
     """
     pass
 
@@ -75,7 +82,7 @@ class GatewayConnectionService(threading.Thread):
         self._conn_parameters = parameters
 
         self._service_proxy = ServiceProxy(service_thread=self,
-                                           dispatch=self._enqueue_event)
+                                           dispatch=self._enqueue_event_to_gw)
 
         # We're shutting down, don't process any more events from clients
         self._shutting_down = False
@@ -91,8 +98,16 @@ class GatewayConnectionService(threading.Thread):
         self._r_attention, self._w_attention = (
             select_connection._PollerBase._get_interrupt_pair())
 
-        # Exception object representing reason for establishment failure
-        self._conn_end_exc = None
+        # True if connection establishment completed successfully and will not
+        # be changed when connection fails
+        self._conn_open_completed = False
+
+        # Exception object representing reason for failure of connection
+        # establishment
+        self._conn_open_exc = None
+
+        # Two-tuple reason for closing of the connection: (code-int, text-str)
+        self._conn_close_reason_pair = None
 
         # Connetion.Blocked frame when connection is in blocked state; None
         # when connection is not blocked. `pika.frame.Method` having `method`
@@ -129,18 +144,32 @@ class GatewayConnectionService(threading.Thread):
         return self._service_proxy
 
     def run(self):
-        """Entry point for background thread"""
+        """Entry point for background thread
 
+        """
         try:
             self._run_service()
         except:
             LOGGER.exception('_run_service failed')
-            self._service_proxy._service_exc = (
-                pika.exceptions.AMQPConnectionError(_UNKNOWN_CLOSE_REASON_CODE,
-                                                    repr(sys.exc_info()[1])))
+            reason_pair = (_UNKNOWN_CLOSE_REASON_CODE, repr(sys.exc_info()[1]))
+
+            if self._conn_open_completed:
+                open_exc = None
+            else:
+                open_exc = pika.exceptions.AMQPConnectionError(*reason_pair)
+
+            self._service_proxy._set_service_exit_exception(
+                GatewayStoppedError(open_exc, reason_pair))
+
             raise
         else:
-            self._service_proxy._service_exc = self._conn_end_exc
+            self._service_proxy._set_service_exit_exception(
+                GatewayStoppedError(self._conn_open_exc,
+                                    self._conn_close_reason_pair))
+
+            LOGGER.info('_run_service exited: %r',
+                        self._service_proxy._service_exc)
+
 
     def _run_service(self):
         """Execute the service; called from background thread
@@ -162,10 +191,32 @@ class GatewayConnectionService(threading.Thread):
         self._conn.add_on_connection_unblocked_callback(
             self._on_connection_unblocked)
 
-        # Run ioloop; this won't return until we decide to stop the loop
-        self._conn.ioloop.start()
+        if not self._conn.is_closed:
+            # Run ioloop; it won't return until we stop the loop upon failure or
+            # closing of the connection
+            self._conn.ioloop.start()
+        else:
+            LOGGER.warning('Connection is closed, skipping ioloop')
 
-    def _enqueue_event(self, event):
+        # Cleanup
+        LOGGER.info('Cleaning up')
+
+        if self._conn_close_reason_pair is None:
+            # Fix up connection close reason; presently, Connection doesn't
+            # provide this when socket connection fails.
+            self._conn_close_reason_pair = (self._conn_open_exc.args[0],
+                                            self._conn_open_exc.args[1])
+
+        # Notify registered clients about closing and unregister them.
+        for client in list(self._clients):
+            self._send_connection_closed_event_to_client(
+                client,
+                open_exc=self._conn_open_exc,
+                close_reason_pair=self._conn_close_reason_pair)
+
+            self._unregister_client(client)
+
+    def _enqueue_event_to_gw(self, event):
         """Implementation of `ServiceProxy.dispatch`"""
         self._input_queue.put(event)
 
@@ -219,65 +270,6 @@ class GatewayConnectionService(threading.Thread):
 
             else:
                 raise TypeError('Unexpected event type {!r}'.format(event))
-
-    def _register_client(self, client):
-        """Register new client
-
-        :param ClientProxy client:
-
-        """
-        assert client not in self._clients, (
-            '{!r} already registered'.format(client))
-
-        self._clients.add(client)
-
-        LOGGER.info('Registered client %r', client)
-
-    def _unregister_client(self, client):
-        """Unregister a previously-registered client. If it's the last client,
-        initiate closing of AMQP connection and set `self._shutting_down` to
-        block processing of events from clients.
-
-        :param ClientProxy client:
-
-        :raises AssertionError:
-
-        """
-        assert client in self._clients, (
-            '{!r} is not registered'.format(client))
-
-        self._clients.remove(client)
-        self._conn_blocked_subscribers.discard(client)
-
-        for channel_number in self._client_to_channels_map[client]:
-            del self._channel_to_client_map[channel_number]
-
-        del self._client_to_channels_map[client]
-
-        LOGGER.info('Unregistered client %r', client)
-
-        if not self._clients:
-            # No more clients, it's time to close the connection
-
-            LOGGER.info('No more clients, closing/shutting-down')
-
-            assert not self._conn_blocked_subscribers, (
-                self._conn_blocked_subscribers)
-
-            assert not self._client_to_channels_map, (
-                self._client_to_channels_map)
-
-            assert not self._channel_to_client_map, (
-                self._channel_to_client_map)
-
-            # Block processing of events from clients
-            self._shutting_down = True
-
-            # Close the AMQP connection
-            if self._conn.is_open:
-                self._conn.close()
-            elif self._conn.is_closed:
-                self._conn.ioloop.stop()
 
     def _on_channel_op_event(self, event):
         """Handle channel reg/unreg events
@@ -337,32 +329,48 @@ class GatewayConnectionService(threading.Thread):
         :param SelectConnection connection:
 
         """
+        LOGGER.info('%r: connection established', self)
+
+        self._conn_open_completed = True
+
         # Resume protocol setup with clients that requested it
         for client in self._clients:
             if client.conn_state == ClientProxy.CONN_STATE_HANDSHAKE:
                 self._send_connection_start_to_client(client)
 
     def _on_connection_open_error(self, connection, error):  # pylint: disable=W0613
-        """Called by `SelectConnection` if the connection can't be established
+        """Called by `SelectConnection` if the connection can't be established.
+        Request shutdown of the service.
 
         :param SelectConnection connection:
         :param error: str or exception
 
         """
+        # NOTE Presently, Connection might dispatch this callback before its
+        # constructor returns, so self._conn might be uninitialized at this time
+
+        # NOTE Presently, when socket connection fails, Connection calls this
+        # callback, but not _on_connection_closed. Upon connection failures
+        # after the socket is connected, both callbacks are called
+
         LOGGER.error('Gateway AMQP connection setup failed: %r', error)
 
-        if not isinstance(error, Exception):
+        # Save the error
+        if not isinstance(error, pika.exceptions.AMQPConnectionError):
             error = pika.exceptions.AMQPConnectionError(
                 _UNKNOWN_CLOSE_REASON_CODE,
                 repr(error))
 
-        self._conn_end_exc = error
+        self._conn_open_exc = error
 
-        # NOTE _on_connection_closed will stop the service
+        # Request shutdown of the service
+        self._request_shutdown(reason_code=None, reason_text=None)
+
 
     def _on_connection_closed(self, connection, reason_code, reason_text):  # pylint: disable=W0613
-        """Called when closing of connection completes, including when
-        connection-establishment fails (alongside `_on_connection_open_error`).
+        """Called when closing of connection completes, including in some cases
+        when connection-establishment fails (alongside
+        `_on_connection_open_error`).
 
         - Notify and unregiseter all registered clients, which triggers request
           to stop the ioloop.
@@ -373,27 +381,16 @@ class GatewayConnectionService(threading.Thread):
 
         """
         if reason_code == 200:
-            LOGGER.info('Gateway AMQP connection closed: %s (%s)', reason_code,
+            LOGGER.info('Gateway AMQP connection closed: (%s) %s', reason_code,
                         reason_text)
         else:
-            LOGGER.error('Gateway AMQP connection closed: %s (%s)', reason_code,
+            LOGGER.error('Gateway AMQP connection closed: (%s) %s', reason_code,
                          reason_text)
 
-        assert self._conn.is_closed, self._conn
+        self._conn_close_reason_pair = (reason_code, reason_text)
 
-        # _on_connection_open_error has precedence, since _on_connection_closed
-        # gets called on any disconnect, including after open error callback.
-        if self._conn_end_exc is None:
-            self._conn_end_exc = pika.exceptions.ConnectionClosed(reason_code,
-                                                                  reason_text)
-        # Notify remaining clients about closing and unregister them.
-        for client in list(self._clients):
-            self._send_connection_close_to_client(client,
-                                                  reason_code,
-                                                  reason_text)
-            # NOTE This will set self._shutting_down and request ioloop to stop
-            # when the final client is unregistered
-            self._unregister_client(client)
+        # Request shutdown of the service
+        self._request_shutdown(reason_code=None, reason_text=None)
 
     def _on_connection_blocked(self, method_frame):
         """Handle Connection.Blocked notification from RabbitMQ broker
@@ -435,6 +432,11 @@ class GatewayConnectionService(threading.Thread):
             LOGGER.debug('_on_frames_to_broker_event: %r from client %r',
                          frame, client)
 
+            if client.conn_state == ClientProxy.CONN_STATE_CLIENT_CLOSED:
+                raise ValueError(
+                    'Unexpected frame from {!r} in CLOSED state: {!r}'.format(
+                        client, frame))
+
             if client.conn_state < ClientProxy.CONN_STATE_HANDSHAKE_DONE:
                 if isinstance(frame, pika.frame.ProtocolHeader):
                     client.conn_state = ClientProxy.CONN_STATE_HANDSHAKE
@@ -467,17 +469,18 @@ class GatewayConnectionService(threading.Thread):
                 LOGGER.info('%r is closing via %r', client, frame)
                 client.conn_state = ClientProxy.CONN_STATE_CLIENT_CLOSED
 
+                # If it's a forced-close request or the last client, initiate
+                # service shutdown
+                if client.force_close or len(self._clients) == 1:
+                    self._request_shutdown(reason_code=frame.method.reply_code,
+                                           reason_text=frame.method.reply_text)
+
                 self._send_connection_close_ok_to_client(client)
 
                 self._unregister_client(client)
                 continue
 
-
             # Forward all other frames to broker
-
-            if client.conn_state != ClientProxy.CONN_STATE_HANDSHAKE_DONE:
-                LOGGER.error('Unexpected frame from %r in state %r: %r',
-                             client, client.conn_state, frame)
 
             self._conn._append_outbound_frame(frame)
             num_frames_appended += 1
@@ -490,6 +493,86 @@ class GatewayConnectionService(threading.Thread):
         else:
             # Let client know that all frames have been disposed
             client.send(event)
+
+    def _register_client(self, client):
+        """Register new client
+
+        :param ClientProxy client:
+
+        """
+        assert client not in self._clients, (
+            '{!r} already registered'.format(client))
+
+        self._clients.add(client)
+
+        LOGGER.info('Registered client %r', client)
+
+    def _unregister_client(self, client):
+        """Unregister a previously-registered client.
+
+        :param ClientProxy client:
+
+        :raises AssertionError:
+
+        """
+        assert client in self._clients, (
+            '{!r} is not registered'.format(client))
+
+        self._clients.remove(client)
+        self._conn_blocked_subscribers.discard(client)
+
+        for channel_number in self._client_to_channels_map[client]:
+            del self._channel_to_client_map[channel_number]
+
+        del self._client_to_channels_map[client]
+
+        LOGGER.info('Unregistered client %r', client)
+
+        if not self._clients:
+            # No more clients, it's time to close the connection
+
+            LOGGER.info('No more clients, closing/shutting-down')
+
+            assert not self._conn_blocked_subscribers, (
+                self._conn_blocked_subscribers)
+
+            assert not self._client_to_channels_map, (
+                self._client_to_channels_map)
+
+            assert not self._channel_to_client_map, (
+                self._channel_to_client_map)
+
+    def _request_shutdown(self, reason_code, reason_text):
+        """Request service to shut down
+
+        :param reason_code: Integer reason code to pass to `Connection.close`
+          or None if connection is already closed
+        :param reason_text: Reason string to pass to `Connection.close`
+          or None if connection is already closed
+
+        """
+        if not self._shutting_down:
+            # Block processing of events from clients
+            self._shutting_down = True
+
+            LOGGER.info('%r: Initiating service shut-down', self)
+        else:
+            LOGGER.info('%r: Continuing service shut-down', self)
+
+
+        # NOTE: self._conn might not be set up when called during connection
+        # establishment failure; presently, Connection constructor might invoke
+        # a callback before the constructor returns.
+        if self._conn is not None:
+            # Close the AMQP connection
+            if self._conn.is_closed:
+                LOGGER.info('Requesting ioloop-stop')
+                self._conn.ioloop.stop()
+            else:
+                LOGGER.info('Requesting connection-close')
+                assert reason_code is not None
+                assert reason_text is not None
+                self._conn.close(reply_code=reason_code, reply_text=reason_text)
 
     @staticmethod
     def _send_blocked_state_to_client(client, method_frame):
@@ -504,6 +587,25 @@ class GatewayConnectionService(threading.Thread):
         client.send(FramesToClientEvent([method_frame]))
 
     @staticmethod
+    def _send_connection_closed_event_to_client(client, open_exc,
+                                                close_reason_pair):
+        """Dispatch `ConnectionClosedEvent` to client
+
+        :param open_exc: pika.exception.AMQPConnectionError object if
+            failure occurred during connection-establishment, None if failure or
+            closing of connection occurred after successful connection
+            establishment.
+        :param tuple close_reason_pair: a two-tuple of (code-int, text-str)
+            representing the reason for connection's failure (including
+            establishment failure) or closing.
+
+        """
+        event = ConnectionClosedEvent(open_exc=open_exc,
+                                      close_reason_pair=close_reason_pair)
+        LOGGER.debug('Sending %r to %r', event, client)
+        client.send(event)
+
+    @staticmethod
     def _send_connection_close_ok_to_client(client):
         """Send Connection.CloseOk to client
 
@@ -511,23 +613,6 @@ class GatewayConnectionService(threading.Thread):
 
         """
         frame = pika.frame.Method(0, pika.spec.Connection.CloseOk())
-        LOGGER.debug('Sending %r to %r', frame, client)
-        client.send(FramesToClientEvent([frame]))
-
-    @staticmethod
-    def _send_connection_close_to_client(client, reason_code, reason_text):
-        """Send Connection.Close to client
-
-        :param ClientProxy client:
-        :param int reason_code:
-        :param str reason_text:
-
-        """
-        frame = pika.frame.Method(0, pika.spec.Connection.Close(
-            reply_code=reason_code,
-            reply_text=reason_text,
-            class_id=0,
-            method_id=0))
         LOGGER.debug('Sending %r to %r', frame, client)
         client.send(FramesToClientEvent([frame]))
 
@@ -731,6 +816,15 @@ class ServiceProxy(object):
         # For use only by check_health and GatewayConnectionService
         self._service_exc = None # exception that caused service to stop
 
+    def _set_service_exit_exception(self, exc):
+        """Called by Gateway Connection Service to set the exception
+        corresponding to reason for service's shutdown
+
+        :param GatewayStoppedError exc:
+
+        """
+        self._service_exc = exc
+
     def check_health(self):
         """Check whether Gateway Connection Service stopped
 
@@ -742,10 +836,13 @@ class ServiceProxy(object):
             return
 
         if self._service_exc is not None:
-            raise GatewayStoppedError(self._service_exc)
+            assert isinstance(self._service_exc, GatewayStoppedError), repr(
+                self._service_exc)
+            raise self._service_exc  # pylint: disable=E0702
         else:
             raise GatewayStoppedError(
-                pika.exceptions.AMQPChannelError(
+                None,
+                pika.exceptions.AMQPConnectionError(
                     _UNKNOWN_CLOSE_REASON_CODE,
                     '{!r} died'.format(self._service_thread)))
 
@@ -768,8 +865,12 @@ class ClientProxy(object):
         """
         self._evt_queue = queue
 
+        # Set to True by client before sending Connection.Close to force closing
+        # of the shared AMQP connection
+        self.force_close = False
+
         # Connection state for use only by `BackgroundConnectionProxy` to track
-        # connection-establishment: CONN_STATE_*
+        # connection state: ClientProxy.CONN_STATE_*
         self.conn_state = self.CONN_STATE_PENDING
 
     def send(self, event):
@@ -884,3 +985,22 @@ class FramesToClientEvent(AsyncEventFamily):
 
         """
         self.frames = frames
+
+
+class ConnectionClosedEvent(AsyncEventFamily):
+    """Notify client about closing or failure of the connection"""
+
+    def __init__(self, open_exc, close_reason_pair):
+        """
+
+        :param open_exc: pika.exception.AMQPConnectionError object if
+            failure occurred during connection-establishment, None if failure or
+            closing of connection occurred after successful connection
+            establishment.
+        :param tuple close_reason_pair: a two-tuple of (code-int, text-str)
+            representing the reason for connection's failure (including
+            establishment failure) or closing.
+
+        """
+        self.open_exc = open_exc
+        self.close_reason_pair = close_reason_pair

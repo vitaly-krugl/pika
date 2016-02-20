@@ -19,6 +19,10 @@ from pika import exceptions
 import pika.spec
 
 
+DEFAULT_CLOSE_REASON_CODE = 200
+DEFAULT_CLOSE_REASON_TEXT = 'Normal shutdown'
+
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -301,10 +305,10 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
         # Receives on_close_callback args from Connection
         self._closed_result = _CallbackResult(self._OnClosedArgs)
 
-        # Set to True when when user calls close() on the connection
-        # NOTE: this is a workaround to detect socket error because
-        # on_close_callback passes reason_code=0 when called due to socket error
-        self._user_initiated_close = False
+        # Set to two-tuple (reply_code, reply-text) when when user calls close()
+        # on the connection. This helps us detect if something went wrong during
+        # the close operation.
+        self._user_initiated_close_reason = None
 
         # Base class is responsible for setting this member to a
         # pika.connection.Connection-based instance and invoking
@@ -390,7 +394,7 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
 
         if self.is_closed:
             try:
-                if not self._user_initiated_close:
+                if not self._user_initiated_close_reason:
                     if self._open_error_result.ready:
                         maybe_exception = self._open_error_result.value.error
                         LOGGER.error('Connection open failed - %r',
@@ -411,8 +415,18 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
                         LOGGER.error('Connection already closed')
                         raise exceptions.ConnectionClosed()
                 else:
-                    LOGGER.info('Connection closed; result=%r',
-                                self._closed_result.value)
+                    result = self._closed_result.value
+                    if ((result.reason_code, result.reason_text) ==
+                            tuple(self._user_initiated_close_reason)):
+                        LOGGER.info('Connection closed; result=%r', result)
+                    else:
+                        # Something went wrong during close
+                        LOGGER.error('Connection closed abnormally; '
+                                     'expected %r, but got %r',
+                                     self._user_initiated_close_reason, result)
+                        raise exceptions.ConnectionClosed(result.reason_code,
+                                                          result.reason_text)
+
             finally:
                 self._cleanup()
 
@@ -590,7 +604,9 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
 
         del self._ready_events[index_to_remove]
 
-    def close(self, reply_code=200, reply_text='Normal shutdown'):
+    def close(self,
+              reply_code=DEFAULT_CLOSE_REASON_CODE,
+              reply_text=DEFAULT_CLOSE_REASON_TEXT):
         """Disconnect from RabbitMQ. If there are any open channels, it will
         attempt to close them prior to fully disconnecting. Channels which
         have active consumers will attempt to send a Basic.Cancel to RabbitMQ
@@ -598,6 +614,8 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
 
         :param int reply_code: The code number for the close
         :param str reply_text: The text reason for the close
+
+        :raises AMQPConnectionError: if something goes wrong while closing
 
         """
         if self.is_closed:
@@ -607,8 +625,6 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
 
         LOGGER.info('Closing connection (%s): %s', reply_code, reply_text)
 
-        self._user_initiated_close = True
-
         # Close channels that remain opened
         for impl_channel in pika.compat.dictvalues(self._impl._channels):
             channel = impl_channel._get_cookie()
@@ -616,8 +632,8 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
                 channel.close(reply_code, reply_text)
 
         # Close the connection
+        self._user_initiated_close_reason = (reply_code, reply_text)
         self._impl.close(reply_code, reply_text)
-
         self._flush_output(self._closed_result.is_ready)
 
     def process_data_events(self, time_limit=0):
