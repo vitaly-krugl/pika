@@ -28,12 +28,14 @@ import Queue
 import threading
 import time
 
+from pika import compat
 from pika.adapters import blocking_connection_base
 from pika.adapters.blocking_connection_base import (
     DEFAULT_CLOSE_REASON_CODE,
     DEFAULT_CLOSE_REASON_TEXT)
 from pika.adapters.subclass_utils import verify_overrides
 from pika.adapters.subclass_utils import overrides_instance_method
+from pika.adapters import threading_utils
 import pika.channel
 import pika.connection
 import pika.exceptions
@@ -99,7 +101,18 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
         # from Connection Gateway
         self._subscribed_to_blocked_state = False
 
-        self._gw_event_rx_queue = Queue.Queue()
+        if compat.PY2:
+            # NOTE We use our own thread-safe queue implementation in py2,
+            # because Queue.Queue.get is very slow on py2 when passed a positive
+            # timeout value; Queue.Queue implements the wait via a polling loop
+            # with exponentially increasing sleep durations. py3 uses
+            # pthread_cond_timedwait, which should be much faster.
+
+            # TODO Need to clean up q resources (release sockets, etc.)
+            self._gw_event_rx_queue = (
+                threading_utils.SimpleQueueWithSelectTimeout())
+        else:
+            self._gw_event_rx_queue = threading_utils.SimpleQueueWithBuiltin()
         self._client_proxy = gw_connection_service.ClientProxy(
             self._gw_event_rx_queue)
 
