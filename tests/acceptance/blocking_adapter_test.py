@@ -56,10 +56,16 @@ class BlockingTestCaseBase(unittest.TestCase):
 
     def _connect(self,
                  url=DEFAULT_URL,
-                 connection_class=pika.BlockingConnection,
+                 connection_class=None,
                  impl_class=None):
+        connection_class = connection_class or pika.BlockingConnection
         parameters = pika.URLParameters(url)
-        connection = connection_class(parameters, _impl_class=impl_class)
+
+        kwargs = dict()
+        if impl_class is not None:
+            kwargs['_impl_class'] = impl_class
+
+        connection = connection_class(parameters, **kwargs)
         self.addCleanup(lambda: connection.close()
                         if connection.is_open else None)
 

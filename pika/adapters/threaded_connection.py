@@ -29,8 +29,9 @@ import threading
 import time
 
 from pika.adapters import blocking_connection_base
-from pika.adapters.blocking_connection_base import DEFAULT_CLOSE_REASON_CODE
-from pika.adapters.blocking_connection_base import DEFAULT_CLOSE_REASON_TEXT
+from pika.adapters.blocking_connection_base import (
+    DEFAULT_CLOSE_REASON_CODE,
+    DEFAULT_CLOSE_REASON_TEXT)
 from pika.adapters.subclass_utils import verify_overrides
 from pika.adapters.subclass_utils import overrides_instance_method
 import pika.channel
@@ -173,8 +174,6 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
             will force the shared AMQP connection to shut down even if there are
             other open clones in existence. The other clones will be notifed of
             the closing through the standard mechanisms.
-
-        :raises AMQPConnectionError: if something goes wrong during close
 
         """
         force = kwargs.pop('force', False)

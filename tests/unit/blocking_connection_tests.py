@@ -136,7 +136,10 @@ class BlockingConnectionTests(unittest.TestCase):
 
         select_connection_class_mock.return_value.is_closed = True
 
-        connection._flush_output(lambda: False, lambda: True)
+        with self.assertRaises(pika.exceptions.ConnectionClosed) as excCtx:
+            connection._flush_output(lambda: False, lambda: True)
+
+        self.assertSequenceEqual(excCtx.exception.args, (200, 'success'))
 
         self.assertEqual(connection._impl.ioloop.activate_poller.call_count,
                          1)

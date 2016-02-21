@@ -22,6 +22,10 @@ import pika.spec
 DEFAULT_CLOSE_REASON_CODE = 200
 DEFAULT_CLOSE_REASON_TEXT = 'Normal shutdown'
 
+# TODO Reserve a value for "unknown reason" and "unexpected failure reason" in
+#connection.InternalCloseReasons after PR #701 is merged
+_UNKNOWN_CLOSE_REASON_CODE = -99
+_UNEXPECTED_FAILURE_REASON_CODE = -400
 
 LOGGER = logging.getLogger(__name__)
 
@@ -415,17 +419,13 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
                         LOGGER.error('Connection already closed')
                         raise exceptions.ConnectionClosed()
                 else:
+                    # User-initiated close
+
                     result = self._closed_result.value
-                    if ((result.reason_code, result.reason_text) ==
-                            tuple(self._user_initiated_close_reason)):
-                        LOGGER.info('Connection closed; result=%r', result)
-                    else:
-                        # Something went wrong during close
-                        LOGGER.error('Connection closed abnormally; '
-                                     'expected %r, but got %r',
-                                     self._user_initiated_close_reason, result)
-                        raise exceptions.ConnectionClosed(result.reason_code,
-                                                          result.reason_text)
+                    # BlockingConnectionBase.close will examine this exception
+                    # to decide whether to propagate it
+                    raise exceptions.ConnectionClosed(result.reason_code,
+                                                      result.reason_text)
 
             finally:
                 self._cleanup()
@@ -615,8 +615,6 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
         :param int reply_code: The code number for the close
         :param str reply_text: The text reason for the close
 
-        :raises AMQPConnectionError: if something goes wrong while closing
-
         """
         if self.is_closed:
             LOGGER.debug('Close called on closed connection (%s): %s',
@@ -625,16 +623,30 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
 
         LOGGER.info('Closing connection (%s): %s', reply_code, reply_text)
 
-        # Close channels that remain opened
-        for impl_channel in pika.compat.dictvalues(self._impl._channels):
-            channel = impl_channel._get_cookie()
-            if channel.is_open:
-                channel.close(reply_code, reply_text)
-
-        # Close the connection
         self._user_initiated_close_reason = (reply_code, reply_text)
-        self._impl.close(reply_code, reply_text)
-        self._flush_output(self._closed_result.is_ready)
+
+        try:
+            # Close channels that remain opened
+            for impl_channel in pika.compat.dictvalues(self._impl._channels):
+                channel = impl_channel._get_cookie()
+                if channel.is_open:
+                    channel.close(reply_code, reply_text)
+
+            # Close the connection
+            self._impl.close(reply_code, reply_text)
+            self._flush_output(self._closed_result.is_ready)
+        except exceptions.AMQPConnectionError as exc:
+            if (exc.args[0], exc.args[1]) == (reply_code, reply_text):
+                LOGGER.info('Connection close completed with expected reason: '
+                            '(%r): %r', reply_code, reply_text)
+            else:
+                if exc.args[0] == _UNEXPECTED_FAILURE_REASON_CODE:
+                    LOGGER.error('Connection closed abnormally: %r', exc)
+                    raise
+                else:
+                    LOGGER.warning('Connection close was interrupted by %r',
+                                   exc)
+
 
     def process_data_events(self, time_limit=0):
         """Will make sure that data events are processed. Dispatches timer and

@@ -18,9 +18,6 @@ Next Release
    never be serviced in the asynchronous scenario.
  - `Channel.basic_reject` fixed to allow `delivery_tag` to be of type `long`
    as well as `int`. (by quantum5)
- - `BlockingConnection.close()` may raise AMQPConnectionError (or derived
-   exception) if something goes wrong while closing.
-
 
 0.10.0 2015-09-02
 -----------------

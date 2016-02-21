@@ -27,9 +27,12 @@ import errno
 import logging
 import os
 import Queue
-import sys
 import threading
+import traceback
 
+from pika.adapters.blocking_connection_base import (
+    _UNKNOWN_CLOSE_REASON_CODE,
+    _UNEXPECTED_FAILURE_REASON_CODE)
 from pika.adapters.subclass_utils import verify_overrides
 from pika.adapters.subclass_utils import overrides_instance_method
 from pika.compat import xrange  # pylint: disable=W0622
@@ -42,11 +45,6 @@ from pika.adapters import select_connection
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-# TODO Reserve a value for "unknown reason" in connection.InternalCloseReasons
-#    once PR #701 is merged
-_UNKNOWN_CLOSE_REASON_CODE = -99
 
 
 class GatewayStoppedError(Exception):
@@ -151,7 +149,8 @@ class GatewayConnectionService(threading.Thread):
             self._run_service()
         except:
             LOGGER.exception('_run_service failed')
-            reason_pair = (_UNKNOWN_CLOSE_REASON_CODE, repr(sys.exc_info()[1]))
+            reason_pair = (_UNEXPECTED_FAILURE_REASON_CODE,
+                           ''.join(traceback.format_exc()))
 
             if self._conn_open_completed:
                 open_exc = None
@@ -169,7 +168,6 @@ class GatewayConnectionService(threading.Thread):
 
             LOGGER.info('_run_service exited: %r',
                         self._service_proxy._service_exc)
-
 
     def _run_service(self):
         """Execute the service; called from background thread
@@ -843,7 +841,7 @@ class ServiceProxy(object):
             raise GatewayStoppedError(
                 None,
                 pika.exceptions.AMQPConnectionError(
-                    _UNKNOWN_CLOSE_REASON_CODE,
+                    _UNEXPECTED_FAILURE_REASON_CODE,
                     '{!r} died'.format(self._service_thread)))
 
 class ClientProxy(object):
