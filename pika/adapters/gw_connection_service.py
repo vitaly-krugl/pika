@@ -85,7 +85,11 @@ class GatewayConnectionService(threading.Thread):
         # We're shutting down, don't process any more events from clients
         self._shutting_down = False
 
-        # Will hold SelectConnection instance
+        # select_connection.IOLoop will be created when thread starts running
+        self._ioloop = None
+
+        # Will hold SelectConnection instance when we receive the first
+        # ProtocolHeader frame
         self._conn = None
 
         # Input event queue
@@ -173,28 +177,20 @@ class GatewayConnectionService(threading.Thread):
         """Execute the service; called from background thread
 
         """
-        self._conn = _GatewayConnection(
-            parameters=self._conn_parameters,
-            on_open_callback=self._on_connection_established,
-            on_open_error_callback=self._on_connection_open_error,
-            on_close_callback=self._on_connection_closed,
-            channel_to_client_map=self._channel_to_client_map)
+        self._ioloop = select_connection.IOLoop()
 
-        self._conn.ioloop.add_handler(self._r_attention.fileno(),
-                                      self._on_attention,
-                                      select_connection.READ)
+        self._ioloop.add_handler(self._r_attention.fileno(),
+                                 self._on_attention,
+                                 select_connection.READ)
 
-        self._conn.add_on_connection_blocked_callback(
-            self._on_connection_blocked)
-        self._conn.add_on_connection_unblocked_callback(
-            self._on_connection_unblocked)
+        # NOTE we defer starting _GatewayConnection until we receive the first
+        # ProtocolHeader frame. This way, immediate connection failures will not
+        # leave the initial client waiting long to discover that something went
+        # wrong.
 
-        if not self._conn.is_closed:
-            # Run ioloop; it won't return until we stop the loop upon failure or
-            # closing of the connection
-            self._conn.ioloop.start()
-        else:
-            LOGGER.warning('Connection is closed, skipping ioloop')
+        # Run ioloop; it won't return until we stop the loop upon failure or
+        # closing of the connection; see _request_shutdown.
+        self._ioloop.start()
 
         # Cleanup
         LOGGER.info('Cleaning up')
@@ -440,6 +436,10 @@ class GatewayConnectionService(threading.Thread):
                     client.conn_state = ClientProxy.CONN_STATE_HANDSHAKE
                     self._register_client(client)
 
+                    if self._conn is None:
+                        # Begin connecting to AMQP
+                        self._open_gateway_connection()
+
                     # Send spec.Connection.Start if connected; otherwise, it
                     # will be sent once connection with broker is established
                     if self._conn.is_open:
@@ -491,6 +491,26 @@ class GatewayConnectionService(threading.Thread):
         else:
             # Let client know that all frames have been disposed
             client.dispatch(event)
+
+    def _open_gateway_connection(self):
+        """Instantiate `_GatewayConnection` and begin connecting to AMQP
+
+        """
+        assert self._conn is None, '_GatewayConnection was already instantiated'
+
+        self._conn = _GatewayConnection(
+            parameters=self._conn_parameters,
+            on_open_callback=self._on_connection_established,
+            on_open_error_callback=self._on_connection_open_error,
+            on_close_callback=self._on_connection_closed,
+            custom_ioloop=self._ioloop,
+            channel_to_client_map=self._channel_to_client_map)
+
+        if not self._conn.is_closed:
+            self._conn.add_on_connection_blocked_callback(
+                self._on_connection_blocked)
+            self._conn.add_on_connection_unblocked_callback(
+                self._on_connection_unblocked)
 
     def _register_client(self, client):
         """Register new client
@@ -561,16 +581,15 @@ class GatewayConnectionService(threading.Thread):
         # NOTE: self._conn might not be set up when called during connection
         # establishment failure; presently, Connection constructor might invoke
         # a callback before the constructor returns.
-        if self._conn is not None:
-            # Close the AMQP connection
-            if self._conn.is_closed:
-                LOGGER.info('Requesting ioloop-stop')
-                self._conn.ioloop.stop()
-            else:
-                LOGGER.info('Requesting connection-close')
-                assert reason_code is not None
-                assert reason_text is not None
-                self._conn.close(reply_code=reason_code, reply_text=reason_text)
+        # Close the AMQP connection
+        if self._conn is None or self._conn.is_closed:
+            LOGGER.info('Requesting ioloop-stop')
+            self._ioloop.stop()
+        else:
+            LOGGER.info('Requesting connection-close')
+            assert reason_code is not None
+            assert reason_text is not None
+            self._conn.close(reply_code=reason_code, reply_text=reason_text)
 
     @staticmethod
     def _send_blocked_state_to_client(client, method_frame):
@@ -651,6 +670,7 @@ class _GatewayConnection(select_connection.SelectConnection):
                  on_open_callback,
                  on_open_error_callback,
                  on_close_callback,
+                 custom_ioloop,
                  channel_to_client_map):
         """
         :param pika.connection.Parameters parameters: Connection parameters
@@ -689,7 +709,8 @@ class _GatewayConnection(select_connection.SelectConnection):
             on_open_callback=on_open_callback,
             on_open_error_callback=on_open_error_callback,
             on_close_callback=on_close_callback,
-            stop_ioloop_on_close=False)
+            stop_ioloop_on_close=False,
+            custom_ioloop=custom_ioloop)
 
     def appended_frames_from_event(self, event):
         """ Called by `GatewayConnectionService`. We will schedule buffered data
