@@ -54,6 +54,10 @@ class BlockingTestCaseBase(unittest.TestCase):
 
     TIMEOUT = DEFAULT_TIMEOUT
 
+    def shortDescription(self):
+        method_desc = super(BlockingTestCaseBase, self).shortDescription()
+        return "%s (%s)" % (pika.BlockingConnection.__name__, method_desc)
+
     def _connect(self,
                  url=DEFAULT_URL,
                  connection_class=None,
@@ -681,7 +685,7 @@ class TestPassiveQueueDeclareOfUnknownQueueRaisesChannelClosed(
 class TestQueueBindAndUnbindAndPurge(BlockingTestCaseBase):
 
     def test(self):
-        """BlockingChannel: Test queue_bind and queue_unbind"""
+        """BlockingChannel: Test queue_bind, queue_unbind, and queue_purge"""
         connection = self._connect()
 
         ch = connection.channel()
@@ -1137,7 +1141,7 @@ class TestTxCommit(BlockingTestCaseBase):
 class TestTxRollback(BlockingTestCaseBase):
 
     def test(self):
-        """BlockingChannel.tx_commit"""
+        """BlockingChannel.tx_rollback"""
         connection = self._connect()
 
         ch = connection.channel()
@@ -2369,7 +2373,7 @@ class TestUnackedMessageAutoRestoredToQueueOnChannelClose(BlockingTestCaseBase):
 class TestNoAckMessageNotRestoredToQueueOnChannelClose(BlockingTestCaseBase):
 
     def test(self):
-        """BlockingChannel unacked message restored to q on channel close """
+        """BlockingChannel unacked no-ack message not restored to q on channel close """
         connection = self._connect()
 
         ch = connection.channel()

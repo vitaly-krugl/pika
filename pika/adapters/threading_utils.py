@@ -121,7 +121,7 @@ if not compat.PY2:
 
         def close(self):
             """Release resources"""
-            pass
+            self._queue.queue.clear()
 
         def qsize(self):
             """Return currrent queue size (number of items)
@@ -173,6 +173,8 @@ else:
 
             self._w_attention.close()
             self._w_attention = None
+
+            self._queue.clear()
 
         def qsize(self):
             """Return currrent queue size (number of items)

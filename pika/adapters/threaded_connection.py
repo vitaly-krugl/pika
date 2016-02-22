@@ -106,7 +106,6 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
         # from Connection Gateway
         self._subscribed_to_blocked_state = False
 
-        # TODO need cleanup for _gw_event_rx_queue
         self._gw_event_rx_queue = threading_utils.SingleConsumerSimpleQueue()
         self._client_proxy = gw_connection_service.ClientProxy(
             self._gw_event_rx_queue)
@@ -195,6 +194,16 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
             self._client_proxy.force_close = True
 
         return super(ThreadedConnection, self).close(reply_code, reply_text)
+
+    @overrides_instance_method
+    def _cleanup(self):
+        """[supplement base] Clean up our own references to help out gc
+
+        """
+        try:
+            return super(ThreadedConnection, self)._cleanup()
+        finally:
+            self._gw_event_rx_queue.close()
 
     @overrides_instance_method
     def _manage_io(self, *waiters):

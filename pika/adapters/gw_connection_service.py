@@ -490,7 +490,7 @@ class GatewayConnectionService(threading.Thread):
             self._conn.appended_frames_from_event(event)
         else:
             # Let client know that all frames have been disposed
-            client.send(event)
+            client.dispatch(event)
 
     def _register_client(self, client):
         """Register new client
@@ -582,7 +582,7 @@ class GatewayConnectionService(threading.Thread):
             `pika.spec.Connection.Unblocked`
 
         """
-        client.send(FramesToClientEvent([method_frame]))
+        client.dispatch(FramesToClientEvent([method_frame]))
 
     @staticmethod
     def _send_connection_closed_event_to_client(client, open_exc,
@@ -601,7 +601,7 @@ class GatewayConnectionService(threading.Thread):
         event = ConnectionClosedEvent(open_exc=open_exc,
                                       close_reason_pair=close_reason_pair)
         LOGGER.debug('Sending %r to %r', event, client)
-        client.send(event)
+        client.dispatch(event)
 
     @staticmethod
     def _send_connection_close_ok_to_client(client):
@@ -612,7 +612,7 @@ class GatewayConnectionService(threading.Thread):
         """
         frame = pika.frame.Method(0, pika.spec.Connection.CloseOk())
         LOGGER.debug('Sending %r to %r', frame, client)
-        client.send(FramesToClientEvent([frame]))
+        client.dispatch(FramesToClientEvent([frame]))
 
     def _send_connection_open_ok_to_client(self, client):
         """Send spec.Connection.OpenOk to client
@@ -621,7 +621,7 @@ class GatewayConnectionService(threading.Thread):
         """
         frame = self._conn._gw_connection_open_ok_frame
         LOGGER.debug('Sending %r to %r', frame, client)
-        client.send(FramesToClientEvent([copy.deepcopy(frame)]))
+        client.dispatch(FramesToClientEvent([copy.deepcopy(frame)]))
 
     def _send_connection_start_to_client(self, client):
         """Send spec.Connection.Start to client
@@ -630,7 +630,7 @@ class GatewayConnectionService(threading.Thread):
         """
         frame = self._conn._gw_connection_start_frame
         LOGGER.debug('Sending %r to %r', frame, client)
-        client.send(FramesToClientEvent([copy.deepcopy(frame)]))
+        client.dispatch(FramesToClientEvent([copy.deepcopy(frame)]))
 
     def _send_connection_tune_to_client(self, client):
         """Send spec.Connection.Tune to client
@@ -639,7 +639,7 @@ class GatewayConnectionService(threading.Thread):
         """
         frame = self._conn._gw_connection_tune_frame
         LOGGER.debug('Sending %r to %r', frame, client)
-        client.send(FramesToClientEvent([copy.deepcopy(frame)]))
+        client.dispatch(FramesToClientEvent([copy.deepcopy(frame)]))
 
 
 @verify_overrides
@@ -768,7 +768,7 @@ class _GatewayConnection(select_connection.SelectConnection):
             while self._gw_incoming_client_frames:
                 client, frames = self._gw_incoming_client_frames.popitem()
                 LOGGER.debug('Dispatching %i frames to %r', len(frames), client)
-                client.send(FramesToClientEvent(frames))
+                client.dispatch(FramesToClientEvent(frames))
 
 
     @overrides_instance_method
@@ -789,7 +789,7 @@ class _GatewayConnection(select_connection.SelectConnection):
                         self._gw_outbound_event_markers[0][0]):
                     # Signal that client's frames have been streamed
                     threshold, event = self._gw_outbound_event_markers.popleft()
-                    event.client.send(event)
+                    event.client.dispatch(event)
                     LOGGER.debug('_handle_write: ACKed %r to %r; thresh=%i '
                                  'frames=%i', event, event.client, threshold,
                                  self._gw_tx_frames_streamed)
@@ -871,7 +871,7 @@ class ClientProxy(object):
         # connection state: ClientProxy.CONN_STATE_*
         self.conn_state = self.CONN_STATE_PENDING
 
-    def send(self, event):
+    def dispatch(self, event):
         """Send an event to client
 
         :param event: event object destined for client
