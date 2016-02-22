@@ -247,7 +247,7 @@ class BaseConnection(connection.Connection):
         if hasattr(error_value, 'errno'):  # Python >= 2.6
             return error_value.errno
         else:
-            # TODO: this doesn't look right; error_value.args[0] ??? Could
+            # TODO this doesn't look right; error_value.args[0] ??? Could
             # probably remove this code path since pika doesn't test against
             # Python 2.5
             return error_value[0]  # Python <= 2.5
@@ -282,7 +282,7 @@ class BaseConnection(connection.Connection):
         :param int|object error_value: The inbound error
 
         """
-        # TODO: doesn't seem right: docstring defines error_value as int|object,
+        # TODO doesn't seem right: docstring defines error_value as int|object,
         # but _get_error_code expects a falsie or an exception-like object
         error_code = self._get_error_code(error_value)
 
@@ -302,7 +302,7 @@ class BaseConnection(connection.Connection):
         elif self.params.ssl and isinstance(error_value, ssl.SSLError):
 
             if error_value.args[0] == ssl.SSL_ERROR_WANT_READ:
-                # TODO: doesn't seem right: this logic updates event state, but
+                # TODO doesn't seem right: this logic updates event state, but
                 # the logic at the bottom unconditionaly disconnects anyway.
                 self.event_state = self.READ
             elif error_value.args[0] == ssl.SSL_ERROR_WANT_WRITE:

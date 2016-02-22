@@ -368,7 +368,16 @@ class Channel(object):
                                    and connection level) allow it. The
                                    prefetch-count is ignored if the no-ack
                                    option is set.
-        :param bool all_channels: Should the QoS apply to all channels
+        :param bool all_channels: Should the QoS apply to all channels (i.e.,
+            "global" per AMQP 0.9.1). NOTE: per
+            https://www.rabbitmq.com/amqp-0-9-1-reference.html, "RabbitMQ has
+            reinterpreted this field. The original specification said: "By
+            default the QoS settings apply to the current channel only. If this
+            field is set, they are applied to the entire connection." Instead,
+            RabbitMQ takes global=false to mean that the QoS settings should
+            apply per-consumer (for new consumers on the channel; existing ones
+            being unaffected) and global=true to mean that the QoS settings
+            should apply per-channel."
 
         """
         self._validate_channel_and_callback(callback)

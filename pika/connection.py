@@ -773,7 +773,7 @@ class Connection(object):
                        self.remaining_connection_attempts)
         if self.remaining_connection_attempts > 0:
             LOGGER.info('Retrying in %i seconds', self.params.retry_delay)
-            # TODO: remove timeout if connection is closed before timer fires
+            # TODO remove timeout if connection is closed before timer fires
             self.add_timeout(self.params.retry_delay, self.connect)
         else:
             # TODO This should use _on_terminate for consistent behavior
@@ -1501,7 +1501,7 @@ class Connection(object):
         self._remove_heartbeat()
 
         # Remove connection management callbacks
-        # TODO: This call was moved here verbatim from legacy code and the
+        # TODO This call was moved here verbatim from legacy code and the
         # following doesn't seem to be right: `Connection.Open` here is
         # unexpected, we don't appear to ever register it, and the broker
         # shouldn't be sending `Connection.Open` to us, anyway.

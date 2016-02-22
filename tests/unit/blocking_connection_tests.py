@@ -50,7 +50,7 @@ class SelectConnectionTemplate(blocking_connection.SelectConnection):
 
 
 class BlockingConnectionTests(unittest.TestCase):
-    """TODO: test properties"""
+    """TODO test properties"""
 
     @patch.object(blocking_connection, 'SelectConnection',
                   spec_set=SelectConnectionTemplate)

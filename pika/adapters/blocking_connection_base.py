@@ -2102,7 +2102,9 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
                                    to zero, meaning "no specific limit",
                                    although other prefetch limits may still
                                    apply. The prefetch-size is ignored if the
-                                   no-ack option is set in the consumer.
+                                   no-ack option is set in the consumer. NOTE:
+                                   as of RabbitMQ v3.6.0 and prior, it does not
+                                   support non-zero prefetch_size.
         :param int prefetch_count: Specifies a prefetch window in terms of whole
                                    messages. This field may be used in
                                    combination with the prefetch-size field; a
@@ -2111,7 +2113,16 @@ class BlockingChannel(object):  # pylint: disable=R0904,R0902
                                    and connection level) allow it. The
                                    prefetch-count is ignored if the no-ack
                                    option is set in the consumer.
-        :param bool all_channels: Should the QoS apply to all channels
+        :param bool all_channels: Should the QoS apply to all channels (i.e.,
+            "global" per AMQP 0.9.1). NOTE: per
+            https://www.rabbitmq.com/amqp-0-9-1-reference.html, "RabbitMQ has
+            reinterpreted this field. The original specification said: "By
+            default the QoS settings apply to the current channel only. If this
+            field is set, they are applied to the entire connection." Instead,
+            RabbitMQ takes global=false to mean that the QoS settings should
+            apply per-consumer (for new consumers on the channel; existing ones
+            being unaffected) and global=true to mean that the QoS settings
+            should apply per-channel."
 
         """
         with _CallbackResult() as qos_ok_result:

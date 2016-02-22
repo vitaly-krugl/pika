@@ -27,6 +27,7 @@ except ImportError:
     import mock
 
 import errno
+from functools import partial
 import os
 import signal
 import socket
@@ -36,7 +37,8 @@ import threading
 import pika
 from pika.adapters import select_connection
 from pika.adapters.select_connection import READ, WRITE
-from functools import partial
+import pika.compat
+
 
 class IOLoopBaseTest(unittest.TestCase):
     ''' Base for test classes in this uit. '''
@@ -403,13 +405,13 @@ class IOLoopEintrTestCaseSelect(IOLoopBaseTest):
 
     @unittest.skipUnless(pika.compat.HAVE_SIGNAL,
                          "This platform doesn't support posix signals")
-    @mock.patch('pika.adapters.select_connection._is_resumable')
-    def test_eintr(self, is_resumable_mock, is_resumable_raw=pika.adapters
-                   .select_connection._is_resumable): #pylint: disable=W0212
+    @mock.patch('pika.compat.is_select_eintr')
+    def test_eintr(self, is_select_eintr_mock,
+                   is_select_eintr_raw=pika.compat.is_select_eintr):
         '''Test that poll() is properly restarted after receiving EINTR error.
            Class of an exception raised to signal the error differs in one
            implementation of polling mechanism and another.'''
-        is_resumable_mock.side_effect = is_resumable_raw
+        is_select_eintr_mock.side_effect = is_select_eintr_raw
         self.poller = self.ioloop._get_poller() #pylint: disable=W0212
         sockpair = self.poller._get_interrupt_pair()
         self._eintr_read_handler_is_called = False
@@ -431,9 +433,9 @@ class IOLoopEintrTestCaseSelect(IOLoopBaseTest):
         self.poller.start()
         self.assertTrue(self._eintr_read_handler_is_called)
         if pika.compat.EINTR_IS_EXPOSED:
-            self.assertEqual(is_resumable_mock.call_count, 1)
+            self.assertEqual(is_select_eintr_mock.call_count, 1)
         else:
-            self.assertEqual(is_resumable_mock.call_count, 0)
+            self.assertEqual(is_select_eintr_mock.call_count, 0)
 
 
 class IOLoopEintrTestCasePoll(IOLoopEintrTestCaseSelect):

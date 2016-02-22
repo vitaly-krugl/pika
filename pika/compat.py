@@ -1,24 +1,40 @@
+"""
+PY2/PY3 compatibility helpers
+"""
+
 import abc
+import errno
 import os
+import select
 import sys as _sys
 
 PY2 = _sys.version_info < (3,)
 PY3 = not PY2
 
 
+# Map of exception classes that might be thrown by select.* poller methods to
+# callables that take an exception object and return True if the exception
+# indicates EINTR.
+#
+# The reason for this unconventional dict initialization is the fact that on some
+# platforms select.error is an aliases for OSError. We don't want the lambda
+# for select.error to win over one for OSError.
+_SELECT_EINTR_CHECKERS = {}
+
+
 if not PY2:
     # these were moved around for Python 3
-    from urllib.parse import unquote as url_unquote, urlencode
+    from urllib.parse import unquote as url_unquote, urlencode #pylint: disable=W0611,E0611,F0401
 
     # Python 3 does not have basestring anymore; we include
     # *only* the str here as this is used for textual data.
-    basestring = (str,)
+    basestring = (str,)  #pylint: disable=W0622
 
     # for assertions that the data is either encoded or non-encoded text
     str_or_bytes = (str, bytes)
 
     # xrange is gone, replace it with range
-    xrange = range
+    xrange = range  #pylint: disable=W0622
 
     # the unicode type is str
     unicode_type = str
@@ -57,7 +73,7 @@ if not PY2:
         """
         return bytes(args)
 
-    class long(int):
+    class long(int):  #pylint: disable=W0622
         """
         A marker class that signifies that the integer value should be
         serialized as `l` instead of `I`
@@ -85,6 +101,9 @@ if not PY2:
     # NOTE: Wrapping in exec, because module containing
     # `class AbstractBase(metaclass=abc.ABCMeta)` fails to load under python 2.
     exec('class AbstractBase(metaclass=abc.ABCMeta): pass')  # pylint: disable=W0122
+
+    # InterruptedError is undefined in PY2
+    _SELECT_EINTR_CHECKERS[InterruptedError] = lambda e: True
 
 else:
     # PY2
@@ -128,4 +147,28 @@ def as_bytes(value):
 
 HAVE_SIGNAL = os.name == 'posix'
 
-EINTR_IS_EXPOSED = _sys.version_info[:2] <= (3,4)
+EINTR_IS_EXPOSED = _sys.version_info[:2] <= (3, 4)
+
+_SELECT_EINTR_CHECKERS[select.error] = lambda e: e.args[0] == errno.EINTR
+_SELECT_EINTR_CHECKERS[IOError] = lambda e: e.errno == errno.EINTR
+_SELECT_EINTR_CHECKERS[OSError] = lambda e: e.errno == errno.EINTR
+
+# Exception classes thrown by polling methods of select.select,
+# select.poll, select.epoll, and select.kqueue that might be carriers of EINTR.
+# May be used in the `except` statement.
+SELECT_EINTR_ERRORS = tuple(_SELECT_EINTR_CHECKERS.keys())
+
+
+def is_select_eintr(exc):
+    """Check if the exception caught from a select.* poller represents EINTR.
+
+    :param exc: exception; must be one of classes in SELECT_EINTR_ERRORS
+
+    :returns: True if the exception represents EINTR; False if not.
+
+    """
+    checker = _SELECT_EINTR_CHECKERS.get(exc.__class__, None)
+    if checker is not None:
+        return checker(exc)
+    else:
+        return False

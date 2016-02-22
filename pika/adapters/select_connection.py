@@ -12,7 +12,7 @@ import time
 from collections import defaultdict
 import threading
 
-import pika.compat
+from pika import compat
 from pika.compat import dictkeys
 
 from pika.adapters.base_connection import BaseConnection
@@ -27,37 +27,6 @@ READ = 0x0001
 WRITE = 0x0004
 ERROR = 0x0008
 
-
-# Reason for this unconventional dict initialization is the fact that on some
-# platforms select.error is an aliases for OSError. We don't want the lambda
-# for select.error to win over one for OSError.
-_SELECT_ERROR_CHECKERS = {}
-if pika.compat.PY3:
-    #InterruptedError is undefined in PY2
-    #pylint: disable=E0602
-    _SELECT_ERROR_CHECKERS[InterruptedError] = lambda e: True
-_SELECT_ERROR_CHECKERS[select.error] = lambda e: e.args[0] == errno.EINTR
-_SELECT_ERROR_CHECKERS[IOError] = lambda e: e.errno == errno.EINTR
-_SELECT_ERROR_CHECKERS[OSError] = lambda e: e.errno == errno.EINTR
-
-
-# We can reduce the number of elements in the list by looking at super-sub
-# class relationship because only the most generic ones needs to be caught.
-# For now the optimization is left out.
-# Following is better but still incomplete.
-#_SELECT_ERRORS = tuple(filter(lambda e: not isinstance(e, OSError),
-#                              _SELECT_ERROR_CHECKERS.keys())
-#                       + [OSError])
-_SELECT_ERRORS = tuple(_SELECT_ERROR_CHECKERS.keys())
-
-def _is_resumable(exc):
-    ''' Check if caught exception represents EINTR error.
-    :param exc: exception; must be one of classes in _SELECT_ERRORS '''
-    checker = _SELECT_ERROR_CHECKERS.get(exc.__class__, None)
-    if checker is not None:
-        return checker(exc)
-    else:
-        return False
 
 class SelectConnection(BaseConnection):
     """An asynchronous connection adapter that attempts to use the fastest
@@ -245,7 +214,7 @@ class IOLoop(object):
         self._poller.poll()
 
 
-class _PollerBase(pika.compat.AbstractBase):  # pylint: disable=R0902
+class _PollerBase(compat.AbstractBase):  # pylint: disable=R0902
     """Base class for select-based IOLoop implementations"""
 
     # Drop out of the poll loop every _MAX_POLL_TIMEOUT secs as a worst case;
@@ -684,8 +653,8 @@ class SelectPoller(_PollerBase):
                                                    self._fd_events[ERROR],
                                                    self._get_next_deadline())
                 break
-            except _SELECT_ERRORS as error:
-                if _is_resumable(error):
+            except compat.SELECT_EINTR_ERRORS as error:
+                if compat.is_select_eintr(error):
                     continue
                 else:
                     raise
@@ -785,8 +754,8 @@ class KQueuePoller(_PollerBase):
                 kevents = self._kqueue.control(None, 1000,
                                                self._get_next_deadline())
                 break
-            except _SELECT_ERRORS as error:
-                if _is_resumable(error):
+            except compat.SELECT_EINTR_ERRORS as error:
+                if compat.is_select_eintr(error):
                     continue
                 else:
                     raise
@@ -904,8 +873,8 @@ class PollPoller(_PollerBase):
             try:
                 events = self._poll.poll(self._get_next_deadline())
                 break
-            except _SELECT_ERRORS as error:
-                if _is_resumable(error):
+            except compat.SELECT_EINTR_ERRORS as error:
+                if compat.is_select_eintr(error):
                     continue
                 else:
                     raise

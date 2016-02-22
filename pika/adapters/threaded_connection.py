@@ -28,7 +28,6 @@ import Queue
 import threading
 import time
 
-from pika import compat
 from pika.adapters import blocking_connection_base
 from pika.adapters.blocking_connection_base import (
     DEFAULT_CLOSE_REASON_CODE,
@@ -75,6 +74,12 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
     # once in a while, but not too often
     _MAX_RX_EVENT_BLOCK_SEC = 5
 
+    # TODO Figure out consumer flow control to avoid overwhelming memory. There
+    # are two cases to consider:
+    #   1. no_ack=True: here, QoS has no effect
+    #   2. no_ack=False: here, we could auotmatically set default QoS if such
+    #      a consumer is being created without user QoS on the channel.
+
     def __init__(self, parameters=None, **kwargs):
         """Create a new instance of the `ThreadedConnection` object.
 
@@ -101,18 +106,8 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
         # from Connection Gateway
         self._subscribed_to_blocked_state = False
 
-        if compat.PY2:
-            # NOTE We use our own thread-safe queue implementation in py2,
-            # because Queue.Queue.get is very slow on py2 when passed a positive
-            # timeout value; Queue.Queue implements the wait via a polling loop
-            # with exponentially increasing sleep durations. py3 uses
-            # pthread_cond_timedwait, which should be much faster.
-
-            # TODO Need to clean up q resources (release sockets, etc.)
-            self._gw_event_rx_queue = (
-                threading_utils.SimpleQueueWithSelectTimeout())
-        else:
-            self._gw_event_rx_queue = threading_utils.SimpleQueueWithBuiltin()
+        # TODO need cleanup for _gw_event_rx_queue
+        self._gw_event_rx_queue = threading_utils.SingleConsumerSimpleQueue()
         self._client_proxy = gw_connection_service.ClientProxy(
             self._gw_event_rx_queue)
 
@@ -266,8 +261,6 @@ class ThreadedConnection(blocking_connection_base.BlockingConnectionBase):
                 timeout = (self._MAX_RX_EVENT_BLOCK_SEC if timeout is None
                            else min(self._MAX_RX_EVENT_BLOCK_SEC, timeout))
 
-                # TODO this is really slow when timeout!=None. Try implementing
-                # our own simpler queue
                 event = self._gw_event_rx_queue.get(timeout=timeout)
             except Queue.Empty:
                 # Check gateway's health
@@ -637,6 +630,7 @@ class _Timer(object):
             LOGGER.error('Attempted to cancel deactivated timer %r', self)
 
 
+# TODO select_connection could use this instead of its own ioloop timer logic
 class _TimerManager(object):
     """Manage timers for use in ioloop"""
 

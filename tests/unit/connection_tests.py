@@ -451,7 +451,7 @@ class ConnectionTests(unittest.TestCase):
         method_frame.method.version_major = 0
         method_frame.method.version_minor = 9
         #This may be incorrectly mocked, or the code is wrong
-        #TODO: Code does hasattr check, should this be a has_key/in check?
+        #TODO Code does hasattr check, should this be a has_key/in check?
         method_frame.method.server_properties = {
             'capabilities': {
                 'basic.nack': True,
