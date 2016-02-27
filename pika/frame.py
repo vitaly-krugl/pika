@@ -105,6 +105,12 @@ class Header(Frame):
         self.body_size = body_size
         self.properties = props
 
+        # Size (in bytes) of all raw inbound frames that comprise the message (
+        # method, header, and body frames); used for flow control by some
+        # adapters. None for outbound Header frames. This value is set by the
+        # channel's content frame assembler as a friend of the class.
+        self._total_raw_in_size = None
+
     def marshal(self):
         """Return the AMQP binary encoded value of the frame
 

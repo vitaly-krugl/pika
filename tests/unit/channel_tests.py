@@ -1,5 +1,5 @@
 """
-Tests for pika.channel.ContentFrameDispatcher
+Tests for pika.channel.Channel
 
 """
 

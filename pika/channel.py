@@ -1250,6 +1250,8 @@ class ContentFrameDispatcher(object):
             self._method_frame = frame_value
         elif isinstance(frame_value, frame.Header):
             self._header_frame = frame_value
+            frame_value._total_raw_in_size = (self._method_frame._raw_in_size +
+                                              frame_value._raw_in_size)
             if frame_value.body_size == 0:
                 return self._finish()
         elif isinstance(frame_value, frame.Body):
@@ -1277,8 +1279,11 @@ class ContentFrameDispatcher(object):
         :rtype: tuple(pika.frame.Method, pika.frame.Header, str)|None
 
         """
+        self._header_frame._total_raw_in_size += body_frame._raw_in_size
+
         self._seen_so_far += len(body_frame.fragment)
         self._body_fragments.append(body_frame.fragment)
+
         if self._seen_so_far == self._header_frame.body_size:
             return self._finish()
         elif self._seen_so_far > self._header_frame.body_size:
