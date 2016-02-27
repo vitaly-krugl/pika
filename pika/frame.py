@@ -19,15 +19,21 @@ class Frame(amqp_object.AMQPObject):
     """
     NAME = 'Frame'
 
-    def __init__(self, frame_type, channel_number):
+    def __init__(self, frame_type, channel_number, raw_in_size):
         """Create a new instance of a frame
 
         :param int frame_type: The frame type
         :param int channel_number: The channel number for the frame
+        :param int raw_in_size: Size (in bytes) of the raw inbound frame; None
+            for outbound frames.
 
         """
         self.frame_type = frame_type
         self.channel_number = channel_number
+
+        # Size (in bytes) of the raw input frame that was decoded; used for flow
+        # control by some adapters.
+        self._raw_in_size = raw_in_size
 
     def _marshal(self, pieces):
         """Create the full AMQP wire protocol frame data representation
@@ -55,14 +61,16 @@ class Method(Frame):
     """
     NAME = 'METHOD'
 
-    def __init__(self, channel_number, method):
+    def __init__(self, channel_number, method, raw_in_size=None):
         """Create a new instance of a frame
 
         :param int channel_number: The frame type
         :param pika.Spec.Class.Method method: The AMQP Class.Method
+        :param int raw_in_size: Size (in bytes) of the raw inbound frame; None
+            for outbound frames.
 
         """
-        Frame.__init__(self, spec.FRAME_METHOD, channel_number)
+        Frame.__init__(self, spec.FRAME_METHOD, channel_number, raw_in_size)
         self.method = method
 
     def marshal(self):
@@ -83,15 +91,17 @@ class Header(Frame):
     """
     NAME = 'Header'
 
-    def __init__(self, channel_number, body_size, props):
+    def __init__(self, channel_number, body_size, props, raw_in_size=None):
         """Create a new instance of a AMQP ContentHeader object
 
         :param int channel_number: The channel number for the frame
         :param int body_size: The number of bytes for the body
         :param pika.spec.BasicProperties props: Basic.Properties object
+        :param int raw_in_size: Size (in bytes) of the raw inbound frame; None
+            for outbound frames.
 
         """
-        Frame.__init__(self, spec.FRAME_HEADER, channel_number)
+        Frame.__init__(self, spec.FRAME_HEADER, channel_number, raw_in_size)
         self.body_size = body_size
         self.properties = props
 
@@ -114,14 +124,16 @@ class Body(Frame):
     """
     NAME = 'Body'
 
-    def __init__(self, channel_number, fragment):
+    def __init__(self, channel_number, fragment, raw_in_size=None):
         """
         Parameters:
 
         - channel_number: int
         - fragment: unicode or str
+        :param int raw_in_size: Size (in bytes) of the raw inbound frame; None
+            for outbound frames.
         """
-        Frame.__init__(self, spec.FRAME_BODY, channel_number)
+        Frame.__init__(self, spec.FRAME_BODY, channel_number, raw_in_size)
         self.fragment = fragment
 
     def marshal(self):
@@ -141,9 +153,14 @@ class Heartbeat(Frame):
     """
     NAME = 'Heartbeat'
 
-    def __init__(self):
-        """Create a new instance of the Heartbeat frame"""
-        Frame.__init__(self, spec.FRAME_HEARTBEAT, 0)
+    def __init__(self, raw_in_size=None):
+        """Create a new instance of the Heartbeat frame
+
+        :param int raw_in_size: Size (in bytes) of the raw inbound frame; None
+            for outbound frames.
+
+        """
+        Frame.__init__(self, spec.FRAME_HEARTBEAT, 0, raw_in_size)
 
     def marshal(self):
         """Return the AMQP binary encoded value of the frame
@@ -183,7 +200,7 @@ class ProtocolHeader(amqp_object.AMQPObject):
 
         """
         return b'AMQP' + struct.pack('BBBB', 0, self.major, self.minor,
-                                    self.revision)
+                                     self.revision)
 
 
 def decode_frame(data_in):
@@ -236,7 +253,7 @@ def decode_frame(data_in):
         method.decode(frame_data, 4)
 
         # Return the amount of data consumed and the Method object
-        return frame_end, Method(channel_number, method)
+        return frame_end, Method(channel_number, method, raw_in_size=frame_end)
 
     elif frame_type == spec.FRAME_HEADER:
 
@@ -250,16 +267,18 @@ def decode_frame(data_in):
         out = properties.decode(frame_data[12:])
 
         # Return a Header frame
-        return frame_end, Header(channel_number, body_size, properties)
+        return frame_end, Header(channel_number, body_size, properties,
+                                 raw_in_size=frame_end)
 
     elif frame_type == spec.FRAME_BODY:
 
         # Return the amount of data consumed and the Body frame w/ data
-        return frame_end, Body(channel_number, frame_data)
+        return frame_end, Body(channel_number, frame_data,
+                               raw_in_size=frame_end)
 
     elif frame_type == spec.FRAME_HEARTBEAT:
 
         # Return the amount of data and a Heartbeat frame
-        return frame_end, Heartbeat()
+        return frame_end, Heartbeat(raw_in_size=frame_end)
 
     raise exceptions.InvalidFrameError("Unknown frame type: %i" % frame_type)

@@ -991,6 +991,9 @@ class Channel(object):
                 self.basic_reject(method_frame.method.delivery_tag)
             return
         if consumer_tag not in self._consumers:
+            # TODO How is this reentrancy case possible? Nothing in channel
+            #  appears to remove consumer_tag from _consumers (except
+            # _on_cancelok)
             return self._add_pending_msg(consumer_tag, method_frame,
                                          header_frame, body)
         while self._pending[consumer_tag]:

@@ -24,7 +24,7 @@ class FrameTests(unittest.TestCase):
     PROTOCOL_HEADER = b'AMQP\x00\x00\t\x01'
 
     def frame_marshal_not_implemented_test(self):
-        frame_obj = frame.Frame(0x000A000B, 1)
+        frame_obj = frame.Frame(0x000A000B, 1, None)
         self.assertRaises(NotImplementedError, frame_obj.marshal)
 
     def frame_underscore_marshal_test(self):
@@ -55,8 +55,10 @@ class FrameTests(unittest.TestCase):
         self.assertEqual(frame.decode_frame(self.PROTOCOL_HEADER)[0], 8)
 
     def decode_method_frame_instance_test(self):
-        self.assertIsInstance(frame.decode_frame(self.BASIC_ACK)[1],
-                              frame.Method)
+        bytes_consumed, frame_obj = frame.decode_frame(self.BASIC_ACK)
+        self.assertEqual(bytes_consumed, len(self.BASIC_ACK))
+        self.assertEqual(frame_obj._raw_in_size, bytes_consumed)
+        self.assertIsInstance(frame_obj, frame.Method)
 
     def decode_protocol_header_failure_test(self):
         self.assertEqual(frame.decode_frame(b'AMQPa'), (0, None))
@@ -69,8 +71,10 @@ class FrameTests(unittest.TestCase):
                               spec.Basic.Ack)
 
     def decode_header_frame_instance_test(self):
-        self.assertIsInstance(frame.decode_frame(self.CONTENT_HEADER)[1],
-                              frame.Header)
+        bytes_consumed, frame_obj = frame.decode_frame(self.CONTENT_HEADER)
+        self.assertEqual(bytes_consumed, len(self.CONTENT_HEADER))
+        self.assertEqual(frame_obj._raw_in_size, bytes_consumed)
+        self.assertIsInstance(frame_obj, frame.Header)
 
     def decode_header_frame_bytes_test(self):
         self.assertEqual(frame.decode_frame(self.CONTENT_HEADER)[0], 23)
@@ -91,8 +95,10 @@ class FrameTests(unittest.TestCase):
                           self.BASIC_ACK[:-1] + b'A')
 
     def decode_body_frame_instance_test(self):
-        self.assertIsInstance(frame.decode_frame(self.BODY_FRAME)[1],
-                              frame.Body)
+        bytes_consumed, frame_obj = frame.decode_frame(self.BODY_FRAME)
+        self.assertEqual(bytes_consumed, len(self.BODY_FRAME))
+        self.assertEqual(frame_obj._raw_in_size, bytes_consumed)
+        self.assertIsInstance(frame_obj, frame.Body)
 
     def decode_body_frame_fragment_test(self):
         self.assertEqual(frame.decode_frame(self.BODY_FRAME)[1].fragment,
@@ -101,9 +107,11 @@ class FrameTests(unittest.TestCase):
     def decode_body_frame_fragment_consumed_bytes_test(self):
         self.assertEqual(frame.decode_frame(self.BODY_FRAME)[0], 28)
 
-    def decode_heartbeat_frame_test(self):
-        self.assertIsInstance(frame.decode_frame(self.HEARTBEAT)[1],
-                              frame.Heartbeat)
+    def decode_heartbeat_frame_instance_test(self):
+        bytes_consumed, frame_obj = frame.decode_frame(self.HEARTBEAT)
+        self.assertEqual(bytes_consumed, len(self.HEARTBEAT))
+        self.assertEqual(frame_obj._raw_in_size, bytes_consumed)
+        self.assertIsInstance(frame_obj, frame.Heartbeat)
 
     def decode_heartbeat_frame_bytes_consumed_test(self):
         self.assertEqual(frame.decode_frame(self.HEARTBEAT)[0], 8)
