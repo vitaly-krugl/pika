@@ -6,13 +6,19 @@ Tests for pika.channel.Channel
 # Disable pylint warning about Access to a protected member
 # pylint: disable=W0212
 
+# Disable pylint messages concerning invalid method name
+# pylint: disable=C0103
+
+# Disable pylint messages concerning missing docstrings
+# pylint: disable=C0111
+
 import collections
 import logging
 
 try:
     import mock
 except ImportError:
-    from unittest import mock
+    from unittest import mock  # pylint: disable=E0611
 
 import sys
 
@@ -22,7 +28,6 @@ except ImportError:
     import unittest
 import warnings
 
-from pika import callback
 from pika import channel
 from pika import connection
 from pika import exceptions
@@ -397,9 +402,10 @@ class ChannelTests(unittest.TestCase):
         self.obj._set_state(self.obj.OPEN)
         mock_callback = mock.Mock()
         self.obj.basic_qos(mock_callback, 10, 20, False)
-        rpc.assert_called_once_with(spec.Basic.Qos(mock_callback, 10, 20,
-                                                   False), mock_callback,
-                                    [spec.Basic.QosOk])
+        rpc.assert_called_once_with(
+            spec.Basic.Qos(10, 20, False),
+            mock_callback,
+            [spec.Basic.QosOk])
 
     def test_basic_reject_raises_channel_closed(self):
         self.assertRaises(exceptions.ChannelClosed, self.obj.basic_reject, 1,
@@ -424,8 +430,8 @@ class ChannelTests(unittest.TestCase):
     @mock.patch('pika.spec.Basic.Reject')
     @mock.patch('pika.channel.Channel._send_method')
     def test_basic_reject_send_method_request_with_long_tag(self,
-                                                           send_method,
-                                                           unused):
+                                                            send_method,
+                                                            unused):
         self.obj._set_state(self.obj.OPEN)
 
         # NOTE: we use `sys.maxsize` for compatibility with python 3, which
@@ -453,7 +459,7 @@ class ChannelTests(unittest.TestCase):
         self.obj._set_state(self.obj.OPEN)
         mock_callback = mock.Mock()
         self.obj.basic_recover(mock_callback, True)
-        rpc.assert_called_once_with(spec.Basic.Recover(mock_callback, True),
+        rpc.assert_called_once_with(spec.Basic.Recover(True),
                                     mock_callback, [spec.Basic.RecoverOk])
 
     def test_close_raises_channel_closed(self):
@@ -869,7 +875,7 @@ class ChannelTests(unittest.TestCase):
         self.obj._set_state(self.obj.OPEN)
         mock_callback = mock.Mock()
         self.obj.tx_commit(mock_callback)
-        rpc.assert_called_once_with(spec.Tx.Commit(mock_callback),
+        rpc.assert_called_once_with(spec.Tx.Commit(),
                                     mock_callback, [spec.Tx.CommitOk])
 
     @mock.patch('pika.spec.Tx.Rollback')
@@ -878,7 +884,7 @@ class ChannelTests(unittest.TestCase):
         self.obj._set_state(self.obj.OPEN)
         mock_callback = mock.Mock()
         self.obj.tx_rollback(mock_callback)
-        rpc.assert_called_once_with(spec.Tx.Rollback(mock_callback),
+        rpc.assert_called_once_with(spec.Tx.Rollback(),
                                     mock_callback, [spec.Tx.RollbackOk])
 
     @mock.patch('pika.spec.Tx.Select')
@@ -887,7 +893,7 @@ class ChannelTests(unittest.TestCase):
         self.obj._set_state(self.obj.OPEN)
         mock_callback = mock.Mock()
         self.obj.tx_select(mock_callback)
-        rpc.assert_called_once_with(spec.Tx.Select(mock_callback),
+        rpc.assert_called_once_with(spec.Tx.Select(),
                                     mock_callback, [spec.Tx.SelectOk])
 
     # Test internal methods
@@ -944,27 +950,29 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(self.obj.frame_dispatcher._method_frame, frame_value)
 
     def test_handle_content_frame_sets_header_frame(self):
-        frame_value = frame.Header(1, 10, spec.BasicProperties())
+        self.obj._handle_content_frame(
+            frame.Method(1, spec.Basic.Deliver(), 24))
+        frame_value = frame.Header(1, 10, spec.BasicProperties(), 156)
         self.obj._handle_content_frame(frame_value)
         self.assertEqual(self.obj.frame_dispatcher._header_frame, frame_value)
 
     def test_handle_content_frame_basic_deliver_called(self):
-        method_value = frame.Method(1, spec.Basic.Deliver('ctag0', 1))
+        method_value = frame.Method(1, spec.Basic.Deliver('ctag0', 1), 24)
         self.obj._handle_content_frame(method_value)
-        header_value = frame.Header(1, 10, spec.BasicProperties())
+        header_value = frame.Header(1, 10, spec.BasicProperties(), 156)
         self.obj._handle_content_frame(header_value)
-        body_value = frame.Body(1, b'0123456789')
+        body_value = frame.Body(1, b'0123456789', 14)
         with mock.patch.object(self.obj, '_on_deliver') as deliver:
             self.obj._handle_content_frame(body_value)
             deliver.assert_called_once_with(method_value, header_value,
                                             b'0123456789')
 
     def test_handle_content_frame_basic_get_called(self):
-        method_value = frame.Method(1, spec.Basic.GetOk('ctag0', 1))
+        method_value = frame.Method(1, spec.Basic.GetOk('ctag0', 1), 24)
         self.obj._handle_content_frame(method_value)
-        header_value = frame.Header(1, 10, spec.BasicProperties())
+        header_value = frame.Header(1, 10, spec.BasicProperties(), 156)
         self.obj._handle_content_frame(header_value)
-        body_value = frame.Body(1, b'0123456789')
+        body_value = frame.Body(1, b'0123456789', 14)
         with mock.patch.object(self.obj, '_on_getok') as getok:
             self.obj._handle_content_frame(body_value)
             getok.assert_called_once_with(method_value, header_value,
@@ -973,11 +981,11 @@ class ChannelTests(unittest.TestCase):
     def test_handle_content_frame_basic_return_called(self):
         method_value = frame.Method(1, spec.Basic.Return(999, 'Reply Text',
                                                          'exchange_value',
-                                                         'routing.key'))
+                                                         'routing.key'), 24)
         self.obj._handle_content_frame(method_value)
-        header_value = frame.Header(1, 10, spec.BasicProperties())
+        header_value = frame.Header(1, 10, spec.BasicProperties(), 156)
         self.obj._handle_content_frame(header_value)
-        body_value = frame.Body(1, b'0123456789')
+        body_value = frame.Body(1, b'0123456789', 14)
         with mock.patch.object(self.obj, '_on_return') as basic_return:
             self.obj._handle_content_frame(body_value)
             basic_return.assert_called_once_with(method_value, header_value,
@@ -1153,7 +1161,6 @@ class ChannelTests(unittest.TestCase):
         self.assertIsNone(self.obj._on_flowok_callback)
 
     def test_on_openok_no_callback(self):
-        mock_callback = mock.Mock()
         self.obj._on_openok_callback = None
         method_value = frame.Method(1, spec.Channel.OpenOk())
         self.obj._on_openok(method_value)
