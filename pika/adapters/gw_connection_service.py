@@ -35,6 +35,7 @@ from pika.adapters.blocking_connection_base import (
     _UNEXPECTED_FAILURE_REASON_CODE)
 from pika.adapters.subclass_utils import verify_overrides
 from pika.adapters.subclass_utils import overrides_instance_method
+from pika.adapters import threading_utils
 from pika.compat import xrange  # pylint: disable=W0622
 import pika.exceptions
 import pika.frame
@@ -79,9 +80,6 @@ class GatewayConnectionService(threading.Thread):
 
         self._conn_parameters = parameters
 
-        self._service_proxy = ServiceProxy(service_thread=self,
-                                           dispatch=self._enqueue_event_to_gw)
-
         # We're shutting down, don't process any more events from clients
         self._shutting_down = False
 
@@ -92,13 +90,8 @@ class GatewayConnectionService(threading.Thread):
         # ProtocolHeader frame
         self._conn = None
 
-        # Input event queue
-        self._input_queue = Queue.Queue()
-
-        self._attention_lock = threading.Lock()
-        self._attention_pending = False
-        self._r_attention, self._w_attention = (
-            select_connection._PollerBase._get_interrupt_pair())
+        # Client interface to GatewayConnectionService
+        self._service_proxy = ServiceProxy(service_thread=self)
 
         # True if connection establishment completed successfully and will not
         # be changed when connection fails
@@ -161,12 +154,12 @@ class GatewayConnectionService(threading.Thread):
             else:
                 open_exc = pika.exceptions.AMQPConnectionError(*reason_pair)
 
-            self._service_proxy._set_service_exit_exception(
+            self._service_proxy._close(
                 GatewayStoppedError(open_exc, reason_pair))
 
             raise
         else:
-            self._service_proxy._set_service_exit_exception(
+            self._service_proxy._close(
                 GatewayStoppedError(self._conn_open_exc,
                                     self._conn_close_reason_pair))
 
@@ -179,7 +172,7 @@ class GatewayConnectionService(threading.Thread):
         """
         self._ioloop = select_connection.IOLoop()
 
-        self._ioloop.add_handler(self._r_attention.fileno(),
+        self._ioloop.add_handler(self._service_proxy._get_monitoring_fd(),
                                  self._on_attention,
                                  select_connection.READ)
 
@@ -210,57 +203,31 @@ class GatewayConnectionService(threading.Thread):
 
             self._unregister_client(client)
 
-    def _enqueue_event_to_gw(self, event):
-        """Implementation of `ServiceProxy.dispatch`"""
-        self._input_queue.put(event)
-
-        # Wake up attention handler, while avoiding unnecessary I/O
-        if not self._attention_pending:
-            with self._attention_lock:
-                if not self._attention_pending:
-                    self._attention_pending = True
-
-                    try:
-                        # Send byte to interrupt the poll loop
-                        os.write(self._w_attention.fileno(), b'X')
-                    except OSError as err:
-                        if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
-                            raise
-
     def _on_attention(self, interrupt_fd, events):  # pylint: disable=W0613
         """Called by connection's ioloop when read is pending on our "attention"
         socket. Process incoming events.
 
         :param int interrupt_fd: The file descriptor to read from
         :param int events: (unused) The events generated for this fd
+
         """
-
-        # Purge data from attention socket so we don't get stuck with endless
-        # callbacks
-        try:
-            os.read(interrupt_fd, 512)
-        except OSError as err:
-            if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
-                raise
-
-        self._attention_pending = False
-
         # Process the number of events presently in the input queue to avoid
         # starving the connection's I/O. Since we're the only consumer, qsize is
         # reliable for our purposes.
-        for _ in xrange(self._input_queue.qsize()):
-            event = self._input_queue.get(block=False)
+        input_queue = self._service_proxy._prepare_to_consume()
+        for _ in xrange(input_queue.qsize()):
+            event = input_queue.get(block=False)
 
             if self._shutting_down:
                 LOGGER.debug('Shutting down, so dropping %r from client', event)
                 continue
 
-            if isinstance(event, ChannelOpEventFamily):
+            if isinstance(event, FramesToBrokerEvent):
+                self._on_frames_to_broker_event(event)
+            elif isinstance(event, ChannelOpEventFamily):
                 self._on_channel_op_event(event)
             elif isinstance(event, BlockedConnectionSubscribeEvent):
                 self._on_blocked_connection_sub_event(event)
-            elif isinstance(event, FramesToBrokerEvent):
-                self._on_frames_to_broker_event(event)
 
             else:
                 raise TypeError('Unexpected event type {!r}'.format(event))
@@ -822,48 +789,132 @@ class ServiceProxy(object):
     """Interface to `GatewayConnectionService` for use by `ThreadedConnection`
     """
 
-    def __init__(self, service_thread, dispatch):
+    def __init__(self, service_thread):
         """
-        :param callable dispatch: Function for sending an event to
-            `GatewayConnectionService`; it has the signature`dispatch(event)`
+        :param int attention_fd: file descriptor for waking up the service
 
         """
-        self.dispatch = dispatch
+        self._r_attention, self._w_attention = (
+            threading_utils.create_attention_pair())
+
+        # Queue for dispatching messages to GatewayConnectionService
+        self._input_queue = Queue.Queue()
+
+        # Mechanism for avoiding unnecessary I/O with the service
+        self._attention_lock = threading.Lock()
+        self._attention_pending = False
 
         # For use only by check_health
         self._service_thread = service_thread
+        self._service_id = id(service_thread)
         # For use only by check_health and GatewayConnectionService
         self._service_exc = None # exception that caused service to stop
 
-    def _set_service_exit_exception(self, exc):
-        """Called by Gateway Connection Service to set the exception
-        corresponding to reason for service's shutdown
+    def _close(self, exc):
+        """Close connection sockets and clean up other resources that might
+        pose challenges for garbage collection. For use only by gateway
+        connection service as friend of class
 
-        :param GatewayStoppedError exc:
+        :param GatewayStoppedError exc: Exception to raise in `check_health`
 
         """
-        self._service_exc = exc
+        with self._attention_lock:
+            self._service_exc = exc
+
+            self._r_attention.close()
+            self._r_attention = None
+            self._w_attention.close()
+            self._w_attention = None
+
+            self._service_thread = None
+
+    def dispatch(self, event):
+        """Clients use this to send an event to `GatewayConnectionService`.
+
+        :param event: An event derived from `AsyncEventFamily` or
+            `RpcEventFamily` destined for `GatewayConnectionService`
+
+        """
+        self._input_queue.put(event)
+
+        # Wake up attention handler, while avoiding unnecessary I/O
+        if not self._attention_pending:
+            with self._attention_lock:
+                if not self._attention_pending:
+                    self._attention_pending = True
+
+                    if self._w_attention is not None:
+                        try:
+                            # Send byte to interrupt the poll loop
+                            os.write(self._w_attention.fileno(), b'X')
+                        except OSError as err:
+                            if err.errno not in (errno.EWOULDBLOCK,
+                                                 errno.EAGAIN):
+                                raise
 
     def check_health(self):
-        """Check whether Gateway Connection Service stopped
+        """Check whether GatewayConnectionService stopped
 
         :raises GatewayStoppedError: if connection gateway service stopped. This
             exception contains information about the cause. See
             `GatewayStoppedError` for more info.
         """
-        if self._service_thread.isAlive():
-            return
+        with self._attention_lock:
+            if (self._service_thread is not None and
+                    self._service_thread.isAlive()):
+                return
 
-        if self._service_exc is not None:
-            assert isinstance(self._service_exc, GatewayStoppedError), repr(
-                self._service_exc)
-            raise self._service_exc  # pylint: disable=E0702
-        else:
-            raise GatewayStoppedError(
-                None,
-                pika.exceptions.AMQPConnectionError(
-                    _UNEXPECTED_FAILURE_REASON_CODE,
-                    '{!r} died'.format(self._service_thread)))
+            # Purge service's input queue to assist with garbage collection
+            while True:
+                try:
+                    self._input_queue.get_nowait()
+                except Queue.Empty:
+                    break
+
+            if self._service_exc is not None:
+                assert isinstance(self._service_exc, GatewayStoppedError), repr(
+                    self._service_exc)
+                raise self._service_exc  # pylint: disable=E0702
+            else:
+                raise GatewayStoppedError(
+                    None,
+                    pika.exceptions.AMQPConnectionError(
+                        _UNEXPECTED_FAILURE_REASON_CODE,
+                        'GatewayConnectionService {!r} died'.format(
+                            self._service_id)))
+
+    def _get_monitoring_fd(self):
+        """Return file descriptor that `GatewayConnectionService` will monitor
+        for readability to detect when Client messages might be available for
+        it.
+
+        :return: file descriptor
+        :rtype: int
+        """
+        return self._r_attention.fileno()  # pylint: disable=E1101
+
+    def _prepare_to_consume(self):
+        """Reset attention-pending status and return input queue. For use only
+        by GatewayConnectionService as friend of class
+
+        :returns: queue possibly containing messages destined for the service
+        :rtype: Queue.Queue
+
+        """
+        # Purge data from attention socket so we don't get stuck with endless
+        # callbacks
+        try:
+            os.read(self._r_attention.fileno(), 512)  # pylint: disable=E1101
+        except OSError as err:
+            if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                raise
+
+        # Reset attention flag before consuming begins to avoid race condition
+        # with dispatch.
+        self._attention_pending = False
+
+        return self._input_queue
+
 
 class ClientProxy(object):
     """Interface to `ThreadedConnection` for use by `GatewayConnectionService`
