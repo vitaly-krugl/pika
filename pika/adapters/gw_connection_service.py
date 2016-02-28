@@ -70,6 +70,10 @@ class GatewayConnectionService(threading.Thread):
 
     """
 
+    # TODO make content high/low water configurable
+    _IN_CONTENT_BYTES_LOW_WATER = 10 * 1024 * 1024
+    _IN_CONTENT_BYTES_HIGH_WATER = 15 * 1024 * 1024
+
     def __init__(self, parameters):
         """
         :param pika.connection.Parameters: parameters for establishing
@@ -90,8 +94,17 @@ class GatewayConnectionService(threading.Thread):
         # ProtocolHeader frame
         self._conn = None
 
+        # For tracking amount of inbound content within the ThreadedConnection
+        # echosystem that hasn't been released to user or disposed of. Used for
+        # determining when to start/stop throttling of inbound data.
+        self._in_content_volume = InboundContentVolume(
+            low_water=self._IN_CONTENT_BYTES_LOW_WATER,
+            hight_water=self._IN_CONTENT_BYTES_HIGH_WATER)
+
         # Client interface to GatewayConnectionService
-        self._service_proxy = ServiceProxy(service_thread=self)
+        self._service_proxy = ServiceProxy(
+            service_thread=self,
+            in_content_volume_tracker=self._in_content_volume)
 
         # True if connection establishment completed successfully and will not
         # be changed when connection fails
@@ -228,6 +241,8 @@ class GatewayConnectionService(threading.Thread):
                 self._on_channel_op_event(event)
             elif isinstance(event, BlockedConnectionSubscribeEvent):
                 self._on_blocked_connection_sub_event(event)
+            elif isinstance(event, ExitedInboundContentExcessMode):
+                self._on_inbound_content_excess_mode_exit()
 
             else:
                 raise TypeError('Unexpected event type {!r}'.format(event))
@@ -458,6 +473,21 @@ class GatewayConnectionService(threading.Thread):
         else:
             # Let client know that all frames have been disposed
             client.dispatch(event)
+
+
+    def _on_inbound_content_excess_mode_enter(self):
+        """Process transition of inbound content volume into in-excess mode
+
+        """
+        # TODO integrate and flesh out _on_inbound_content_excess_mode_enter
+        pass
+
+    def _on_inbound_content_excess_mode_exit(self):
+        """Handle notification that inbound content volume exited in-excess mode
+
+        """
+        # TODO flesh out _on_inbound_content_excess_mode_exit
+        pass
 
     def _open_gateway_connection(self):
         """Instantiate `_GatewayConnection` and begin connecting to AMQP
@@ -785,15 +815,79 @@ class _GatewayConnection(select_connection.SelectConnection):
                     break
 
 
+class InboundContentVolume(object):
+    """Tracks outstanding inbound content messages (Basic.Deliver, Basic.GetOk,
+    Basic.Return); used to determine when to throttle incoming data
+
+    """
+
+    def __init__(self, low_water, hight_water):
+        """
+        :param low_water: while in excess, exit excess mode when outstanding
+            volume dips below this number of bytes
+        :param high_water: when outstanding volume surpasses this number, enter
+            in-excess mode
+
+        """
+        self._low_water = low_water
+        self._high_water = hight_water
+
+        self._lock = threading.Lock()
+        self._volume = long()
+        self._exceeded = False
+
+    def add(self, num_bytes):
+        """Add to consumed volume
+
+        :param num_butes: amount to add to volume
+
+        :return: True if this operation caused volume to enter in-excess mode;
+            None if there was no change in mode
+
+        """
+        with self._lock:
+            self._volume += num_bytes
+
+            if not self._exceeded and self._volume > self._high_water:
+                self._exceeded = True
+                return True
+            else:
+                return None
+
+    def subtract(self, num_bytes):
+        """Subtract from consumed volume
+
+        :param num_bytes: amount to subract from volume
+
+        :return: True if this operation caused volume to exit in-excess mode;
+            None if there was no change in mode
+
+        """
+        with self._lock:
+            self._volume -= num_bytes
+
+            if self._volume < 0:
+                raise ValueError("Content volume underflow %r", self._volume)
+
+            if self._exceeded and self._volume < self._low_water:
+                self._exceeded = False
+                return False
+            else:
+                return None
+
+
 class ServiceProxy(object):
     """Interface to `GatewayConnectionService` for use by `ThreadedConnection`
     """
 
-    def __init__(self, service_thread):
+    def __init__(self, service_thread, in_content_volume_tracker):
         """
         :param int attention_fd: file descriptor for waking up the service
+        :param InboundContentVolume in_content_volume_tracker:
 
         """
+        self._attention_lock = threading.Lock()
+
         self._r_attention, self._w_attention = (
             threading_utils.create_attention_pair())
 
@@ -801,7 +895,6 @@ class ServiceProxy(object):
         self._input_queue = Queue.Queue()
 
         # Mechanism for avoiding unnecessary I/O with the service
-        self._attention_lock = threading.Lock()
         self._attention_pending = False
 
         # For use only by check_health
@@ -809,6 +902,8 @@ class ServiceProxy(object):
         self._service_id = id(service_thread)
         # For use only by check_health and GatewayConnectionService
         self._service_exc = None # exception that caused service to stop
+
+        self._in_content_volume = in_content_volume_tracker
 
     def _close(self, exc):
         """Close connection sockets and clean up other resources that might
@@ -882,6 +977,22 @@ class ServiceProxy(object):
                         _UNEXPECTED_FAILURE_REASON_CODE,
                         'GatewayConnectionService {!r} died'.format(
                             self._service_id)))
+
+    # TODO integrate untrack_content into ThreadedConnection
+    def untrack_content(self, num_bytes):
+        """Called by Client when content is being disposed of by
+        `ThreadedConnection` (either released to user or discarded).
+
+        If this operation causes the outstanding volume to exit in-excess mode,
+        dispatches `ExitedInboundContentExcessMode` to service so that it may
+        stop throttling inbound data.
+
+        :param num_bytes: raw size of content per
+            `frame.Header._total_raw_in_size`
+
+        """
+        if self._in_content_volume.subtract(num_bytes):
+            self.dispatch(ExitedInboundContentExcessMode())
 
     def _get_monitoring_fd(self):
         """Return file descriptor that `GatewayConnectionService` will monitor
@@ -969,6 +1080,13 @@ class RpcEventFamily(object):
 
 class AsyncEventFamily(object):
     """Base class for client or service-destined event that has no reply"""
+    pass
+
+
+class ExitedInboundContentExcessMode(AsyncEventFamily):
+    """Sent by ServiceProxy to service when volume of tracked content frames
+    exits in-excess mode
+    """
     pass
 
 
