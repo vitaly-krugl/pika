@@ -1187,6 +1187,7 @@ class Channel(object):
                               properties and body.
 
         """
+        # pylint: disable=W0212
         self.connection._send_method(self.channel_number, method_frame, content)
 
     def _set_cookie(self, cookie):
@@ -1245,6 +1246,8 @@ class ContentFrameDispatcher(object):
         :param Method|Header|Body frame_value: The frame to process
 
         """
+        # Disable pylint warning concerning access to protected member
+        # pylint: disable=W0212
         if (isinstance(frame_value, frame.Method) and
             spec.has_content(frame_value.method.INDEX)):
             self._method_frame = frame_value
@@ -1279,6 +1282,8 @@ class ContentFrameDispatcher(object):
         :rtype: tuple(pika.frame.Method, pika.frame.Header, str)|None
 
         """
+        # Disable pylint warning concerning access to protected member
+        # pylint: disable=W0212
         self._header_frame._total_raw_in_size += body_frame._raw_in_size
 
         self._seen_so_far += len(body_frame.fragment)

@@ -923,8 +923,16 @@ class ServiceProxy(object):
 
             self._service_thread = None
 
+            # So that clients calling dispatch won't try to access
+            # self._w_attention
+            self._attention_pending = True
+
+
+
     def dispatch(self, event):
         """Clients use this to send an event to `GatewayConnectionService`.
+
+        See also `ServiceProxy._prepare_to_consume`
 
         :param event: An event derived from `AsyncEventFamily` or
             `RpcEventFamily` destined for `GatewayConnectionService`
@@ -934,18 +942,20 @@ class ServiceProxy(object):
 
         # Wake up attention handler, while avoiding unnecessary I/O
         if not self._attention_pending:
+            wake_up_service = False
             with self._attention_lock:
                 if not self._attention_pending:
                     self._attention_pending = True
+                    wake_service = True
 
-                    if self._w_attention is not None:
-                        try:
-                            # Send byte to interrupt the poll loop
-                            os.write(self._w_attention.fileno(), b'X')
-                        except OSError as err:
-                            if err.errno not in (errno.EWOULDBLOCK,
-                                                 errno.EAGAIN):
-                                raise
+            if wake_up_service:
+                try:
+                    # Send byte to interrupt the poll loop
+                    os.write(self._w_attention.fileno(), b'X')
+                except OSError as err:
+                    if err.errno not in (errno.EWOULDBLOCK,
+                                         errno.EAGAIN):
+                        raise
 
     def check_health(self):
         """Check whether GatewayConnectionService stopped
@@ -953,6 +963,7 @@ class ServiceProxy(object):
         :raises GatewayStoppedError: if connection gateway service stopped. This
             exception contains information about the cause. See
             `GatewayStoppedError` for more info.
+
         """
         with self._attention_lock:
             if (self._service_thread is not None and
@@ -1001,12 +1012,15 @@ class ServiceProxy(object):
 
         :return: file descriptor
         :rtype: int
+
         """
         return self._r_attention.fileno()  # pylint: disable=E1101
 
     def _prepare_to_consume(self):
         """Reset attention-pending status and return input queue. For use only
-        by GatewayConnectionService as friend of class
+        by GatewayConnectionService as friend of class.
+
+        See also `ServiceProxy.dispatch`
 
         :returns: queue possibly containing messages destined for the service
         :rtype: Queue.Queue

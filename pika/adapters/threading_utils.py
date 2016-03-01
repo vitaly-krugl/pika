@@ -17,10 +17,10 @@ from pika import compat
 LOGGER = logging.getLogger(__name__)
 
 
+# TODO select_connection could use this instead of its own _get_interrupt_pair
 def create_attention_pair():
     """ Create a socket pair that is suitable for alerting threads.
 
-    TODO select_connection could use this instead of its own _get_interrupt_pair
     """
 
     read_sock = write_sock = None
