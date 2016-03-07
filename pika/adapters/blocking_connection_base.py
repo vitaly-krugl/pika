@@ -617,7 +617,7 @@ class BlockingConnectionBase(compat.AbstractBase):  # pylint: disable=R0902
 
         """
         if self.is_closed:
-            LOGGER.debug('Close called on closed connection (%s): %s',
+            LOGGER.debug('Close called on closed connection, passing (%s): %s',
                          reply_code, reply_text)
             return
 

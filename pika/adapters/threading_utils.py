@@ -34,9 +34,9 @@ def create_attention_pair():
     if read_sock is None:
         # Create TCP/IP socket pair manually
 
-        # Manually create and connect two sockets
+        # Manually create and connect two sockets over loopback
         listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listen_sock.bind(('localhost', 0))
+        listen_sock.bind(('127.0.0.1', 0))
         listen_sock.listen(1)
 
         write_sock = socket.socket()

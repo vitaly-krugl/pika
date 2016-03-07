@@ -147,6 +147,8 @@ class GatewayConnectionService(threading.Thread):
         :returns: ServiceProxy instance for interacting with the service
         :rtype: ServiceProxy
         """
+        LOGGER.info('Starting Gateway Connection Service thread')
+
         super(GatewayConnectionService, self).start()
 
         return self._service_proxy
@@ -155,6 +157,8 @@ class GatewayConnectionService(threading.Thread):
         """Entry point for background thread
 
         """
+        LOGGER.info('Gateway Connection Service thread is running')
+
         try:
             self._run_service()
         except:
@@ -183,6 +187,8 @@ class GatewayConnectionService(threading.Thread):
         """Execute the service; called from background thread
 
         """
+        LOGGER.info('Gateway Connection Service is running')
+
         self._ioloop = select_connection.IOLoop()
 
         self._ioloop.add_handler(self._service_proxy._get_monitoring_fd(),
@@ -196,6 +202,7 @@ class GatewayConnectionService(threading.Thread):
 
         # Run ioloop; it won't return until we stop the loop upon failure or
         # closing of the connection; see _request_shutdown.
+        LOGGER.info('Entering ioloop')
         self._ioloop.start()
 
         # Cleanup
@@ -946,7 +953,7 @@ class ServiceProxy(object):
             with self._attention_lock:
                 if not self._attention_pending:
                     self._attention_pending = True
-                    wake_service = True
+                    wake_up_service = True
 
             if wake_up_service:
                 try:
