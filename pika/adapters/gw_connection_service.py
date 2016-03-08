@@ -70,10 +70,6 @@ class GatewayConnectionService(threading.Thread):
 
     """
 
-    # TODO make content high/low water configurable
-    _IN_CONTENT_BYTES_LOW_WATER = 10 * 1024 * 1024
-    _IN_CONTENT_BYTES_HIGH_WATER = 15 * 1024 * 1024
-
     def __init__(self, parameters):
         """
         :param pika.connection.Parameters: parameters for establishing
@@ -94,17 +90,8 @@ class GatewayConnectionService(threading.Thread):
         # ProtocolHeader frame
         self._conn = None
 
-        # For tracking amount of inbound content within the ThreadedConnection
-        # echosystem that hasn't been released to user or disposed of. Used for
-        # determining when to start/stop throttling of inbound data.
-        self._in_content_volume = InboundContentVolume(
-            low_water=self._IN_CONTENT_BYTES_LOW_WATER,
-            hight_water=self._IN_CONTENT_BYTES_HIGH_WATER)
-
         # Client interface to GatewayConnectionService
-        self._service_proxy = ServiceProxy(
-            service_thread=self,
-            in_content_volume_tracker=self._in_content_volume)
+        self._service_proxy = ServiceProxy(service_thread=self)
 
         # True if connection establishment completed successfully and will not
         # be changed when connection fails
@@ -248,8 +235,6 @@ class GatewayConnectionService(threading.Thread):
                 self._on_channel_op_event(event)
             elif isinstance(event, BlockedConnectionSubscribeEvent):
                 self._on_blocked_connection_sub_event(event)
-            elif isinstance(event, ExitedInboundContentExcessMode):
-                self._on_inbound_content_excess_mode_exit()
 
             else:
                 raise TypeError('Unexpected event type {!r}'.format(event))
@@ -480,21 +465,6 @@ class GatewayConnectionService(threading.Thread):
         else:
             # Let client know that all frames have been disposed
             client.dispatch(event)
-
-
-    def _on_inbound_content_excess_mode_enter(self):
-        """Process transition of inbound content volume into in-excess mode
-
-        """
-        # TODO integrate and flesh out _on_inbound_content_excess_mode_enter
-        pass
-
-    def _on_inbound_content_excess_mode_exit(self):
-        """Handle notification that inbound content volume exited in-excess mode
-
-        """
-        # TODO flesh out _on_inbound_content_excess_mode_exit
-        pass
 
     def _open_gateway_connection(self):
         """Instantiate `_GatewayConnection` and begin connecting to AMQP
@@ -822,75 +792,134 @@ class _GatewayConnection(select_connection.SelectConnection):
                     break
 
 
-class InboundContentVolume(object):
-    """Tracks outstanding inbound content messages (Basic.Deliver, Basic.GetOk,
-    Basic.Return); used to determine when to throttle incoming data
+class _MessageAssembler(object):
+    """Assembles content messages for one channel"""
 
-    """
+    def __init__(self):
+        self._frames = []
+        self._expected_num_bytes = None
+        self._num_bytes_so_far = None
 
-    def __init__(self, low_water, hight_water):
+    def filter(self, frame):
+        """ Use content frames to assemble a message frame sequence, rejecting
+        non-content frames.
+
+        :param pika.frame.Frame:
+
+        :returns: if finished assembling a complete message, returns a `list` of
+            its frames, starting with method and header frames. Otherwise,
+            returns the rejected frame.
+
+        :raises ValueError: on unexpected content frame or content is in excess
+            of expected body size
         """
-        :param low_water: while in excess, exit excess mode when outstanding
-            volume dips below this number of bytes
-        :param high_water: when outstanding volume surpasses this number, enter
-            in-excess mode
-
-        """
-        self._low_water = low_water
-        self._high_water = hight_water
-
-        self._lock = threading.Lock()
-        self._volume = long()
-        self._exceeded = False
-
-    def add(self, num_bytes):
-        """Add to consumed volume
-
-        :param num_butes: amount to add to volume
-
-        :return: True if this operation caused volume to enter in-excess mode;
-            None if there was no change in mode
-
-        """
-        with self._lock:
-            self._volume += num_bytes
-
-            if not self._exceeded and self._volume > self._high_water:
-                self._exceeded = True
-                return True
+        if (isinstance(frame, pika.frame.Method) and
+                pika.spec.has_content(frame.method.INDEX)):
+            if not self._frames:
+                # Got the expected content method frame
+                self._frames = [frame]
             else:
-                return None
+                raise ValueError('Unexpected content Method frame %r. '
+                                 'Last buffered frame type was %r' %
+                                 (frame, type(self._frames[-1]),))
+        elif isinstance(frame, pika.frame.Header):
+            if len(self._frames) == 1:
+                # Got the expected content Header frame
+                self._expected_num_bytes = frame.body_size
+                self._num_bytes_so_far = 0
+                self._frames.append(frame)
 
-    def subtract(self, num_bytes):
-        """Subtract from consumed volume
+                if frame.body_size == 0:
+                    return self._finish()
+            else:
+                raise ValueError(
+                    'Unexpected content Header frame %r. '
+                    'Last buffered frame type was %r' %
+                    (frame, type(self._frames[-1]) if self._frames else None,))
+        elif isinstance(frame, pika.frame.Body):
+            if self._expected_num_bytes:
+                # Got the expected content Body frame
+                self._num_bytes_so_far += len(frame.fragment)
+                self._frames.append(frame)
 
-        :param num_bytes: amount to subract from volume
+                if self._num_bytes_so_far == self._expected_num_bytes:
+                    return self._finish()
 
-        :return: True if this operation caused volume to exit in-excess mode;
-            None if there was no change in mode
+                if self._num_bytes_so_far > self._expected_num_bytes:
+                    raise ValueError('Incoming content exceeded expected length: '
+                                     'expected=%i; so_far=%i; method-frame=%r' %
+                                     (self._expected_num_bytes,
+                                      self._num_bytes_so_far,
+                                      self._frames[0],))
+            else:
+                raise ValueError(
+                    'Unexpected content Body frame. '
+                    'Last buffered frame type was %r' %
+                    (type(self._frames[-1]) if self._frames else None,))
+
+        # Not a content frame
+        return frame
+
+    def _finish(self):
+        """Return the `list` of assembled content frames making up a single
+        message and reset instance members
 
         """
-        with self._lock:
-            self._volume -= num_bytes
+        frames = self._frames
+        self._frames = []
+        self._expected_num_bytes = self._num_bytes_so_far = None
 
-            if self._volume < 0:
-                raise ValueError("Content volume underflow %r", self._volume)
+        return frames
 
-            if self._exceeded and self._volume < self._low_water:
-                self._exceeded = False
-                return False
-            else:
-                return None
+
+
+# TODO Don't need _ContentFilter; service can use MessageAssembler directly
+class _ContentFilter(object):
+
+    def __init__(self):
+        # Map of channel number to MessageAssembler instance
+        self._channel_message_assemblers = dict()
+
+    def filter(self, frame):
+        """ Use content frames to assemble a message frame sequence, rejecting
+        non-content frames.
+
+        :param pika.frame.Frame:
+
+        :returns: if finished assembling a complete message, returns a `list` of
+            its frames, starting with method and header frames. Otherwise,
+            returns the rejected frame.
+
+        :raises ValueError: on unexpected content frame or content is in excess
+            of expected body size
+        """
+        assembler = self._channel_message_assemblers[frame.channel_number]
+        return assembler.filter(frame)
+
+    def register_channel(self, channel_number):
+        """Register a channel
+
+        :param int channel_number:
+
+        """
+        self._channel_message_assemblers[channel_number] = _MessageAssembler()
+
+    def drop_channel(self, channel_number):
+        """Drop the given channel, if in use
+
+        :param int channel_number:
+
+        """
+        self._channel_message_assemblers.pop(channel_number, None)
 
 
 class ServiceProxy(object):
     """Interface to `GatewayConnectionService` for use by `ThreadedConnection`
     """
 
-    def __init__(self, service_thread, in_content_volume_tracker):
+    def __init__(self, service_thread):
         """
         :param int attention_fd: file descriptor for waking up the service
-        :param InboundContentVolume in_content_volume_tracker:
 
         """
         self._attention_lock = threading.Lock()
@@ -909,8 +938,6 @@ class ServiceProxy(object):
         self._service_id = id(service_thread)
         # For use only by check_health and GatewayConnectionService
         self._service_exc = None # exception that caused service to stop
-
-        self._in_content_volume = in_content_volume_tracker
 
     def _close(self, exc):
         """Close connection sockets and clean up other resources that might
@@ -995,22 +1022,6 @@ class ServiceProxy(object):
                         _UNEXPECTED_FAILURE_REASON_CODE,
                         'GatewayConnectionService {!r} died'.format(
                             self._service_id)))
-
-    # TODO integrate untrack_content into ThreadedConnection
-    def untrack_content(self, num_bytes):
-        """Called by Client when content is being disposed of by
-        `ThreadedConnection` (either released to user or discarded).
-
-        If this operation causes the outstanding volume to exit in-excess mode,
-        dispatches `ExitedInboundContentExcessMode` to service so that it may
-        stop throttling inbound data.
-
-        :param num_bytes: raw size of content per
-            `frame.Header._total_raw_in_size`
-
-        """
-        if self._in_content_volume.subtract(num_bytes):
-            self.dispatch(ExitedInboundContentExcessMode())
 
     def _get_monitoring_fd(self):
         """Return file descriptor that `GatewayConnectionService` will monitor
@@ -1101,13 +1112,6 @@ class RpcEventFamily(object):
 
 class AsyncEventFamily(object):
     """Base class for client or service-destined event that has no reply"""
-    pass
-
-
-class ExitedInboundContentExcessMode(AsyncEventFamily):
-    """Sent by ServiceProxy to service when volume of tracked content frames
-    exits in-excess mode
-    """
     pass
 
 
