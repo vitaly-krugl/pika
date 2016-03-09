@@ -807,7 +807,8 @@ class _MessageAssembler(object):
         :param pika.frame.Frame:
 
         :returns: if finished assembling a complete message, returns a `list` of
-            its frames, starting with method and header frames. Otherwise,
+            its frames, starting with method and header frames; if the frame
+            is part of the message being assembled, returns None. Otherwise,
             returns the rejected frame.
 
         :raises ValueError: on unexpected content frame or content is in excess
@@ -856,9 +857,12 @@ class _MessageAssembler(object):
                     'Unexpected content Body frame. '
                     'Last buffered frame type was %r' %
                     (type(self._frames[-1]) if self._frames else None,))
+        else:
+            # Not a content frame
+            return frame
 
-        # Not a content frame
-        return frame
+        # We retained this frame as part of the message being assembled
+        return None
 
     def _finish(self):
         """Return the `list` of assembled content frames making up a single
@@ -887,7 +891,8 @@ class _ContentFilter(object):
         :param pika.frame.Frame:
 
         :returns: if finished assembling a complete message, returns a `list` of
-            its frames, starting with method and header frames. Otherwise,
+            its frames, starting with method and header frames; if the frame
+            is part of the message being assembled, returns None. Otherwise,
             returns the rejected frame.
 
         :raises ValueError: on unexpected content frame or content is in excess
