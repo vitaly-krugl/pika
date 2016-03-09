@@ -63,6 +63,19 @@ class GatewayStoppedError(Exception):
     pass
 
 
+class _ChannelInfo(object):
+    """Information about a channel"""
+
+    def __init__(self, client):
+        """
+        :param ClientProxy client: the client that owns the channel
+
+        """
+        self.client = client
+
+        self.message_assembler = _MessageAssembler()
+
+
 class GatewayConnectionService(threading.Thread):
     """`GatewayConnectionService` runs the true AMQP connection instance in a
     background thread. It communicates with `ThreadedConnection` via thread-safe
@@ -116,9 +129,9 @@ class GatewayConnectionService(threading.Thread):
         # subscribed to receive Connection.Blocked frames
         self._conn_blocked_subscribers = set()
 
-        # Mapping of registered channel numbers to their ClientProxy instances
+        # Mapping of registered channel numbers to their _ChannelInfo instances
         # for dispatching of frames
-        self._channel_to_client_map = dict()
+        self._channel_info_map = dict()
 
         # Mapping of ClientProxy instances to the lists of their registered
         # channel numbers (for cleanup)
@@ -251,19 +264,20 @@ class GatewayConnectionService(threading.Thread):
         assert client in self._clients, '{!r} unknown'.format(client)
 
         if isinstance(event, ChannelRegEvent):
-            assert channel_number not in self._channel_to_client_map, (
+            assert channel_number not in self._channel_info_map, (
                 client, channel_number,
-                self._channel_to_client_map[channel_number])
-            self._channel_to_client_map[channel_number] = client
+                self._channel_info_map[channel_number])
+
+            self._channel_info_map[channel_number] = _ChannelInfo(client)
             self._client_to_channels_map[client].add(channel_number)
 
             LOGGER.info('Registered channel %s with %r', channel_number, client)
 
         elif isinstance(event, ChannelUnregEvent):
-            assert channel_number in self._channel_to_client_map, (
+            assert channel_number in self._channel_info_map, (
                 client, channel_number)
 
-            del self._channel_to_client_map[channel_number]
+            del self._channel_info_map[channel_number]
             self._client_to_channels_map[client].remove(channel_number)
 
             LOGGER.info('Unregistered channel %s from %r', channel_number,
@@ -478,7 +492,7 @@ class GatewayConnectionService(threading.Thread):
             on_open_error_callback=self._on_connection_open_error,
             on_close_callback=self._on_connection_closed,
             custom_ioloop=self._ioloop,
-            channel_to_client_map=self._channel_to_client_map)
+            channel_info_map=self._channel_info_map)
 
         if not self._conn.is_closed:
             self._conn.add_on_connection_blocked_callback(
@@ -514,7 +528,7 @@ class GatewayConnectionService(threading.Thread):
         self._conn_blocked_subscribers.discard(client)
 
         for channel_number in self._client_to_channels_map[client]:
-            del self._channel_to_client_map[channel_number]
+            del self._channel_info_map[channel_number]
 
         del self._client_to_channels_map[client]
 
@@ -531,8 +545,7 @@ class GatewayConnectionService(threading.Thread):
             assert not self._client_to_channels_map, (
                 self._client_to_channels_map)
 
-            assert not self._channel_to_client_map, (
-                self._channel_to_client_map)
+            assert not self._channel_info_map, (self._channel_info_map)
 
     def _request_shutdown(self, reason_code, reason_text):
         """Request service to shut down
@@ -645,7 +658,7 @@ class _GatewayConnection(select_connection.SelectConnection):
                  on_open_error_callback,
                  on_close_callback,
                  custom_ioloop,
-                 channel_to_client_map):
+                 channel_info_map):
         """
         :param pika.connection.Parameters parameters: Connection parameters
         :param method on_open_callback: Method to call on connection open
@@ -653,8 +666,8 @@ class _GatewayConnection(select_connection.SelectConnection):
             be established: on_open_error_callback(connection, str|exception)
         :param method on_close_callback: Called when the connection is closed:
             on_close_callback(connection, reason_code, reason_text)
-        :param dict channel_to_client_map: mapping of channel numbers to their
-            ClientProxy instances
+        :param dict channel_info_map: mapping of channel numbers to _ClientInfo
+            instances
 
         """
         # TODO Clean up references on termination to help with gc
@@ -662,7 +675,7 @@ class _GatewayConnection(select_connection.SelectConnection):
         # Base class may start streaming from the scope of its constructor, so
         # we need to init self ahead of super
 
-        self._gw_channel_to_client_map = channel_to_client_map
+        self._gw_channel_info_map = channel_info_map
 
         self._gw_tx_frames_streamed = 0
         self._gw_outbound_event_markers = collections.deque()
@@ -742,13 +755,30 @@ class _GatewayConnection(select_connection.SelectConnection):
 
         """
         try:
-            client = self._gw_channel_to_client_map[frame.channel_number]
+            channel_info = self._gw_channel_info_map[frame.channel_number]
         except KeyError:
-            LOGGER.error('No client for incoming frame %r', frame)
+            # This should never happen, and would be break down of protocol
+            # TODO Should we even bother with this case if it should never
+            # happen?
+            LOGGER.error('No channel info for incoming frame %r', frame)
             return
 
-        self._gw_incoming_client_frames[client].append(frame)
-        LOGGER.debug('Caching %r for %r', frame, client)
+        result = channel_info.message_assembler.filter(frame)
+
+        client = channel_info.client
+
+        if result is not None:
+            if result is frame:
+                self._gw_incoming_client_frames[client].append(
+                    frame)
+                LOGGER.debug('Caching %r for %r', frame, client)
+            else:
+                # Message frame sequence
+                # TODO integrate with threshold and throttling logic
+                for frame in result:
+                    self._gw_incoming_client_frames[client].append(frame)
+                    LOGGER.debug('Caching channel %i %s frame for %r',
+                                 frame.channel_number, frame.NAME, client)
 
     @overrides_instance_method
     def _on_data_available(self, data_in):
@@ -874,48 +904,6 @@ class _MessageAssembler(object):
         self._expected_num_bytes = self._num_bytes_so_far = None
 
         return frames
-
-
-
-# TODO Don't need _ContentFilter; service can use MessageAssembler directly
-class _ContentFilter(object):
-
-    def __init__(self):
-        # Map of channel number to MessageAssembler instance
-        self._channel_message_assemblers = dict()
-
-    def filter(self, frame):
-        """ Use content frames to assemble a message frame sequence, rejecting
-        non-content frames.
-
-        :param pika.frame.Frame:
-
-        :returns: if finished assembling a complete message, returns a `list` of
-            its frames, starting with method and header frames; if the frame
-            is part of the message being assembled, returns None. Otherwise,
-            returns the rejected frame.
-
-        :raises ValueError: on unexpected content frame or content is in excess
-            of expected body size
-        """
-        assembler = self._channel_message_assemblers[frame.channel_number]
-        return assembler.filter(frame)
-
-    def register_channel(self, channel_number):
-        """Register a channel
-
-        :param int channel_number:
-
-        """
-        self._channel_message_assemblers[channel_number] = _MessageAssembler()
-
-    def drop_channel(self, channel_number):
-        """Drop the given channel, if in use
-
-        :param int channel_number:
-
-        """
-        self._channel_message_assemblers.pop(channel_number, None)
 
 
 class ServiceProxy(object):
