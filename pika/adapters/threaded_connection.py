@@ -13,6 +13,23 @@ The user facing classes in the module consist of the
 and the :class:`~pika.adapters.blocking_connection_base.BlockingChannel`
 classes.
 
+Prototype notes:
+This prototype allows a single physical Pika connection to be shared across
+multiple threads using `BlockingConnection` API and keeps the AMQP heartbeat
+going (prevents connection timeout) even when individual threads take a very
+long time to process a message or block excessively for some other reason.
+Although the latter is convenient, the throughput in the multi-threaded
+implementation degraded a great deal to something like 70% below the
+single-threaded `BlockingConnection` implementation (I don't recall the exact
+details of RX vs TX degradation). Perhaps with more engineering time and
+resources, performance could be improved. In my prototype, the socket connection
+to RabbitMQ is serviced by a separate thread, which is also responsible for
+servicing AMQP heartbeats. Besides performance, there was one other problem that
+needed to be solved in this prototype: throttling messages to QoS-less consumers
+when the consumer can't keep with incoming messages; the prototype just ends up
+caching all such incoming messages in RAM, which may be an issue in production
+scenarios.
+
 """
 
 # Suppress pylint messages concerning "Too few public methods"
