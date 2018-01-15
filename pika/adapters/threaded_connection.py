@@ -26,9 +26,9 @@ resources, performance could be improved. In my prototype, the socket connection
 to RabbitMQ is serviced by a separate thread, which is also responsible for
 servicing AMQP heartbeats. Besides performance, there was one other problem that
 needed to be solved in this prototype: throttling messages to QoS-less consumers
-when the consumer can't keep with incoming messages; the prototype just ends up
-caching all such incoming messages in RAM, which may be an issue in production
-scenarios.
+when the consumer can't keep up with incoming messages; the prototype just ends
+up caching all such incoming messages in RAM, which may be an issue in
+production scenarios.
 
 """
 
