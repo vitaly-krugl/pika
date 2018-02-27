@@ -189,7 +189,7 @@ class Channel(object):
                            False)
 
     def add_on_return_callback(self, callback):
-        """Pass a callback function that will be called when basic_publish as
+        """Pass a callback function that will be called when basic_publish is
         sent a message that has been rejected and returned by the server.
 
         :param callable callback: The function to call, having the signature
@@ -317,6 +317,7 @@ class Channel(object):
         :param dict arguments: Custom key/value pair arguments for the consumer
         :param callable callback: callback(pika.frame.Method) for method
           Basic.ConsumeOk.
+        :return: Consumer tag which may be used to cancel the consumer.
         :rtype: str
         :raises ValueError:
 
@@ -604,7 +605,8 @@ class Channel(object):
 
         if not (self.connection.publisher_confirms and
                 self.connection.basic_nack):
-            raise exceptions.MethodNotImplemented('Not Supported on Server')
+            raise exceptions.MethodNotImplemented(
+                'Confirm.Select not Supported by Server')
 
         # Add the ack and nack callback
         self.callbacks.add(self.channel_number, spec.Basic.Ack, ack_nack_callback,
@@ -1423,7 +1425,7 @@ class Channel(object):
                                    self._on_synchronous_complete,
                                    arguments=arguments)
                 if callback is not None:
-                    LOGGER.debug('Adding passed-in callback')
+                    LOGGER.debug('Adding passed-in RPC response callback')
                     self.callbacks.add(self.channel_number, reply, callback,
                                        arguments=arguments)
 

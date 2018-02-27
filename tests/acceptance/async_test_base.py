@@ -14,20 +14,34 @@ import unittest
 import uuid
 
 try:
-    from unittest import mock
+    from unittest import mock  # pylint: disable=C0412
 except ImportError:
     import mock
-
 
 import pika
 from pika import adapters
 from pika.adapters import select_connection
 
+from ..threaded_test_wrapper import create_run_in_thread_decorator
+
+
+# protected-access
+# pylint: disable=W0212
+
+
+TEST_TIMEOUT = 15
+
+# Decorator for running our tests in threads with timeout
+# NOTE: we give it a little more time to give our I/O loop-based timeout logic
+# sufficient time to mop up.
+run_test_in_thread_with_timeout = create_run_in_thread_decorator(  # pylint: disable=C0103
+    TEST_TIMEOUT * 1.1)
+
 
 class AsyncTestCase(unittest.TestCase):
     DESCRIPTION = ""
     ADAPTER = None
-    TIMEOUT = 15
+    TIMEOUT = TEST_TIMEOUT
 
     def setUp(self):
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -82,7 +96,7 @@ class AsyncTestCase(unittest.TestCase):
             self._run_ioloop()
             self.assertFalse(self._timed_out)
         finally:
-            self.connection.ioloop.close()
+            self.connection._async.close()
             self.connection = None
 
     def stop_ioloop_only(self):
@@ -90,7 +104,7 @@ class AsyncTestCase(unittest.TestCase):
         closing the connection
         """
         self._safe_remove_test_timeout()
-        self.connection.ioloop.stop()
+        self.connection._async.stop()
 
     def stop(self):
         """close the connection and stop the ioloop"""
@@ -103,7 +117,7 @@ class AsyncTestCase(unittest.TestCase):
         logic after we instantiate the connection and assign it to
         `self.connection`, but before we run the ioloop
         """
-        self.connection.ioloop.start()
+        self.connection._async.run()
 
     def _safe_remove_test_timeout(self):
         if hasattr(self, 'timeout') and self.timeout is not None:
@@ -115,7 +129,7 @@ class AsyncTestCase(unittest.TestCase):
         if hasattr(self, 'connection') and self.connection is not None:
             self._safe_remove_test_timeout()
             self.logger.info("Stopping ioloop")
-            self.connection.ioloop.stop()
+            self.connection._async.stop()
 
     def on_closed(self, connection, reply_code, reply_text):
         """called when the connection has finished closing"""
@@ -129,7 +143,7 @@ class AsyncTestCase(unittest.TestCase):
 
     def on_open_error(self, connection, error):
         self.logger.error('on_open_error: %r %r', connection, error)
-        connection.ioloop.stop()
+        connection._async.stop()
         raise AssertionError('Error connecting to RabbitMQ')
 
     def on_timeout(self):
@@ -201,11 +215,13 @@ class AsyncAdapters(object):
         """
         raise NotImplementedError
 
+    @run_test_in_thread_with_timeout
     def select_default_test(self):
         """SelectConnection:DefaultPoller"""
         with mock.patch.multiple(select_connection, SELECT_TYPE=None):
             self.start(adapters.SelectConnection, select_connection.IOLoop)
 
+    @run_test_in_thread_with_timeout
     def select_select_test(self):
         """SelectConnection:select"""
 
@@ -215,6 +231,7 @@ class AsyncAdapters(object):
     @unittest.skipIf(
         not hasattr(select, 'poll') or
         not hasattr(select.poll(), 'modify'), "poll not supported")  # pylint: disable=E1101
+    @run_test_in_thread_with_timeout
     def select_poll_test(self):
         """SelectConnection:poll"""
 
@@ -222,6 +239,7 @@ class AsyncAdapters(object):
             self.start(adapters.SelectConnection, select_connection.IOLoop)
 
     @unittest.skipIf(not hasattr(select, 'epoll'), "epoll not supported")
+    @run_test_in_thread_with_timeout
     def select_epoll_test(self):
         """SelectConnection:epoll"""
 
@@ -229,12 +247,14 @@ class AsyncAdapters(object):
             self.start(adapters.SelectConnection, select_connection.IOLoop)
 
     @unittest.skipIf(not hasattr(select, 'kqueue'), "kqueue not supported")
+    @run_test_in_thread_with_timeout
     def select_kqueue_test(self):
         """SelectConnection:kqueue"""
 
         with mock.patch.multiple(select_connection, SELECT_TYPE='kqueue'):
             self.start(adapters.SelectConnection, select_connection.IOLoop)
 
+    @run_test_in_thread_with_timeout
     def tornado_test(self):
         """TornadoConnection"""
         ioloop_factory = None
@@ -243,7 +263,9 @@ class AsyncAdapters(object):
             ioloop_factory = tornado.ioloop.IOLoop
         self.start(adapters.TornadoConnection, ioloop_factory)
 
-    @unittest.skipIf(sys.version_info < (3, 4), "Asyncio available for Python 3.4+")
+    @unittest.skipIf(sys.version_info < (3, 4),
+                     'Asyncio is available only with Python 3.4+')
+    @run_test_in_thread_with_timeout
     def asyncio_test(self):
         """AsyncioConnection"""
         ioloop_factory = None

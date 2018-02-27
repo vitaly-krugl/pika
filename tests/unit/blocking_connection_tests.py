@@ -10,7 +10,8 @@ import mock
 from mock import patch
 
 import pika
-from pika.adapters import blocking_connection
+from pika.adapters import (blocking_connection, async_interface,
+                           select_connection)
 import pika.channel
 from pika.exceptions import AMQPConnectionError, ChannelClosed
 
@@ -36,9 +37,10 @@ class SelectConnectionTemplate(blocking_connection.SelectConnection):
     is_closed = None
     is_closing = None
     is_open = None
-    outbound_buffer = None
     _channels = None
     ioloop = None
+    _transport = None
+    _adapter_get_write_buffer_size = None
 
 
 class BlockingConnectionTests(unittest.TestCase):
@@ -107,12 +109,22 @@ class BlockingConnectionTests(unittest.TestCase):
         blocking_connection,
         'SelectConnection',
         spec_set=SelectConnectionTemplate,
-        is_closed=False,
-        outbound_buffer=[])
+        is_closed=False)
     def test_flush_output(self, select_connection_class_mock):
         with mock.patch.object(blocking_connection.BlockingConnection,
                                '_process_io_for_connection_setup'):
             connection = blocking_connection.BlockingConnection('params')
+
+        get_buffer_size_mock = mock.Mock(
+            name='_adapter_get_write_buffer_size',
+            side_effect=[100, 50, 0],
+            spec=async_interface.AbstractStreamTransport.get_write_buffer_size)
+
+        transport_mock = mock.NonCallableMock(
+            spec_set=async_interface.AbstractStreamTransport)
+
+        connection._impl._transport = transport_mock
+        connection._impl._adapter_get_write_buffer_size = get_buffer_size_mock
 
         connection._opened_result.set_value_once(
             select_connection_class_mock.return_value)
@@ -123,8 +135,7 @@ class BlockingConnectionTests(unittest.TestCase):
         blocking_connection,
         'SelectConnection',
         spec_set=SelectConnectionTemplate,
-        is_closed=False,
-        outbound_buffer=[])
+        is_closed=False)
     def test_flush_output_user_initiated_close(self,
                                                select_connection_class_mock):
         with mock.patch.object(blocking_connection.BlockingConnection,
@@ -144,8 +155,7 @@ class BlockingConnectionTests(unittest.TestCase):
         blocking_connection,
         'SelectConnection',
         spec_set=SelectConnectionTemplate,
-        is_closed=False,
-        outbound_buffer=[])
+        is_closed=False)
     def test_flush_output_server_initiated_error_close(
             self, select_connection_class_mock):
 
@@ -169,8 +179,7 @@ class BlockingConnectionTests(unittest.TestCase):
         blocking_connection,
         'SelectConnection',
         spec_set=SelectConnectionTemplate,
-        is_closed=False,
-        outbound_buffer=[])
+        is_closed=False)
     def test_flush_output_server_initiated_no_error_close(
             self, select_connection_class_mock):
 
@@ -301,43 +310,6 @@ class BlockingConnectionTests(unittest.TestCase):
                 '_flush_output',
                 spec_set=blocking_connection.BlockingConnection._flush_output):
             connection.sleep(0.00001)
-
-    def test_connection_attempts_with_timeout(self):
-        # for whatever conn_attempt we try:
-        for conn_attempt in (1, 2, 5):
-            mock_sock_obj = mock.Mock(
-                spec_set=socket.socket,
-                connect=mock.Mock(side_effect=socket.timeout))
-
-            # NOTE Use short retry_delay to not wait uselessly during the retry
-            # process, but not too low to avoid timer_id collision on systems
-            # with poor timer resolution (e.g., Windows)
-            params = pika.ConnectionParameters(
-                connection_attempts=conn_attempt, retry_delay=0.01)
-            with self.assertRaises(AMQPConnectionError) as ctx:
-                with mock.patch(
-                        'pika.SelectConnection._create_tcp_connection_socket',
-                        return_value=mock_sock_obj) as create_sock_mock:
-                    with mock.patch(
-                            'pika.SelectConnection._getaddrinfo',
-                            return_value=[(socket.AF_INET, socket.SOCK_STREAM,
-                                           socket.IPPROTO_TCP, '',
-                                           ('127.0.0.1', 5672))]):
-                        pika.BlockingConnection(parameters=params)
-
-            # as any attempt will timeout (directly),
-            # at the end there must be exactly that count of socket.connect()
-            # method calls:
-            self.assertEqual(conn_attempt,
-                             create_sock_mock.return_value.connect.call_count)
-
-            # and each must be with the following arguments (always the same):
-            create_sock_mock.return_value.connect.assert_has_calls(
-                conn_attempt * [mock.call(('127.0.0.1', 5672))])
-
-            # and the raised error must then looks like:
-            self.assertEqual('Connection to 127.0.0.1:5672 failed: timeout',
-                             str(ctx.exception))
 
     def test_connection_blocked_evt(self):
         blocked_buffer = []
