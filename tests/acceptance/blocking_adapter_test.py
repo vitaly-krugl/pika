@@ -8,8 +8,8 @@ import time
 import unittest
 import uuid
 
-from forward_server import ForwardServer
-from test_utils import retry_assertion
+from ..forward_server import ForwardServer
+from .test_utils import retry_assertion
 
 import pika
 from pika.adapters import blocking_connection
@@ -203,7 +203,7 @@ class TestLostConnectionResultsInIsClosedConnectionAndChannel(BlockingTestCaseBa
         channel = connection.channel()
 
         # Simulate the server dropping the socket connection
-        connection._impl.socket.shutdown(socket.SHUT_RDWR)
+        connection._impl._transport._sock.shutdown(socket.SHUT_RDWR)
 
         with self.assertRaises(pika.exceptions.ConnectionClosed):
             # Changing QoS should result in ConnectionClosed
@@ -291,7 +291,7 @@ class TestSuddenBrokerDisconnectBeforeChannel(BlockingTestCaseBase):
 
         self.assertTrue(self.connection.is_closed)
         self.assertFalse(self.connection.is_open)
-        self.assertIsNone(self.connection._impl.socket)
+        self.assertIsNone(self.connection._impl._transport)
 
 
 class TestNoAccessToFileDescriptorAfterConnectionClosed(BlockingTestCaseBase):
@@ -314,10 +314,9 @@ class TestNoAccessToFileDescriptorAfterConnectionClosed(BlockingTestCaseBase):
 
         self.assertTrue(self.connection.is_closed)
         self.assertFalse(self.connection.is_open)
-        self.assertIsNone(self.connection._impl.socket)
+        self.assertIsNone(self.connection._impl._transport)
 
         # Attempt to operate on the connection once again after ConnectionClosed
-        self.assertIsNone(self.connection._impl.socket)
         with self.assertRaises(pika.exceptions.ConnectionClosed):
             self.connection.channel()
 
@@ -631,7 +630,6 @@ class TestRemoveTimeoutFromTimeoutCallback(BlockingTestCaseBase):
         while not rx_timer2:
             connection.process_data_events(time_limit=None)
 
-        self.assertIsNone(timer_id1.callback)
         self.assertFalse(connection._ready_events)
 
 

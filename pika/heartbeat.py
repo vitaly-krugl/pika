@@ -117,6 +117,9 @@ class HeartbeatChecker(object):
         duration = self._max_idle_count * self._interval
         text = HeartbeatChecker._STALE_CONNECTION % duration
 
+        # Abort the stream connection. There is no point trying to gracefully
+        # close the AMQP connection since lack of heartbeat suggests that the
+        # stream is dead.
         self._connection._on_terminate(  # pylint: disable=W0212
             HeartbeatChecker._CONNECTION_FORCED,
             text)

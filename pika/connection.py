@@ -2,8 +2,8 @@
 # disable too-many-lines
 # pylint: disable=C0302
 
+import abc
 import ast
-import collections
 import copy
 import functools
 import logging
@@ -47,6 +47,11 @@ class InternalCloseReasons(object):
     """
     SOCKET_ERROR = -1
     BLOCKED_CONNECTION_TIMEOUT = -2
+    AMQP_VERSION_MISMATCH = -3
+    AUTH_MISMATCH = -4
+    UNEXPECTED_FRAME_TYPE = -5
+    UNEXPECTED_ERROR = -6  # Unanticipated error
+
 
 
 class Parameters(object):  # pylint: disable=R0902
@@ -956,7 +961,7 @@ class SSLOptions(object):
         self.server_hostname = server_hostname
 
 
-class Connection(object):
+class Connection(pika.compat.AbstractBase):
     """This is the core class that implements communication with RabbitMQ. This
     class should not be invoked directly but rather through the use of an
     adapter such as SelectConnection or BlockingConnection.
@@ -969,7 +974,7 @@ class Connection(object):
     ON_CONNECTION_BACKPRESSURE = '_on_connection_backpressure'
     ON_CONNECTION_CLOSED = '_on_connection_closed'
     ON_CONNECTION_ERROR = '_on_connection_error'
-    ON_CONNECTION_OPEN = '_on_connection_open'
+    ON_CONNECTION_OPEN_OK = '_on_connection_open_ok'
     CONNECTION_CLOSED = 0
     CONNECTION_INIT = 1
     CONNECTION_PROTOCOL = 2
@@ -1056,7 +1061,8 @@ class Connection(object):
 
         # Add the on connection error callback
         self.callbacks.add(0, self.ON_CONNECTION_ERROR,
-                           on_open_error_callback or self._on_connection_error,
+                           on_open_error_callback or
+                           self._default_on_connection_error,
                            False)
 
         # On connection callback
@@ -1148,7 +1154,7 @@ class Connection(object):
         """
         if not callable(callback):
             raise TypeError('callback should be a function or method.')
-        self.callbacks.add(0, self.ON_CONNECTION_OPEN, callback, False)
+        self.callbacks.add(0, self.ON_CONNECTION_OPEN_OK, callback, False)
 
     def add_on_open_error_callback(self, callback, remove_default=True):
         """Add a callback notification when the connection can not be opened.
@@ -1156,7 +1162,8 @@ class Connection(object):
         The callback method should accept the connection instance that could not
         connect, and either a string or an exception as its second arg.
 
-        :param method callback: Callback to call when can't connect
+        :param method callback: Callback to call when can't connect, having
+            the signature _(Connection, str | BaseException)
         :param bool remove_default: Remove default exception raising callback
 
         """
@@ -1164,16 +1171,28 @@ class Connection(object):
             raise TypeError('callback should be a function or method.')
         if remove_default:
             self.callbacks.remove(0, self.ON_CONNECTION_ERROR,
-                                  self._on_connection_error)
+                                  self._default_on_connection_error)
         self.callbacks.add(0, self.ON_CONNECTION_ERROR, callback, False)
 
+    @abc.abstractmethod
     def add_timeout(self, deadline, callback):
         """Adapters should override to call the callback after the
         specified number of seconds have elapsed, using a timer, or a
         thread, or similar.
 
-        :param int deadline: The number of seconds to wait to call callback
+        :param float deadline: The number of seconds to wait to call callback
         :param method callback: The callback will be called without args.
+        :return: Handle that can be passed to `remove_timeout()` to cancel the
+            callback.
+
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def remove_timeout(self, timeout_id):
+        """Adapters should override: Remove a timeout
+
+        :param opaque timeout_id: The timeout handle to remove
 
         """
         raise NotImplementedError
@@ -1221,6 +1240,11 @@ class Connection(object):
 
         # NOTE The connection is either in opening or open state
 
+        # TODO: need a test for closing connection while it's opening, no trans-
+        #       port yet, etc.
+
+        was_open_on_entry = self.is_open
+
         # Initiate graceful closing of channels that are OPEN or OPENING
         if self._channels:
             self._close_channels(reply_code, reply_text)
@@ -1230,16 +1254,28 @@ class Connection(object):
         LOGGER.info("Closing connection (%s): %s", reply_code, reply_text)
         self.closing = reply_code, reply_text
 
-        # If there are channels that haven't finished closing yet, then
-        # _on_close_ready will finally be called from _on_channel_cleanup once
-        # all channels have been closed
-        if not self._channels:
-            # We can initiate graceful closing of the connection right away,
-            # since no more channels remain
-            self._on_close_ready()
+        if was_open_on_entry:
+            # If there are channels that haven't finished closing yet, then
+            # _on_close_ready will finally be called from _on_channel_cleanup once
+            # all channels have been closed
+            if not self._channels:
+                # We can initiate graceful closing of the connection right away,
+                # since no more channels remain
+                self._on_close_ready()
+            else:
+                LOGGER.info(
+                    'Connection.close is waiting for %d channels to close: %s',
+                    len(self._channels), self)
         else:
-            LOGGER.info('Connection.close is waiting for '
-                        '%d channels to close: %s', len(self._channels), self)
+            # It was opening, but not fully open yet, so we won't attempt
+            # graceful Connection.Close.
+            LOGGER.debug('Connection.close is bypassing graceful AMQP close '
+                         'since AMQP was in opening state.')
+            # Call _on_terminate through event loop so user's termination
+            # callbacks won't be called in the scope of the close() call itself
+            self.add_timeout(
+                0,
+                functools.partial(self._on_terminate, reply_code, reply_text))
 
     def connect(self):
         """Invoke if trying to reconnect to a RabbitMQ server. Constructing the
@@ -1261,15 +1297,6 @@ class Connection(object):
         self._connection_attempt_timer = self.add_timeout(
             0,
             self._on_connect_timer)
-
-
-    def remove_timeout(self, timeout_id):
-        """Adapters should override: Remove a timeout
-
-        :param str timeout_id: The timeout id to remove
-
-        """
-        raise NotImplementedError
 
     def set_backpressure_multiplier(self, value=10):
         """Alter the backpressure multiplier value. We set this to 10 by default.
@@ -1352,20 +1379,47 @@ class Connection(object):
     #
     # Internal methods for managing the communication process
     #
-
+    @abc.abstractmethod
     def _adapter_connect(self):
-        """Subclasses should override to set up the outbound socket connection.
+        """Subclasses should override to perform one round of stream connection
+        establishment (including SSL if requested by user) asynchronously. Upon
+        completion of the round, they must invoke
+        `Connection._on_stream_connection_done(None|BaseException)`, where the
+        arg value of None signals success, while an exception instance (check
+        for `BaseException`) signals failure of the round.
+
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def _adapter_disconnect(self):
+        """Subclasses should override this to cause the underlying transport
+        (socket) to close.
 
         :raises: NotImplementedError
 
         """
         raise NotImplementedError
 
-    def _adapter_disconnect(self):
-        """Subclasses should override this to cause the underlying transport
-        (socket) to close.
+    @abc.abstractmethod
+    def _adapter_emit_data(self, data):
+        """Take ownership of data and send it to AMQP server as soon as
+        possible.
 
-        :raises: NotImplementedError
+        Subclasses must override this
+
+        :param bytes data:
+
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def _adapter_get_write_buffer_size(self):
+        """
+        Subclasses must override this
+
+        :return: Current size of output data buffered by the transport
+        :rtype: int
 
         """
         raise NotImplementedError
@@ -1395,24 +1449,6 @@ class Connection(object):
         """Add a callback for when a Connection.Tune frame is received."""
         self.callbacks.add(0, spec.Connection.Tune, self._on_connection_tune)
 
-    def _append_frame_buffer(self, value):
-        """Append the bytes to the frame buffer.
-
-        :param str value: The bytes to append to the frame buffer
-
-        """
-        self._frame_buffer += value
-
-    @property
-    def _buffer_size(self):
-        """Return the suggested buffer size from the connection state/tune or
-        the default if that is None.
-
-        :rtype: int
-
-        """
-        return self.params.frame_max or spec.FRAME_MAX_SIZE
-
     def _check_for_protocol_mismatch(self, value):
         """Invoked when starting a connection to make sure it's a supported
         protocol.
@@ -1421,10 +1457,8 @@ class Connection(object):
         :raises: ProtocolVersionMismatch
 
         """
-        if (value.method.version_major,
-                value.method.version_minor) != spec.PROTOCOL_VERSION[0:2]:
-            # TODO This should call _on_terminate for proper callbacks and
-            # cleanup
+        if ((value.method.version_major, value.method.version_minor) !=
+                spec.PROTOCOL_VERSION[0:2]):
             raise exceptions.ProtocolVersionMismatch(frame.ProtocolHeader(),
                                                      value)
 
@@ -1537,7 +1571,7 @@ class Connection(object):
 
         """
         avg_frame_size = self.bytes_sent / self.frames_sent
-        buffer_size = sum([len(f) for f in self.outbound_buffer])
+        buffer_size = self._adapter_get_write_buffer_size()
         if buffer_size > (avg_frame_size * self._backpressure_multiplier):
             LOGGER.warning(BACKPRESSURE_WARNING, buffer_size,
                            int(buffer_size / avg_frame_size))
@@ -1547,15 +1581,6 @@ class Connection(object):
         """If the connection is not closed, close it."""
         if self.is_open:
             self.close()
-
-    def _flush_outbound(self):
-        """Adapters should override to flush the contents of outbound_buffer
-        out along the socket.
-
-        :raises: NotImplementedError
-
-        """
-        raise NotImplementedError
 
     def _get_body_frame_max_length(self):
         """Calculate the maximum amount of bytes that can be in a body frame.
@@ -1574,11 +1599,9 @@ class Connection(object):
         :rtype: tuple(str, str)
 
         """
-        (auth_type,
-         response) = self.params.credentials.response_for(method_frame.method)
+        (auth_type, response) = self.params.credentials.response_for(
+            method_frame.method)
         if not auth_type:
-            # TODO this should call _on_terminate for proper callbacks and
-            # cleanup instead
             raise exceptions.AuthenticationError(self.params.credentials.TYPE)
         self.params.credentials.erase_credentials()
         return auth_type, response
@@ -1604,9 +1627,6 @@ class Connection(object):
 
         # Negotiated server properties
         self.server_properties = None
-
-        # Outbound buffer for buffering writes until we're able to send them
-        self.outbound_buffer = collections.deque([])
 
         # Inbound buffer for decoding frames
         self._frame_buffer = bytes()
@@ -1810,8 +1830,10 @@ class Connection(object):
 
         self._on_terminate(self.closing[0], self.closing[1])
 
-    def _on_connection_error(self, _connection_unused, error_message=None):
-        """Default behavior when the connecting connection can not connect.
+    def _default_on_connection_error(self, _connection_unused,
+                                     error_message=None):
+        """Default behavior when the connecting connection cannot connect and
+        user didn't supply own `on_connection_error` callback.
 
         :raises: exceptions.AMQPConnectionError
 
@@ -1819,13 +1841,13 @@ class Connection(object):
         raise exceptions.AMQPConnectionError(error_message or
                                              self.params.connection_attempts)
 
-    def _on_connection_open(self, method_frame):
+    def _on_connection_open_ok(self, method_frame):
         """
         This is called once we have tuned the connection with the server and
         called the Connection.Open on the server and it has replied with
         Connection.Ok.
         """
-        # TODO _on_connection_open - what if user started closing it already?
+        # TODO _on_connection_open_ok - what if user started closing it already?
         # It shouldn't transition to OPEN if in closing state. Just log and skip
         # the rest.
 
@@ -1835,7 +1857,7 @@ class Connection(object):
         self._set_connection_state(self.CONNECTION_OPEN)
 
         # Call our initial callback that we're open
-        self.callbacks.process(0, self.ON_CONNECTION_OPEN, self, self)
+        self.callbacks.process(0, self.ON_CONNECTION_OPEN_OK, self, self)
 
     def _on_connection_start(self, method_frame):
         """This is called as a callback once we have received a Connection.Start
@@ -1846,12 +1868,54 @@ class Connection(object):
 
         """
         self._set_connection_state(self.CONNECTION_START)
-        if self._is_protocol_header_frame(method_frame):
-            raise exceptions.UnexpectedFrameError
-        self._check_for_protocol_mismatch(method_frame)
-        self._set_server_information(method_frame)
-        self._add_connection_tune_callback()
-        self._send_connection_start_ok(*self._get_credentials(method_frame))
+
+        error_pair = None
+        try:
+            if self._is_protocol_header_frame(method_frame):
+                raise exceptions.UnexpectedFrameError(method_frame)
+            self._check_for_protocol_mismatch(method_frame)
+            self._set_server_information(method_frame)
+            self._add_connection_tune_callback()
+            self._send_connection_start_ok(*self._get_credentials(method_frame))
+        except exceptions.UnexpectedFrameError as error:
+            LOGGER.exception('Unexpected frame received.')
+            error_pair = (InternalCloseReasons.UNEXPECTED_FRAME_TYPE, error)
+        except exceptions.ProtocolVersionMismatch as error:
+            LOGGER.exception('Incompatible protocol.')
+            error_pair = (InternalCloseReasons.AMQP_VERSION_MISMATCH, error)
+        except exceptions.AuthenticationError as error:
+            LOGGER.exception('Authentication failed.')
+            error_pair = (InternalCloseReasons.AUTH_MISMATCH, error)
+        except Exception as error:  # pylint: disable=W0703
+            LOGGER.exception('Unexpected error.')
+            error_pair = (InternalCloseReasons.UNEXPECTED_ERROR, error)
+
+        if error_pair is not None:
+            self._on_terminate(error_pair[0], repr(error_pair[1]))
+
+    def _on_stream_connection_done(self, error):
+        """Called by the adapter layer when the stream connection attempt,
+        including SSL if requested, completes or fails to complete after
+        exhausting all resolved addresses.
+
+        :param None | BaseException error: None on success, exception on
+            failure
+        """
+        if error is None:
+            self._on_connected()
+        else:
+            self.remaining_connection_attempts -= 1
+            LOGGER.warning('Could not connect, %i attempts left',
+                           self.remaining_connection_attempts)
+            if self.remaining_connection_attempts > 0:
+                LOGGER.info('Retrying in %i seconds', self.params.retry_delay)
+                self._connection_attempt_timer = self.add_timeout(
+                    self.params.retry_delay,
+                    self._on_connect_timer)
+            else:
+                # No more connection attempts
+                self._on_terminate(InternalCloseReasons.SOCKET_ERROR,
+                                   repr(error))
 
     def _on_connect_timer(self):
         """Callback for self._connection_attempt_timer: initiate connection
@@ -1860,36 +1924,8 @@ class Connection(object):
         """
         self._connection_attempt_timer = None
 
-        error = self._adapter_connect()
-        if not error:
-            self._on_connected()
-            return
-
-        self.remaining_connection_attempts -= 1
-        LOGGER.warning('Could not connect, %i attempts left',
-                       self.remaining_connection_attempts)
-        if self.remaining_connection_attempts > 0:
-            LOGGER.info('Retrying in %i seconds', self.params.retry_delay)
-            self._connection_attempt_timer = self.add_timeout(
-                self.params.retry_delay,
-                self._on_connect_timer)
-        else:
-            # TODO connect must not call failure callback from constructor. The
-            # current behavior is error-prone, because the user code may get a
-            # callback upon socket connection failure before user's other state
-            # may be sufficiently initialized. Constructors must either succeed
-            # or raise an exception. To be forward-compatible with failure
-            # reporting from fully non-blocking connection establishment,
-            # connect() should set INIT state and schedule a 0-second timer to
-            # continue the rest of the logic in a private method. The private
-            # method should use itself instead of connect() as the callback for
-            # scheduling retries.
-
-            # TODO This should use _on_terminate for consistent behavior/cleanup
-            self.callbacks.process(0, self.ON_CONNECTION_ERROR, self, self,
-                                   error)
-            self.remaining_connection_attempts = self.params.connection_attempts
-            self._set_connection_state(self.CONNECTION_CLOSED)
+        # Adapter will invoke `self._on_stream_connection_done` upon completion
+        self._adapter_connect()
 
     @staticmethod
     def _negotiate_integer_value(client_value, server_value):
@@ -1997,7 +2033,8 @@ class Connection(object):
         :param str data_in: The data that is available to read
 
         """
-        self._append_frame_buffer(data_in)
+        self._frame_buffer += data_in
+
         while self._frame_buffer:
             consumed_count, frame_value = self._read_frame()
             if not frame_value:
@@ -2015,7 +2052,7 @@ class Connection(object):
         :param str reason_text: human-readable text message describing the error
         """
         LOGGER.info(
-            'Disconnected from RabbitMQ at %s:%i (%s): %s',
+            'Disconnected from AMQP Broker at %s:%i (%s): %s',
             self.params.host, self.params.port, reason_code,
             reason_text)
 
@@ -2038,17 +2075,20 @@ class Connection(object):
             self._remove_callbacks(0, [spec.Connection.Blocked,
                                        spec.Connection.Unblocked])
 
-        # Close the socket
+        # Close the stream
         self._adapter_disconnect()
 
         # Determine whether this was an error during connection setup
         connection_error = None
 
-        if self.connection_state == self.CONNECTION_PROTOCOL:
+        if self.connection_state == self.CONNECTION_INIT:
+            LOGGER.error('Failed to connect to server')
+            connection_error = exceptions.AMQPConnectionError(reason_code,
+                                                              reason_text)
+        elif self.connection_state == self.CONNECTION_PROTOCOL:
             LOGGER.error('Incompatible Protocol Versions')
-            connection_error = exceptions.IncompatibleProtocolError(
-                reason_code,
-                reason_text)
+            connection_error = exceptions.IncompatibleProtocolError(reason_code,
+                                                                    reason_text)
         elif self.connection_state == self.CONNECTION_START:
             LOGGER.error('Connection closed while authenticating indicating a '
                          'probable authentication error')
@@ -2059,9 +2099,8 @@ class Connection(object):
             LOGGER.error('Connection closed while tuning the connection '
                          'indicating a probable permission error when '
                          'accessing a virtual host')
-            connection_error = exceptions.ProbableAccessDeniedError(
-                reason_code,
-                reason_text)
+            connection_error = exceptions.ProbableAccessDeniedError(reason_code,
+                                                                    reason_text)
         elif self.connection_state not in [self.CONNECTION_OPEN,
                                            self.CONNECTION_CLOSED,
                                            self.CONNECTION_CLOSING]:
@@ -2201,7 +2240,7 @@ class Connection(object):
         """Send a Connection.Open frame"""
         self._rpc(0, spec.Connection.Open(self.params.virtual_host,
                                           insist=True),
-                  self._on_connection_open, [spec.Connection.OpenOk])
+                  self._on_connection_open_ok, [spec.Connection.OpenOk])
 
     def _send_connection_start_ok(self, authentication_type, response):
         """Send a Connection.StartOk frame
@@ -2237,8 +2276,7 @@ class Connection(object):
         marshaled_frame = frame_value.marshal()
         self.bytes_sent += len(marshaled_frame)
         self.frames_sent += 1
-        self.outbound_buffer.append(marshaled_frame)
-        self._flush_outbound()
+        self._adapter_emit_data(marshaled_frame)
         if self.params.backpressure_detection:
             self._detect_backpressure()
 
