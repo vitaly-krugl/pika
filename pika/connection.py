@@ -2235,12 +2235,7 @@ class Connection(object):
             raise exceptions.ConnectionClosed
 
         marshaled_frame = frame_value.marshal()
-        self.bytes_sent += len(marshaled_frame)
-        self.frames_sent += 1
-        self.outbound_buffer.append(marshaled_frame)
-        self._flush_outbound()
-        if self.params.backpressure_detection:
-            self._detect_backpressure()
+        self._output_marshaled_frame(marshaled_frame)
 
     def _send_method(self, channel_number, method, content=None):
         """Constructs a RPC method frame and then sends it to the broker.
@@ -2266,8 +2261,15 @@ class Connection(object):
 
         """
         length = len(content[1])
-        self._send_frame(frame.Method(channel_number, method_frame))
-        self._send_frame(frame.Header(channel_number, length, content[0]))
+
+        # Note: we construct the Method and Header objects, marshal them
+        # *then* output in case the marshaling operation throws an exception
+        frame_method = frame.Method(channel_number, method_frame)
+        frame_header = frame.Header(channel_number, length, content[0])
+        frame_method_marshaled = frame_method.marshal()
+        frame_header_marshaled = frame_header.marshal()
+        self._output_marshaled_frame(frame_method_marshaled)
+        self._output_marshaled_frame(frame_header_marshaled)
 
         if content[1]:
             chunks = int(math.ceil(float(length) / self._body_max_length))
@@ -2276,7 +2278,9 @@ class Connection(object):
                 end = start + self._body_max_length
                 if end > length:
                     end = length
-                self._send_frame(frame.Body(channel_number, content[1][start:end]))
+                frame_body = frame.Body(channel_number, content[1][start:end])
+                frame_body_marshaled = frame_body.marshal()
+                self._output_marshaled_frame(frame_body_marshaled)
 
     def _set_connection_state(self, connection_state):
         """Set the connection state.
@@ -2308,3 +2312,16 @@ class Connection(object):
         """
         self._frame_buffer = self._frame_buffer[byte_count:]
         self.bytes_received += byte_count
+
+    def _output_marshaled_frame(self, marshaled_frame):
+        """Output marshaled frame to buffer
+
+        :param bytes marshaled: The frame marshaled to bytes
+
+        """
+        self.bytes_sent += len(marshaled_frame)
+        self.frames_sent += 1
+        self.outbound_buffer.append(marshaled_frame)
+        self._flush_outbound()
+        if self.params.backpressure_detection:
+            self._detect_backpressure()
