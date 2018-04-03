@@ -52,8 +52,8 @@ class HostTCPConnector(object):
         self._async_services = async_services
         self._addrinfo_iter = None
         self._sock = None
-        self._async_ref = None  # current cancelable asynchronous operation
-        self._timeout_ref = None
+        self._async_ref = None  # current cancelable asynchronous task
+        self._timeout_ref = None  # current timeout task
 
         # Exceptions from failed connection attempts since last successful
         # connection attempt to be passed to user when we run out of resolved
@@ -63,7 +63,7 @@ class HostTCPConnector(object):
         self._on_done = None  # will be provided via try_next()
 
     def close(self):
-        """Abruptly close the connector, ensuring no further callbacks from it.
+        """Abruptly close the connector, ensuring no callback from it.
 
         """
         self._deactivate()
@@ -78,8 +78,9 @@ class HostTCPConnector(object):
         self._on_done = None
 
     def try_next(self, on_done):
-        """ Attempt to connect using the remaining address records from the DNS
-        lookup, kick-starting the DNS lookup if it hasn't been performed yet.
+        """Attempt to connect asynchronously using the remaining address records
+        from the DNS lookup, kick-starting the DNS lookup if it hasn't been
+        performed yet.
 
         :param callable on_done: on_done(socket.socket|BaseException)`, will be
             invoked upon completion, where the arg value of socket.socket
