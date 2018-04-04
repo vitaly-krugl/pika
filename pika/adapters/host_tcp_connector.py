@@ -53,7 +53,7 @@ class HostTCPConnector(object):
         self._addrinfo_iter = None
         self._sock = None
         self._async_ref = None  # current cancelable asynchronous task
-        self._timeout_ref = None  # current timeout task
+        self._timeout_ref = None  # current timeout timer
 
         # Exceptions from failed connection attempts since last successful
         # connection attempt to be passed to user when we run out of resolved

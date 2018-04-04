@@ -1009,7 +1009,7 @@ class Connection(pika.compat.AbstractBase):
         :param method on_open_callback: Called when the connection is opened:
             on_open_callback(connection)
         :param method on_open_error_callback: Called if the connection can't
-            be established: on_open_error_callback(connection, str|exception)
+            be established: on_open_error_callback(Connection, BaseException)
         :param method on_close_callback: Called when the connection is closed:
             `on_close_callback(connection, reason_code, reason_text)`, where
             `reason_code` is either an IETF RFC 821 reply code for AMQP-level
@@ -1163,7 +1163,7 @@ class Connection(pika.compat.AbstractBase):
         connect, and either a string or an exception as its second arg.
 
         :param method callback: Callback to call when can't connect, having
-            the signature _(Connection, str | BaseException)
+            the signature _(Connection, BaseException)
         :param bool remove_default: Remove default exception raising callback
 
         """
