@@ -365,7 +365,6 @@ class _TransportManager(object):
 
         """
         self._async_ref = None
-        self._sock = None
         if isinstance(result, BaseException):
             exc = result
             LOGGER.error('Attempt to create a streaming transport failed: %r',
