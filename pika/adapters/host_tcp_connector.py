@@ -275,8 +275,7 @@ class HostTCPConnector(object):
                                               self._connection_errors))))
             return
 
-        _LOG.debug('Attempting to connect using address record %r',
-                   addr_record)
+        _LOG.debug('Attempting to connect using address record %r', addr_record)
         self._sock = socket.socket(addr_record[0],
                                    addr_record[1],
                                    addr_record[2])
