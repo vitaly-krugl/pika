@@ -11,7 +11,8 @@ import pika.compat
 import pika.exceptions
 import pika.tcp_socket_opts
 
-from pika.adapters.host_tcp_connector import HostTCPConnector
+from pika.adapters import connection_workflow # import (AMQPConnectionWorkflow,
+                                              # AMQPConnector)
 from pika import connection
 
 
@@ -46,8 +47,15 @@ class BaseConnection(connection.Connection):
                 'Expected instance of Parameters, not %r' % parameters)
 
         self._async = async_services
+
+        self._connection_workflow = None  # type: connection_workflow.AMQPConnectionWorkflow
         self._transport = None  # type: async_interface.AbstractStreamTransport
-        self._transport_mgr = None  # type: _TransportManager
+
+        self._got_eof = False  # transport indicated EOF (connection reset)
+
+        # TODO: get rid of _transport_mgr
+        # self._transport_mgr = None
+
         super(BaseConnection,
               self).__init__(parameters, on_open_callback,
                              on_open_error_callback, on_close_callback)
@@ -60,8 +68,9 @@ class BaseConnection(connection.Connection):
         """
         super(BaseConnection, self)._init_connection_state()
 
-        self._transport_mgr = None
+        self._connection_workflow = None
         self._transport = None
+        self._got_eof = False
 
     def __repr__(self):
 
@@ -146,36 +155,61 @@ class BaseConnection(connection.Connection):
 
         self._async.add_callback_threadsafe(callback)
 
-    def _adapter_connect(self):
-        """Perform one round of stream connection establishment (including SSL
-        if requested by user) asynchronously. Upon completion of the round, they
-        must invoke `Connection._on_stream_connection_done(None|BaseException)`,
-        where the arg value of None signals success, while an exception instance
-        (check for `BaseException`) signals failure of the round.
+    def _adapter_connect_stack(self):
+        """Initiate full-stack connection establishment asynchronously for
+        self-initiated connection brin-up.
+
+        Upon failed completion, we will invoke
+        `Connection._on_stack_connection_workflow_failed()`. NOTE: On success,
+        the stack will be up already, so there is no corresponding callback.
 
         """
-        self._transport_mgr = _TransportManager(
-            params=self.params,
-            stream_proto=self,
-            async_services=self._async,
-            on_done=self._on_transport_manager_done)
+        self._connection_workflow = connection_workflow.AMQPConnectionWorkflow(
+            [self.params],
+            connection_timeout=self.params.socket_timeout * 1.5,
+            retries=self.params.connection_attempts - 1,
+            retry_pause=self.params.retry_delay,
+            _until_first_amqp_attempt=True)
 
-    def _on_transport_manager_done(self, error):
-        """`_TransportManager` completion callback
+        def create_connector():
+            return connection_workflow.AMQPConnector(lambda: self, self._async)
 
-        :param None | BaseException error: None on success; exception on error.
+        self._connection_workflow.start(
+            connector_factory=create_connector,
+            native_loop=self._async.get_native_ioloop(),
+            on_done=self._on_connection_workflow_done)
+
+    def _on_connection_workflow_done(self, conn_or_exc):
+        """`AMQPConnectionWorkflow` completion callback.
+
+        :param BaseConnection | Exception conn_or_exc: Our own connection
+            instance on success; exception on failure. See
+            `AbstractAMQPConnectionWorkflow.start()` for details.
 
         """
-        self._transport_mgr.close()
-        self._transport_mgr = None
+        LOGGER.debug('Full-stack connection workflow completed: %r',
+                     conn_or_exc)
 
-        # Notify protocol
-        self._on_stream_connection_done(error)
+        self._connection_workflow = None
+
+        # Notify protocol of failure
+        if isinstance(conn_or_exc, Exception):
+            LOGGER.error('Full-stack connection workflow failed: %r',
+                         conn_or_exc)
+            self._transport = None
+            self._on_stack_connection_workflow_failed(conn_or_exc)
+        else:
+            # NOTE: On success, the stack will be up already, so there is no
+            #       corresponding callback.
+            assert conn_or_exc is self, \
+                'Expected self conn={!r} from workflow, but got {!r}.'.format(
+                    self, conn_or_exc)
 
     def _adapter_disconnect(self):
-        """Invoked if the connection is being told to disconnect
+        """Disconnect
 
         """
+        # TODO: deal with connection workflow and tranport abort instead of drop.
         if self._transport_mgr is not None:
             self._transport_mgr.close()
             self._transport_mgr = None
@@ -215,7 +249,7 @@ class BaseConnection(connection.Connection):
         self._transport = transport
 
     def connection_lost(self, error):
-        """Called upon loss or closing of connection.
+        """Called upon loss or closing of TCP connection.
 
         `async_interface.AbstractStreamProtocol` interface method.
 
@@ -232,16 +266,22 @@ class BaseConnection(connection.Connection):
         self._transport = None
 
         if error is None:
-            # Most likely as result of `eof_received()`
-            error = pika.compat.SOCKET_ERROR(errno.ECONNRESET,
-                                             os.strerror(errno.ECONNRESET))
+            # Either result of `eof_received()` or abort
+            if self._got_eof:
+                error = pika.exceptions.StreamLostError(
+                    'Transport indicated EOF')
+        else:
+            error = pika.exceptions.StreamLostError(
+                'Stream connection lost: {!r}'.format(error))
 
-        try:
-            error_code = error.errno
-        except AttributeError:
-            error_code = connection.InternalCloseReasons.SOCKET_ERROR
+        LOGGER.log(logging.DEBUG if error is None else logging.ERROR,
+                   'connection_lost: %r',
+                   error)
 
-        self._on_terminate(error_code, repr(error))
+        if error is not None and self._error is None:
+            self._error = error
+
+        self._on_stack_terminated()
 
     def eof_received(self):  # pylint: disable=R0201
         """Called after the remote peer shuts its write end of the connection.
@@ -256,6 +296,10 @@ class BaseConnection(connection.Connection):
         :raises Exception: Exception-based exception on error
 
         """
+        LOGGER.error('Transport indicated EOF.')
+
+        self._got_eof = True
+
         # This is how a reset connection will typically present itself
         # when we have nothing to send to the server over plaintext stream.
         #
@@ -273,106 +317,3 @@ class BaseConnection(connection.Connection):
 
         """
         self._on_data_available(data)
-
-
-class _TransportManager(object):
-    """Manages streaming transport setup
-
-    """
-
-    def __init__(self, params, stream_proto, async_services, on_done):
-        """
-
-        :param pika.connection.Params params:
-        :param async_interface.AbstractStreamProtocol stream_proto:
-        :param async_interface.AbstractAsyncServices async_services:
-        :param callable on_done: on_done(None|BaseException)`, will be invoked
-            upon completion, where the arg value of None signals success, while
-            an exception object signals failure of the workflow after exhausting
-            all remaining address records from DNS lookup.
-
-        """
-        self._params = params
-        self._stream_proto = stream_proto
-        self._async = async_services
-        self._on_done = on_done
-
-        self._sock = None  # type: socket.socket
-        self._addrinfo_iter = None
-
-        self._async_ref = None
-
-        self._tcp_connector = HostTCPConnector(self._params, self._async)
-        self._tcp_connector.try_next(self._on_tcp_connection_attempt_done)
-
-
-    def close(self):
-        """Abruptly close this instance
-
-        """
-        if self._tcp_connector is not None:
-            self._tcp_connector.close()
-            self._tcp_connector = None
-
-        if self._async_ref is not None:
-            self._async_ref.cancel()
-
-        if self._sock is not None:
-            self._sock.close()
-            self._sock = None
-
-    def _on_tcp_connection_attempt_done(self, sock_or_exc):
-        """Handle completion of asynchronous stream socket connection attempt.
-
-        :param socket.socket | BaseException sock_or_exc: socket on success;
-            exception instance on failure
-
-        """
-        if isinstance(sock_or_exc, BaseException):
-            LOGGER.error(
-                'Failed to establish TCP/IP connection with broker: %r.',
-                sock_or_exc)
-            self._on_done(sock_or_exc)
-        else:
-            self._sock = sock_or_exc
-            # We succeeded in opening a TCP stream
-            LOGGER.debug('%r connected.', self._sock)
-
-            # Now attempt to set up a streaming transport
-            ssl_context = server_hostname = None
-            ssl_options = self._params.ssl_options
-            if ssl_options is not None:
-                ssl_context = ssl_options.context
-                server_hostname = ssl_options.server_hostname
-                if server_hostname is None:
-                    server_hostname = self._params.host
-
-            self._async_ref = self._async.create_streaming_connection(
-                protocol_factory=lambda: self._stream_proto,
-                sock=self._sock,
-                ssl_context=ssl_context,
-                server_hostname=server_hostname,
-                on_done=self._on_create_streaming_connection_done)
-
-            self._sock = None  # create_streaming_connection took ownership
-
-    def _on_create_streaming_connection_done(self, result):
-        """Handle asynchronous completion of
-        `AbstractAsyncServices.create_streaming_connection()`
-
-        :param sequence|BaseException result: On success, a two-tuple
-            (transport, protocol); on failure, exception instance.
-
-        """
-        self._async_ref = None
-        if isinstance(result, BaseException):
-            exc = result
-            LOGGER.error('Attempt to create a streaming transport failed: %r',
-                         exc)
-            # Try connecting with next address record
-            self._tcp_connector.try_next(self._on_tcp_connection_attempt_done)
-        else:
-            # We succeeded in setting up the streaming transport!
-            # result is a two-tuple (transport, protocol)
-            LOGGER.info('Transport connected: %r.', result)
-            self._on_done(None)
