@@ -1,10 +1,6 @@
 """Pika specific exceptions"""
 
 
-class TransportError(Exception):
-    """Generic transport error"""
-    pass
-
 class AMQPError(Exception):
 
     def __repr__(self):
@@ -15,16 +11,29 @@ class AMQPConnectionError(AMQPError):
 
     def __repr__(self):
         if len(self.args) == 1:
-            if self.args[0] == 1:
-                return ('No connection could be opened after 1 '
-                        'connection attempt')
-            elif isinstance(self.args[0], int):
-                return ('No connection could be opened after %s '
-                        'connection attempts' % self.args[0])
-            else:
-                return 'No connection could be opened: %s' % self.args[0]
+            return '{}: No connection could be opened: {}'.format(
+                self.__class__.__name__,
+                self.args[0])
         elif len(self.args) == 2:
-            return '%s: %s' % (self.args[0], self.args[1])
+            return '{}: {}: {}'.format(self.__class__.__name__,
+                                       self.args[0],
+                                       self.args[1])
+
+class ConnectionOpenAborted(AMQPConnectionError):
+    """Client closed connection while opening."""
+    pass
+
+
+class StreamBringUpError(AMQPConnectionError):
+    """Stream (TCP or SSL) connection error."""
+    # TODO: do we use this?
+    pass
+
+
+class StreamLostError(AMQPConnectionError):
+    """Stream (TCP) connection lost."""
+    # TODO: do we use this?
+    pass
 
 
 class IncompatibleProtocolError(AMQPConnectionError):
@@ -64,12 +73,58 @@ class NoFreeChannels(AMQPConnectionError):
 
 class ConnectionClosed(AMQPConnectionError):
 
+    # TODO: grep for proper usage (args passed)
+
+    def __init__(self, reply_code, reply_text):
+        """
+
+        :param int reply_code: reply-code that was used in user's or broker's
+            `Connection.Close` method. NEW in v1.0.0
+        :param str reply_text: reply-text that was used in user's or broker's
+            `Connection.Close` method. Human-readable string corresponding to
+            `reply_code`. NEW in v1.0.0
+        """
+        super(ConnectionClosed, self).__init__(int(reply_code), str(reply_text))
+
     def __repr__(self):
-        if len(self.args) == 2:
-            return 'The AMQP connection was closed (%s) %s' % (self.args[0],
-                                                               self.args[1])
-        else:
-            return 'The AMQP connection was closed: %s' % (self.args,)
+        return '{}: ({}) {!r}'.format(self.__class__.__name__,
+                                      self.reply_code,
+                                      self.reply_text)
+
+    @property
+    def reply_code(self):
+        """ NEW in v1.0.0
+        :rtype: int
+
+        """
+        return self.args[0]
+
+    @property
+    def reply_text(self):
+        """ NEW in v1.0.0
+        :rtype: str
+
+        """
+        return self.args[1]
+
+class ConnectionClosedByBroker(ConnectionClosed):
+    """Connection.Close from broker."""
+    pass
+
+
+class ConnectionClosedByClient(ConnectionClosed):
+    """Connection was closed at request of Pika client."""
+    pass
+
+
+class ConnectionBlockedTimeout(AMQPConnectionError):
+    """RabbitMQ-specific: timed out waiting for connection.unblocked."""
+    pass
+
+
+class HeartbeatTimeout(AMQPConnectionError):
+    """Connection was dropped as result of heartbeat timeout."""
+    pass
 
 
 class AMQPChannelError(AMQPError):
@@ -115,7 +170,7 @@ class ChannelClosed(AMQPChannelError):
     @property
     def reply_text(self):
         """ NEW in v1.0.0
-        :rtype: int
+        :rtype: str
 
         """
         return self.args[1]

@@ -647,21 +647,8 @@ class _AsyncStreamConnector(object):
 
             _LOGGER.debug('_linkup(): introduced transport to protocol %r; %r',
                           transport, protocol)
-
         except Exception as error:  # pylint: disable=W0703
             result = error
-
-            if transport is not None:
-                try:
-                    # TODO: may be an overkill. asyncio's selector_events
-                    # doesn't seem to go to this trouble in
-                    # _SelectorSocketTransport().
-                    transport.drop()
-                except Exception as error:  # pylint: disable=W0703
-                    # Report and suppress the exception, since we need to pass
-                    # the original error with user's completion callback
-                    _LOGGER.error('transport.abort() failed: error=%r; %s',
-                                  error, self._sock)
         else:
             result = (transport, protocol)
 
@@ -744,6 +731,7 @@ class _AsyncTransportBase(  # pylint: disable=W0223
     # Max per consume call to prevent event starvation
     _MAX_CONSUME_BYTES = 1024 * 100
 
+
     class RxEndOfFile(OSError):
         """We raise this internally when EOF (empty read) is detected on input.
 
@@ -751,6 +739,7 @@ class _AsyncTransportBase(  # pylint: disable=W0223
         def __init__(self):
             super(_AsyncTransportBase.RxEndOfFile, self).__init__(
                 -1, 'End of input stream (EOF)')
+
 
     def __init__(self, sock, protocol, async_services):
         """
@@ -771,26 +760,17 @@ class _AsyncTransportBase(  # pylint: disable=W0223
         self._tx_buffers = collections.deque()
         self._tx_buffered_byte_count = 0
 
-    def drop(self):
-        """Close connection abruptly and synchronously without flushing pending
-        data and without invoking the corresponding protocol's
-        `connection_lost()` method.
-
-        NOTE: This differs from asyncio transport's `abort()` and `close()`
-        methods which close the stream asynchronously and eventually call the
-        protocol's `connection_lost()` method. The abrupt synchronous behavior
-        of the `drop()` method suits Pika's current connection-management logic
-        better.
+    def abort(self):
+        """Close connection abruptly without waiting for pending I/O to
+        complete. Will invoke the corresponding protocol's `connection_lost()`
+        method asynchronously (not in context of the abort() call).
 
         :raises Exception: Exception-based exception on error
         """
-        _LOGGER.info('Dropping transport connection immediately: state=%s; %s',
+        _LOGGER.info('Aborting transport connection: state=%s; %s',
                      self._state, self._sock)
 
-        self._deactivate()
-        self._close_and_finalize()
-
-        self._state = self._STATE_COMPLETED
+        self._initiate_abort(None)
 
     def get_protocol(self):
         """Return the protocol linked to this transport.
@@ -975,6 +955,8 @@ class _AsyncTransportBase(  # pylint: disable=W0223
 
             if self._state == self._STATE_ABORTED_BY_USER:
                 # Abort by user already pending
+                _LOGGER.debug('_AsyncTransportBase._initiate_abort(): '
+                              'ignoring - user-abort already pending.')
                 return
 
             # Notification priority is given to user-initiated abort over

@@ -240,8 +240,9 @@ class AbstractAsyncServices(pika.compat.AbstractBase):
             `on_done(BaseException | (transport, protocol))` to be notified when
             the asynchronous operation completes. An exception arg indicates
             failure (check for `BaseException`); otherwise the two-tuple will
-            contain the linked transport/protocol pair, with the
-            AbstractStreamTransport and AbstractStreamProtocol respectively.
+            contain the linked transport/protocol pair having
+            AbstractStreamTransport and AbstractStreamProtocol interfaces
+            respectively.
         :param None | ssl.SSLContext ssl_context: if None, this will proceed as
             a plaintext connection; otherwise, if not None, SSL session
             establishment will be performed prior to linking the transport and
@@ -360,16 +361,10 @@ class AbstractStreamTransport(pika.compat.AbstractBase):
     """
 
     @abc.abstractmethod
-    def drop(self):
-        """Close connection abruptly and synchronously without flushing pending
-        data and without invoking the corresponding protocol's
-        `connection_lost()` method.
-
-        NOTE: This differs from asyncio transport's `abort()` and `close()`
-        methods which close the stream asynchronously and eventually call the
-        protocol's `connection_lost()` method. The abrupt synchronous behavior
-        of the `drop()` method suits Pika's current connection-management logic
-        better.
+    def abort(self):
+        """Close connection abruptly without waiting for pending I/O to
+        complete. Will invoke the corresponding protocol's `connection_lost()`
+        method asynchronously (not in context of the abort() call).
 
         :raises Exception: Exception-based exception on error
         """
