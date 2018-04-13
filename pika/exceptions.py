@@ -71,6 +71,15 @@ class NoFreeChannels(AMQPConnectionError):
         return 'The connection has run out of free channels'
 
 
+class ConnectionWrongStateError(AMQPConnectionError):
+    def __repr__(self):
+        if self.args:
+            return super(ConnectionWrongState, self).__repr__()
+        else:
+            return (
+                'The connection is in wrong state for the requested operation.')
+
+
 class ConnectionClosed(AMQPConnectionError):
 
     # TODO: grep for proper usage (args passed)

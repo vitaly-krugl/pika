@@ -53,9 +53,6 @@ class BaseConnection(connection.Connection):
 
         self._got_eof = False  # transport indicated EOF (connection reset)
 
-        # TODO: get rid of _transport_mgr
-        # self._transport_mgr = None
-
         super(BaseConnection,
               self).__init__(parameters, on_open_callback,
                              on_open_error_callback, on_close_callback)
@@ -179,6 +176,14 @@ class BaseConnection(connection.Connection):
             native_loop=self._async.get_native_ioloop(),
             on_done=self._on_connection_workflow_done)
 
+    def _adapter_abort_connection_workflow(self):
+        """Asynchronously abort connection workflow. Upon completion, call
+        `Connection._on_stack_connection_workflow_failed()` with None as the
+        argument.
+
+        """
+        self._connection_workflow.abort()
+
     def _on_connection_workflow_done(self, conn_or_exc):
         """`AMQPConnectionWorkflow` completion callback.
 
@@ -194,9 +199,18 @@ class BaseConnection(connection.Connection):
 
         # Notify protocol of failure
         if isinstance(conn_or_exc, Exception):
-            LOGGER.error('Full-stack connection workflow failed: %r',
-                         conn_or_exc)
             self._transport = None
+            if isinstance(conn_or_exc,
+                          connection_workflow.AMQPConnectionWorkflowAborted):
+                LOGGER.info('Full-stack connection workflow aborted: %r',
+                            conn_or_exc)
+                # So that _on_stack_connection_workflow_failed() will know it's
+                # not a failure
+                conn_or_exc = None
+            else:
+                LOGGER.error('Full-stack connection workflow failed: %r',
+                             conn_or_exc)
+
             self._on_stack_connection_workflow_failed(conn_or_exc)
         else:
             # NOTE: On success, the stack will be up already, so there is no
@@ -210,6 +224,7 @@ class BaseConnection(connection.Connection):
 
         """
         # TODO: deal with connection workflow and tranport abort instead of drop.
+        # TODO: get rid of _transport_mgr
         if self._transport_mgr is not None:
             self._transport_mgr.close()
             self._transport_mgr = None
