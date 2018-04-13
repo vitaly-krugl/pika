@@ -37,23 +37,6 @@ PRODUCT = "Pika Python Client Library"
 LOGGER = logging.getLogger(__name__)
 
 
-class InternalCloseReasons(object):
-    """Internal reason codes passed to the user's on_close_callback when the
-    connection is terminated abruptly, without reply code/text from the broker.
-
-    AMQP 0.9.1 specification cites IETF RFC 821 for reply codes. To avoid
-    conflict, the `InternalCloseReasons` namespace uses negative integers. These
-    are invalid for sending to the broker.
-    """
-    SOCKET_ERROR = -1
-    BLOCKED_CONNECTION_TIMEOUT = -2
-    AMQP_VERSION_MISMATCH = -3
-    AUTH_MISMATCH = -4
-    UNEXPECTED_FRAME_TYPE = -5
-    UNEXPECTED_ERROR = -6  # Unanticipated error
-
-
-
 class Parameters(object):  # pylint: disable=R0902
     """Base connection parameters class definition
 
@@ -598,9 +581,9 @@ class ConnectionParameters(Parameters):
             connection to remain blocked (triggered by Connection.Blocked from
             broker); if the timeout expires before connection becomes unblocked,
             the connection will be torn down, triggering the adapter-specific
-            mechanism for informing client app about the closed connection (
-            e.g., on_close_callback or ConnectionClosed exception) with
-            `reason_code` of `InternalCloseReasons.BLOCKED_CONNECTION_TIMEOUT`.
+            mechanism for informing client app about the closed connection:
+            passing `ConnectionBlockedTimeout` exception to on_close_callback
+            in asynchronous adapters or raising it in `BlockingConnection`.
         :type blocked_connection_timeout: None, int, float
         :param client_properties: None or dict of client properties used to
             override the fields in the default client properties reported to
@@ -758,8 +741,6 @@ class URLParameters(Parameters):
         # incorrect path='/%2f?socket_timeout=1'
         if url[0:4].lower() == 'amqp':
             url = 'http' + url[4:]
-
-        # TODO Is support for the alternative http(s) schemes intentional?
 
         parts = pika.compat.urlparse(url)
 
@@ -1005,29 +986,26 @@ class Connection(pika.compat.AbstractBase):
         Available Parameters classes are the ConnectionParameters class and
         URLParameters class.
 
-        :param pika.connection.Parameters parameters: Connection parameters
+        :param pika.connection.Parameters parameters: Read-only connection
+            parameters.
         :param method on_open_callback: Called when the connection is opened:
             on_open_callback(connection)
         :param method on_open_error_callback: Called if the connection can't
             be established: on_open_error_callback(Connection, BaseException)
         :param method on_close_callback: Called when the connection is closed:
-            `on_close_callback(connection, reason_code, reason_text)`, where
-            `reason_code` is either an IETF RFC 821 reply code for AMQP-level
-             closures or a value from `pika.connection.InternalCloseReasons` for
-             internal causes, such as socket errors.
+            `on_close_callback(connection, exception)`, where `exception` is
+            either an instance of `exceptions.ConnectionClosed` (if
+            fully-open connection was closed by user or broker) or exception of
+            another type that describes the cause of connection closure/failure.
 
         """
         self.connection_state = self.CONNECTION_CLOSED
 
         # Determines whether we invoke the on_open_error_callback or
-        # on_close_callback. Otherwise, we lose track when state transitions to
-        # CONNECTION_CLOSING as the result of Connection.close() call during
+        # on_close_callback. So that we don't lose track when state transitions
+        # to CONNECTION_CLOSING as the result of Connection.close() call during
         # opening.
-
         self._opening = True
-
-        # TODO: get rid of self.closing
-        # TODO: get rid of InternalCloseReasons?
 
         # Value to pass to on_open_error_callback or on_close_callback when
         # connection fails to be established or becomes closed
@@ -1061,13 +1039,9 @@ class Connection(pika.compat.AbstractBase):
         self.server_properties = None
         self._body_max_length = None
         self.known_hosts = None
-        self.closing = None
         self._frame_buffer = None
         self._channels = None
         self._backpressure_multiplier = None
-        # TODO: get rid of remaining_connection_attempts since they are now
-        #       handled by AMQPConnectionWorkflow.
-        self.remaining_connection_attempts = None
 
         self._init_connection_state()
 
@@ -1102,13 +1076,13 @@ class Connection(pika.compat.AbstractBase):
 
     def add_on_close_callback(self, callback):
         """Add a callback notification when the connection has closed. The
-        callback will be passed the connection, the reason_code (int) and the
-        reply_text (str), where reason_code is either an IETF RFC 821 reply code
-        for AMQP-level closures or a value from
-        `pika.connection.InternalCloseReasons` for internal causes, such as
-        socket errors.
+        callback will be passed the connection and an exception instance. The
+        exception will either be an instance of `exceptions.ConnectionClosed` if
+        a fully-open connection was closed by user or broker or exception of
+        another type that describes the cause of connection closure/failure.
 
-        :param method callback: Callback to call on close
+        :param method callback: Callback to call on close, having the signature:
+            callback(pika.connection.Connection, exception)
 
         """
         if not callable(callback):
@@ -1225,8 +1199,7 @@ class Connection(pika.compat.AbstractBase):
 
         """
         if not self.is_open:
-            # TODO if state is OPENING, then ConnectionClosed might be wrong
-            raise exceptions.ConnectionClosed(
+            raise exceptions.ConnectionWrongStateError(
                 'Channel allocation requires an open connection: %s' % self)
 
         if not channel_number:
@@ -1253,8 +1226,8 @@ class Connection(pika.compat.AbstractBase):
 
         # NOTE The connection is either in opening or open state
 
-        # TODO: need a test for closing connection while it's opening, no trans-
-        #       port yet, etc.
+        # TODO: need a test for closing connection while it's opening - i.e., no
+        #       transport yet, etc.
 
         # Initiate graceful closing of channels that are OPEN or OPENING
         if self._channels:
@@ -1263,20 +1236,17 @@ class Connection(pika.compat.AbstractBase):
         # Set our connection state
         self._set_connection_state(self.CONNECTION_CLOSING)
         LOGGER.info("Closing connection (%s): %s", reply_code, reply_text)
-        self.closing = reply_code, reply_text
 
         if self._opening:
             # It was opening, but not fully open yet, so we won't attempt
-            # graceful Connection.Close.
-            LOGGER.info('Connection.close is bypassing graceful AMQP close '
-                         'since AMQP was in opening state.')
+            # graceful AMQP Connection.Close.
+            LOGGER.info('Connection.close() is bypassing graceful AMQP close '
+                         'since AMQP was still in opening state.')
 
-            # TODO: need something else to make sure the connection workflow
-            #       is aborted and won't retry.
-            self._terminate_stream(
-                exceptions.ConnectionOpenAborted(
-                    'User requested connection close() before connection finished '
-                    'opening.'))
+            self._error = exceptions.ConnectionOpenAborted(
+                'User requested connection close() before connection finished '
+                'opening.')
+            self._adapter_abort_connection_workflow()
 
         else:
             self._error = exceptions.ConnectionClosedByClient(reply_code,
@@ -1396,11 +1366,20 @@ class Connection(pika.compat.AbstractBase):
     @abc.abstractmethod
     def _adapter_connect_stack(self):
         """Subclasses should override to initiate full-stack connection
-        asynchronously. Upon failed completion, they must invoke
-        `Connection._on_stack_connection_workflow_failed()`.
+        workflow asynchronously. Upon failed or aborted completion, they must
+        invoke `Connection._on_stack_connection_workflow_failed()`.
 
         NOTE: On success, the stack will be up already, so there is no
               corresponding callback.
+
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def _adapter_abort_connection_workflow(self):
+        """Asynchronously abort connection workflow. Upon completion, call
+        `Connection._on_stack_connection_workflow_failed()` with None as the
+        argument.
 
         """
         raise NotImplementedError
@@ -1652,9 +1631,6 @@ class Connection(pika.compat.AbstractBase):
         # Dict of open channels
         self._channels = dict()
 
-        # Remaining connection attempts
-        self.remaining_connection_attempts = self.params.connection_attempts
-
         # Data used for Heartbeat checking and back-pressure detection
         self.bytes_sent = 0
         self.bytes_received = 0
@@ -1665,8 +1641,8 @@ class Connection(pika.compat.AbstractBase):
         # Default back-pressure multiplier value
         self._backpressure_multiplier = 10
 
-        # When closing, hold reason why
-        self.closing = 0, 'Not specified'
+        # When closing, holds reason why
+        self._error = None
 
         # Our starting point once connected, first frame received
         self._add_connection_start_callback()
@@ -1754,7 +1730,7 @@ class Connection(pika.compat.AbstractBase):
 
     def _on_close_ready(self):
         """Called when the Connection is in a state that it can close after
-        a close has been requested. This happens, for example, when all of the
+        a close has been requested by client. This happens after all of the
         channels are closed that were open when the close request was made.
 
         """
@@ -1762,7 +1738,9 @@ class Connection(pika.compat.AbstractBase):
             LOGGER.warning('_on_close_ready invoked when already closed')
             return
 
-        self._send_connection_close(self.closing[0], self.closing[1])
+        # NOTE: Assuming self._error is instance of exceptions.ConnectionClosed
+        self._send_connection_close(self._error.reply_code,
+                                    self._error.reply_text)
 
     def _on_connected(self):
         """Invoked when the socket is connected and it's time to start speaking
@@ -1828,9 +1806,6 @@ class Connection(pika.compat.AbstractBase):
 
         """
         LOGGER.debug('_on_connection_close: frame=%s', method_frame)
-
-        self.closing = (method_frame.method.reply_code,
-                        method_frame.method.reply_text)
 
         self._terminate_stream(
             exceptions.ConnectionClosedByBroker(
@@ -1904,12 +1879,15 @@ class Connection(pika.compat.AbstractBase):
         """Handle failure of self-initiated stack bring-up. Called by adapter
         layer when the full-stack connection workflow fails.
 
-        :param Exception error: exception instance describing the reason for
-            failure.
+        :param Exception | None error: exception instance describing the reason
+            for failure or None if the connection workflow was aborted.
         """
-        LOGGER.error('Self-initiated stack bring-up failed: %r', error)
+        if error is None:
+            LOGGER.info('Self-initiated stack bring-up aborted.')
+        else:
+            LOGGER.error('Self-initiated stack bring-up failed: %r', error)
+            self._error = error
 
-        self._error = error
         self._on_stack_terminated()
 
     @staticmethod
@@ -2067,12 +2045,8 @@ class Connection(pika.compat.AbstractBase):
         self._remove_heartbeat()
 
         # Remove connection management callbacks
-        # TODO This call was moved here verbatim from legacy code and the
-        # following doesn't seem to be right: `Connection.Open` here is
-        # unexpected, we don't appear to ever register it, and the broker
-        # shouldn't be sending `Connection.Open` to us, anyway.
-        self._remove_callbacks(0, [spec.Connection.Close, spec.Connection.Start,
-                                   spec.Connection.Open])
+        self._remove_callbacks(0,
+                               [spec.Connection.Close, spec.Connection.Start])
 
         if self.params.blocked_connection_timeout is not None:
             self._remove_callbacks(0, [spec.Connection.Blocked,
@@ -2279,7 +2253,7 @@ class Connection(pika.compat.AbstractBase):
         """
         if self.is_closed:
             LOGGER.error('Attempted to send frame when closed')
-            raise exceptions.ConnectionClosed
+            raise exceptions.ConnectionWrongStateError
 
         marshaled_frame = frame_value.marshal()
         self.bytes_sent += len(marshaled_frame)

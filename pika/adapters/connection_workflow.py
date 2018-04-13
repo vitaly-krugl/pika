@@ -111,7 +111,8 @@ class AMQPConnectionWorkflowError(AMQPConnectorException):
             self.exceptions[-1])
 
 
-# TODO: abort the transport instead of closing Connection in all cases.
+# TODO: Abort the transport instead of closing AMQP Connection in all cases.
+#       Look into connection callback (de)registration logic.
 
 class AMQPConnector(object):
     """Performs a single TCP/[SSL]/AMQP connection workflow.

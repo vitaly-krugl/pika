@@ -515,6 +515,7 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         self.connection.connection_state = self.connection.CONNECTION_INIT
         self.connection._adapter_connect = mock.Mock(return_value='error')
         self.connection.callbacks = mock.Mock(spec=self.connection.callbacks)
+        # TODO: remaining_connection_attempts is gone, now part of conn workflow
         self.connection.remaining_connection_attempts = 2
         self.connection.params.retry_delay = 555
         self.connection.params.connection_attempts = 99
@@ -524,6 +525,7 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         self.connection._on_stream_connection_done(Exception())
         self.connection.add_timeout.assert_called_once_with(
             555, self.connection._on_connect_timer)
+        # TODO: remaining_connection_attempts is gone, now part of conn workflow
         self.assertEqual(1, self.connection.remaining_connection_attempts)
         self.assertFalse(self.connection.callbacks.process.called)
         self.assertEqual(self.connection.CONNECTION_INIT,
@@ -534,6 +536,7 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         error = Exception()
         self.connection._on_stream_connection_done(error)
         self.assertFalse(self.connection.add_timeout.called)
+        # TODO: remaining_connection_attempts is gone, now part of conn workflow
         self.assertEqual(99, self.connection.remaining_connection_attempts)
         self.assertEqual(self.connection.callbacks.process.call_count, 2)
         conn_error = exceptions.AMQPConnectionError(
@@ -697,7 +700,8 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         """make sure _on_connection_close_ok terminates connection"""
         method_frame = mock.Mock()
         method_frame.method = mock.Mock(spec=spec.Connection.CloseOk)
-        self.connection.closing = (1, 'bye')
+        # TODO: no more Connection.closing
+        #self.connection.closing = (1, 'bye')
         self.connection._on_terminate = mock.Mock()
 
         self.connection._on_connection_close_ok(method_frame)

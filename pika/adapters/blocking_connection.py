@@ -308,11 +308,9 @@ class BlockingConnection(object):
     channels will not dispatch user callbacks. SOLUTION: To break this potential
     deadlock, applications may configure the `blocked_connection_timeout`
     connection parameter when instantiating `BlockingConnection`. Upon blocked
-    connection timeout, this adapter will raise ConnectionClosed exception with
-    first exception arg of
-    `pika.connection.InternalCloseReasons.BLOCKED_CONNECTION_TIMEOUT`. See
-    `pika.connection.ConnectionParameters` documentation to learn more about
-    `blocked_connection_timeout` configuration.
+    connection timeout, this adapter will raise ConnectionBlockedTimeout
+    exception`. See `pika.connection.ConnectionParameters` documentation to
+    learn more about the `blocked_connection_timeout` configuration.
 
     """
     # Connection-opened callback args
@@ -325,7 +323,7 @@ class BlockingConnection(object):
 
     # Connection-closing callback args
     _OnClosedArgs = namedtuple('BlockingConnection__OnClosedArgs',
-                               'connection reason_code reason_text')
+                               'connection error')
 
     # Channel-opened callback args
     _OnChannelOpenedArgs = namedtuple(
@@ -364,9 +362,8 @@ class BlockingConnection(object):
         # Receives on_close_callback args from Connection
         self._closed_result = _CallbackResult(self._OnClosedArgs)
 
-        # Set to True when when user calls close() on the connection
-        # NOTE: this is a workaround to detect socket error because
-        # on_close_callback passes reason_code=0 when called due to socket error
+        # Set to True when when user calls close() on the connection so that
+        # we won't raise an exception upon connection-closed callback from impl
         self._user_initiated_close = False
 
         impl_class = _impl_class or SelectConnection
@@ -421,11 +418,10 @@ class BlockingConnection(object):
                                self._open_error_result.is_ready)
 
         if self._open_error_result.ready:
+            # TODO This appears to be duplicate logic of error-handling in
+            #      `_flush_output()`. Can probably safely remove this block.
             try:
-                exception_or_message = self._open_error_result.value.error
-                if isinstance(exception_or_message, Exception):
-                    raise exception_or_message
-                raise exceptions.AMQPConnectionError(exception_or_message)
+                raise self._open_error_result.value.error
             finally:
                 self._cleanup()
 
@@ -442,9 +438,11 @@ class BlockingConnection(object):
         :param waiters: sequence of zero or more callables taking no args and
                         returning true when it's time to stop processing.
                         Their results are OR'ed together.
+        :raises: exceptions passed by impl if opening of connection fails or
+            connection closes.
         """
         if self.is_closed:
-            raise exceptions.ConnectionClosed()
+            raise exceptions.ConnectionWrongStateError()
 
         # Conditions for terminating the processing loop:
         #   connection closed
@@ -455,10 +453,10 @@ class BlockingConnection(object):
         is_done = (lambda:
                    self._closed_result.ready or
                    (self._impl._transport and
-                    self._impl._adapter_get_write_buffer_size()== 0 and
+                    self._impl._adapter_get_write_buffer_size() == 0 and
                     (not waiters or any(ready() for ready in waiters))))
 
-        # Process I/O until our completion condition is satisified
+        # Process I/O until our completion condition is satisfied
         while not is_done():
             self._impl.ioloop.poll()
             self._impl.ioloop.process_timeouts()
@@ -467,21 +465,15 @@ class BlockingConnection(object):
             try:
                 if not self._user_initiated_close:
                     if self._open_error_result.ready:
-                        maybe_exception = self._open_error_result.value.error
                         LOGGER.error('Connection open failed - %r',
-                                     maybe_exception)
-                        if isinstance(maybe_exception, Exception):
-                            raise maybe_exception
-                        else:
-                            raise exceptions.ConnectionClosed(maybe_exception)
+                                     self._open_error_result.value.error)
+                        raise self._open_error_result.value.error
                     else:
-                        result = self._closed_result.value
-                        LOGGER.error('Connection close detected; result=%r',
-                                     result)
-                        raise exceptions.ConnectionClosed(result.reason_code,
-                                                          result.reason_text)
+                        LOGGER.error('Connection close detected: %r',
+                                     self._closed_result.value)
+                        raise self._closed_result.value.error
                 else:
-                    LOGGER.info('Connection closed; result=%r',
+                    LOGGER.info('User-initiated close: result=%r',
                                 self._closed_result.value)
             finally:
                 self._cleanup()
