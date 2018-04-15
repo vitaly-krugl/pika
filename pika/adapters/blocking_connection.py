@@ -1799,14 +1799,14 @@ class BlockingChannel(object):
         pika callback, because dispatching `basic_consume` callbacks from this
         context would constitute recursion.
 
-        :raises pika.exceptions.RecursionError: if called from the scope of a
+        :raises pika.exceptions.ReentrancyError: if called from the scope of a
             `BlockingConnection` or `BlockingChannel` callback
         :raises ChannelClosed: when this channel is closed by broker.
         """
         # Check if called from the scope of an event dispatch callback
         with self.connection._acquire_event_dispatch() as dispatch_allowed:
             if not dispatch_allowed:
-                raise exceptions.RecursionError(
+                raise exceptions.ReentrancyError(
                     'start_consuming may not be called from the scope of '
                     'another BlockingConnection or BlockingChannel callback')
 

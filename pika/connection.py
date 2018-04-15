@@ -978,7 +978,8 @@ class Connection(pika.compat.AbstractBase):
                  parameters=None,
                  on_open_callback=None,
                  on_open_error_callback=None,
-                 on_close_callback=None):
+                 on_close_callback=None,
+                 internal_connection_workflow=True):
         """Connection initialization expects an object that has implemented the
          Parameters class and a callback function to notify when we have
          successfully connected to the AMQP Broker.
@@ -997,6 +998,9 @@ class Connection(pika.compat.AbstractBase):
             either an instance of `exceptions.ConnectionClosed` (if
             fully-open connection was closed by user or broker) or exception of
             another type that describes the cause of connection closure/failure.
+        :param bool internal_connection_workflow: True for autonomous connection
+            establishment which is default; False for externally-managed
+            connection workflow via the `create_connection()` factory.
 
         """
         self.connection_state = self.CONNECTION_CLOSED
@@ -1030,6 +1034,8 @@ class Connection(pika.compat.AbstractBase):
         else:
             self.params = ConnectionParameters()
 
+        self._internal_connection_workflow = internal_connection_workflow
+
         # Define our callback dictionary
         self.callbacks = pika_callback.CallbackManager()
 
@@ -1060,7 +1066,74 @@ class Connection(pika.compat.AbstractBase):
         if on_close_callback:
             self.add_on_close_callback(on_close_callback)
 
-        self.connect()
+        self._set_connection_state(self.CONNECTION_INIT)
+
+        if self._internal_connection_workflow:
+            # Kick off full-stack connection establishment. It will complete
+            # asynchronously.
+            self._adapter_connect_stack()
+        else:
+            # Externally-managed connection workflow will proceed asynchronously
+            # using adapter-specific mechanism
+            LOGGER.debug('Using external connection workflow.')
+
+    def _init_connection_state(self):
+        """Initialize or reset all of the internal state variables for a given
+        connection. On disconnect or reconnect all of the state needs to
+        be wiped.
+
+        """
+        # TODO: probably don't need the state recovery logic since we don't
+        #       test re-connection sufficiently (if at all), and users should
+        #       just create a new instance of Connection when needed.
+        # So, just merge the pertinent logic into the constructor.
+
+        # Connection state
+        self._set_connection_state(self.CONNECTION_CLOSED)
+
+        # Negotiated server properties
+        self.server_properties = None
+
+        # Inbound buffer for decoding frames
+        self._frame_buffer = bytes()
+
+        # Dict of open channels
+        self._channels = dict()
+
+        # Data used for Heartbeat checking and back-pressure detection
+        self.bytes_sent = 0
+        self.bytes_received = 0
+        self.frames_sent = 0
+        self.frames_received = 0
+        self._heartbeat_checker = None
+
+        # Default back-pressure multiplier value
+        self._backpressure_multiplier = 10
+
+        # When closing, holds reason why
+        self._error = None
+
+        # Our starting point once connected, first frame received
+        self._add_connection_start_callback()
+
+        # Add a callback handler for the Broker telling us to disconnect.
+        # NOTE: As of RabbitMQ 3.6.0, RabbitMQ broker may send Connection.Close
+        # to signal error during connection setup (and wait a longish time
+        # before closing the TCP/IP stream). Earlier RabbitMQ versions
+        # simply closed the TCP/IP stream.
+        self.callbacks.add(0, spec.Connection.Close, self._on_connection_close)
+
+        if self.params.blocked_connection_timeout is not None:
+            if self._blocked_conn_timer is not None:
+                # Blocked connection timer was active when teardown was
+                # initiated
+                self.remove_timeout(self._blocked_conn_timer)
+                self._blocked_conn_timer = None
+
+            self.add_on_connection_blocked_callback(
+                self._on_connection_blocked)
+            self.add_on_connection_unblocked_callback(
+                self._on_connection_unblocked)
 
     def add_backpressure_callback(self, callback):
         """Call method "callback" when pika believes backpressure is being
@@ -1221,13 +1294,16 @@ class Connection(pika.compat.AbstractBase):
 
         """
         if self.is_closing or self.is_closed:
-            LOGGER.warning('Suppressing close request on %s', self)
+            LOGGER.warning('Suppressing close(%s, %r) request on %s because it '
+                           'was called while connection is in state=%s.',
+                           reply_code, reply_text, self,
+                           self._STATE_NAMES[self.connection_state])
             return
 
         # NOTE The connection is either in opening or open state
 
         # TODO: need a test for closing connection while it's opening - i.e., no
-        #       transport yet, etc.
+        #       transport yet, have transport but AMQP not fully up.
 
         # Initiate graceful closing of channels that are OPEN or OPENING
         if self._channels:
@@ -1235,17 +1311,20 @@ class Connection(pika.compat.AbstractBase):
 
         # Set our connection state
         self._set_connection_state(self.CONNECTION_CLOSING)
-        LOGGER.info("Closing connection (%s): %s", reply_code, reply_text)
+        LOGGER.info("Closing connection (%s): %r", reply_code, reply_text)
 
         if self._opening:
             # It was opening, but not fully open yet, so we won't attempt
             # graceful AMQP Connection.Close.
-            LOGGER.info('Connection.close() is bypassing graceful AMQP close '
-                         'since AMQP was still in opening state.')
+            LOGGER.info('Connection.close() is terminating stream and '
+                        'bypassing graceful AMQP close, since AMQP is still '
+                        'opening.')
 
             self._error = exceptions.ConnectionOpenAborted(
-                'User requested connection close() before connection finished '
-                'opening.')
+                'Connection.close() called before connection '
+                'finished opening: ({}): {!r}'.format(
+                    reply_code,
+                    reply_text))
             self._adapter_abort_connection_workflow()
 
         else:
@@ -1263,24 +1342,6 @@ class Connection(pika.compat.AbstractBase):
                 LOGGER.info(
                     'Connection.close is waiting for %d channels to close: %s',
                     len(self._channels), self)
-
-    def connect(self):
-        """Invoke if trying to reconnect to a RabbitMQ server. Constructing the
-        Connection object should connect on its own.
-
-        TODO: get rid of the public connect() method since Connection is not
-              thoroughly tested for re-connection and it's safer to create a new
-              connection after failure. Sockets don't support re-connect either.
-        """
-        assert self.is_closed, (
-            'connect expected CLOSED state, but got: {}'.format(
-                self._STATE_NAMES[self.connection_state]))
-
-        self._set_connection_state(self.CONNECTION_INIT)
-
-        # Initiate full-stack connection establishment. It will complete
-        # asynchronously.
-        self._adapter_connect_stack()
 
     def set_backpressure_multiplier(self, value=10):
         """Alter the backpressure multiplier value. We set this to 10 by default.
@@ -1381,13 +1442,15 @@ class Connection(pika.compat.AbstractBase):
         `Connection._on_stack_connection_workflow_failed()` with None as the
         argument.
 
+        Assumption: may be called only while connection is opening.
+
         """
         raise NotImplementedError
 
     @abc.abstractmethod
     def _adapter_disconnect(self):
-        """Subclasses should override this to cause the underlying transport
-        (socket) to close.
+        """Asynchronously bring down the streaming transport layer and invoke
+        `Connection._on_stack_terminated()` asynchronously when complete.
 
         :raises: NotImplementedError
 
@@ -1609,63 +1672,6 @@ class Connection(pika.compat.AbstractBase):
         """
         return self.callbacks.pending(value.channel_number, value.method)
 
-    def _init_connection_state(self):
-        """Initialize or reset all of the internal state variables for a given
-        connection. On disconnect or reconnect all of the state needs to
-        be wiped.
-
-        """
-        # TODO: probably don't need the state recovery logic since we don't
-        #       test re-connection sufficiently (if at all), and users should
-        #       just create a new instance of Connection when needed.
-
-        # Connection state
-        self._set_connection_state(self.CONNECTION_CLOSED)
-
-        # Negotiated server properties
-        self.server_properties = None
-
-        # Inbound buffer for decoding frames
-        self._frame_buffer = bytes()
-
-        # Dict of open channels
-        self._channels = dict()
-
-        # Data used for Heartbeat checking and back-pressure detection
-        self.bytes_sent = 0
-        self.bytes_received = 0
-        self.frames_sent = 0
-        self.frames_received = 0
-        self._heartbeat_checker = None
-
-        # Default back-pressure multiplier value
-        self._backpressure_multiplier = 10
-
-        # When closing, holds reason why
-        self._error = None
-
-        # Our starting point once connected, first frame received
-        self._add_connection_start_callback()
-
-        # Add a callback handler for the Broker telling us to disconnect.
-        # NOTE: As of RabbitMQ 3.6.0, RabbitMQ broker may send Connection.Close
-        # to signal error during connection setup (and wait a longish time
-        # before closing the TCP/IP stream). Earlier RabbitMQ versions
-        # simply closed the TCP/IP stream.
-        self.callbacks.add(0, spec.Connection.Close, self._on_connection_close)
-
-        if self.params.blocked_connection_timeout is not None:
-            if self._blocked_conn_timer is not None:
-                # Blocked connection timer was active when teardown was
-                # initiated
-                self.remove_timeout(self._blocked_conn_timer)
-                self._blocked_conn_timer = None
-
-            self.add_on_connection_blocked_callback(
-                self._on_connection_blocked)
-            self.add_on_connection_unblocked_callback(
-                self._on_connection_unblocked)
-
     def _is_method_frame(self, value):
         """Returns true if the frame is a method frame.
 
@@ -1820,8 +1826,7 @@ class Connection(pika.compat.AbstractBase):
         """
         LOGGER.debug('_on_connection_close_ok: frame=%s', method_frame)
 
-        # TODO: modify _terminate_stream() to support no self._error update
-        self._terminate_stream()
+        self._terminate_stream(None)
 
     def _default_on_connection_error(self, _connection_unused,
                                      error_message=None):
@@ -1840,10 +1845,6 @@ class Connection(pika.compat.AbstractBase):
         called the Connection.Open on the server and it has replied with
         Connection.Ok.
         """
-        # TODO _on_connection_open_ok - what if user started closing it already?
-        # It shouldn't transition to OPEN if in closing state. Just log and skip
-        # the rest.
-
         self._opening = False
 
         self.known_hosts = method_frame.method.known_hosts
@@ -1886,9 +1887,14 @@ class Connection(pika.compat.AbstractBase):
             LOGGER.info('Self-initiated stack bring-up aborted.')
         else:
             LOGGER.error('Self-initiated stack bring-up failed: %r', error)
-            self._error = error
 
-        self._on_stack_terminated()
+        if not self.is_closed:
+            self._on_stack_terminated(error)
+        else:
+            # This may happen when AMQP layer bring up was started but did not
+            # complete
+            LOGGER.debug('_on_stack_connection_workflow_failed(): '
+                         'suppressing - connection already closed.')
 
     @staticmethod
     def _negotiate_integer_value(client_value, server_value):
@@ -2006,20 +2012,28 @@ class Connection(pika.compat.AbstractBase):
             self._process_frame(frame_value)
 
     def _terminate_stream(self, error):
-        """Initiate termination of the stream (TCP) connection.
+        """Deactivate heartbeat instance if activated already, and initiate
+        termination of the stream (TCP) connection asynchronously.
 
         When connection terminates, the appropriate user callback will be
         invoked with the given error: "on open error" or "on connection closed".
 
-        :param Exception error: exception instance describing the cause of
-            of termination. It will be passed to the
+        :param Exception | None error: exception instance describing the reason
+            for termination; None for normal closing, such as upon receipt of
+            Connection.CloseOk.
 
         """
-        assert isinstance(error, Exception), \
-            'error arg is not instance of Exception: {!r}.'.format(error)
+        assert isinstance(error, (None, Exception)), \
+            'error arg is neither None nor instance of Exception: {!r}.'.format(
+                error)
 
-        # Save the exception for user callback once the stream closes
-        self._error = error
+        if error is not None:
+            # Save the exception for user callback once the stream closes
+            self._error = error
+        else:
+            assert self._error is not None, (
+                '_terminate_stream() expected self._error to be set when '
+                'passed None error arg.')
 
         # So it won't mess with the stack
         self._remove_heartbeat()
@@ -2027,19 +2041,30 @@ class Connection(pika.compat.AbstractBase):
         # Begin disconnection of stream or termination of connection workflow
         self._adapter_disconnect()
 
-    def _on_stack_terminated(self):
+    def _on_stack_terminated(self, error):
         """Handle termination of stack (including TCP layer) or failure to
         establish the stack. Notify registered ON_CONNECTION_ERROR or
         ON_CONNECTION_CLOSED callbacks, depending on whether the connection
         was opening or open.
 
-        The exception describing the condition is expected to be in
-        `self._error`.
+        :param Exception | None error: None means that the transport was aborted
+            internally and exception in `self._error` represents the cause.
+            Otherwise it's an exception object that describes the unexpected
+            loss of connection.
 
         """
-        LOGGER.info(
-            'AMQP stack is terminated or failed to connect: %s:%i - %r',
-            self.params.host, self.params.port, self._error)
+        LOGGER.info('AMQP stack terminated, failed to connect, or aborted: '
+                    'error-arg=%r; pending-error=%r', error, self._error)
+
+        if error is not None:
+            if self._error is not None:
+                LOGGER.debug('_on_stack_terminated(): overriding '
+                             'pending-error=%r with %r', self._error, error)
+            self._error = error
+        else:
+            assert self._error is not None, (
+                '_on_stack_terminated() expected self._error to be populated '
+                'with reason for terminating stack.')
 
         # Stop the heartbeat checker if it exists
         self._remove_heartbeat()
@@ -2052,63 +2077,29 @@ class Connection(pika.compat.AbstractBase):
             self._remove_callbacks(0, [spec.Connection.Blocked,
                                        spec.Connection.Unblocked])
 
-        # Close the stream
-        self._adapter_disconnect()
-
-        # Determine whether this was an error during connection setup
-        connection_error = None
-
-        # TODO: make use of self._error
-        # TODO: the if below only makes sense if self._error is a StreamLostError
-
-        if self.connection_state == self.CONNECTION_INIT:
-            LOGGER.error('Failed to connect to server')
-            connection_error = exceptions.AMQPConnectionError(reason_code,
-                                                              reason_text)
-        elif self.connection_state == self.CONNECTION_PROTOCOL:
-            LOGGER.error('Incompatible Protocol Versions')
-            connection_error = exceptions.IncompatibleProtocolError(reason_code,
-                                                                    reason_text)
-        elif self.connection_state == self.CONNECTION_START:
-            LOGGER.error('Connection closed while authenticating indicating a '
-                         'probable authentication error')
-            connection_error = exceptions.ProbableAuthenticationError(
-                reason_code,
-                reason_text)
-        elif self.connection_state == self.CONNECTION_TUNE:
-            LOGGER.error('Connection closed while tuning the connection '
-                         'indicating a probable permission error when '
-                         'accessing a virtual host')
-            connection_error = exceptions.ProbableAccessDeniedError(reason_code,
-                                                                    reason_text)
-        elif self.connection_state not in [self.CONNECTION_OPEN,
-                                           self.CONNECTION_CLOSED,
-                                           self.CONNECTION_CLOSING]:
-            LOGGER.warning('Unexpected connection state on disconnect: %i',
-                           self.connection_state)
-
         # Transition to closed state
         self._set_connection_state(self.CONNECTION_CLOSED)
 
-        # Inform our channel proxies
+        # Inform our channel proxies, if any are still around
         for channel in dictkeys(self._channels):
             if channel not in self._channels:
                 continue
             # pylint: disable=W0212
-            self._channels[channel]._on_close_meta(reason_code, reason_text)
-
-        # TODO: invoke appropriate callback based on self._opening
+            self._channels[channel]._on_close_meta(
+                pika.channel.ClientChannelErrors.CONNECTION_CLOSED,
+                repr(self._error))
 
         # Inform interested parties
-        if connection_error is not None:
-            LOGGER.error('Connection setup failed due to %r', connection_error)
+        if self._opening:
+            LOGGER.info('Connection setup terminated due to %r', self._error)
             self.callbacks.process(0,
                                    self.ON_CONNECTION_ERROR,
                                    self, self,
-                                   connection_error)
-
-        self.callbacks.process(0, self.ON_CONNECTION_CLOSED, self, self,
-                               reason_code, reason_text)
+                                   self._error)
+        else:
+            LOGGER.info('Stack terminated due to %r', self._error)
+            self.callbacks.process(0, self.ON_CONNECTION_CLOSED, self, self,
+                                   self._error)
 
         # Reset connection properties
         self._init_connection_state()

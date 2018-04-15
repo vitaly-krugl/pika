@@ -29,8 +29,9 @@ class ClientChannelErrors(object):
     # Our codes will be -1001, -1002, -1003, etc. to avoid collision
     # with `Connection`-defined internal client error codes
     FIRST = -1000
-    OPEN_PENDING = -1001  # channel is not usable yet; wait until it opens
-    CLOSE_PENDING = -1002  # channel is closing
+    CONNECTION_CLOSED = -1001 # Connection closed suddenly
+    OPEN_PENDING = -1002  # channel is not usable yet; wait until it opens
+    CLOSE_PENDING = -1003  # channel is closing
 
 
 class Channel(object):
