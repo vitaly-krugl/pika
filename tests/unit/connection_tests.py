@@ -38,7 +38,10 @@ class ConstructibleConnection(connection.Connection):
     that we can instantiate and test it.
 
     """
-    def _adapter_connect(self):
+    def _adapter_connect_stack(self):
+        raise NotImplementedError
+
+    def _adapter_abort_connection_workflow(self):
         raise NotImplementedError
 
     def _adapter_disconnect(self):
@@ -62,10 +65,12 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         class ChannelTemplate(channel.Channel):
             channel_number = None
 
-        with mock.patch('pika.connection.Connection.connect'):
+        with mock.patch.object(ConstructibleConnection,
+                               '_adapter_connect_stack'):
             self.connection = ConstructibleConnection()
             self.connection._set_connection_state(
                 connection.Connection.CONNECTION_OPEN)
+            self.connection._opened = True
 
         self.channel = mock.Mock(spec=ChannelTemplate)
         self.channel.channel_number = 1
@@ -176,42 +181,44 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         self.assertFalse(on_close_ready.called,
                          '_on_close_ready should not have been called')
 
-    def test_on_terminate_cleans_up(self):
-        """_on_terminate cleans up heartbeat, adapter, and channels"""
+    def test_on_stack_terminated_cleans_up(self):
+        """_on_stack_terminated cleans up heartbeat, adapter, and channels"""
         heartbeat = mock.Mock()
-        self.connection.heartbeat = heartbeat
+        self.connection._heartbeat_checker = heartbeat
         self.connection._adapter_disconnect = mock.Mock()
 
-        self.connection._on_terminate(-1, 'Undefined')
+        original_exc = Exception('something terrible')
+        self.connection._on_stack_terminated(original_exc)
 
         heartbeat.stop.assert_called_once_with()
-        self.connection._adapter_disconnect.assert_called_once_with()
 
-        self.channel._on_close_meta.assert_called_once_with(-1, 'Undefined')
+        self.channel._on_close_meta.assert_called_once_with(
+            pika.channel.ClientChannelErrors.CONNECTION_CLOSED,
+            repr(original_exc))
 
         self.assertTrue(self.connection.is_closed)
 
-    def test_on_terminate_invokes_connection_closed_callback(self):
-        """_on_terminate invokes `Connection.ON_CONNECTION_CLOSED` callbacks"""
+    def test_on_stack_terminated_invokes_connection_closed_callback(self):
+        """_on_stack_terminated invokes `Connection.ON_CONNECTION_CLOSED` callbacks"""
         self.connection.callbacks.process = mock.Mock(
             wraps=self.connection.callbacks.process)
 
         self.connection._adapter_disconnect = mock.Mock()
 
-        self.connection._on_terminate(1, 'error text')
+        self.connection._on_stack_terminated(Exception(1, 'error text'))
 
         self.connection.callbacks.process.assert_called_once_with(
             0, self.connection.ON_CONNECTION_CLOSED, self.connection,
-            self.connection, 1, 'error text')
+            self.connection, mock.ANY)
 
         with self.assertRaises(AssertionError):
             self.connection.callbacks.process.assert_any_call(
                 0, self.connection.ON_CONNECTION_ERROR, self.connection,
                 self.connection, mock.ANY)
 
-    def test_on_terminate_invokes_protocol_on_connection_error_and_closed(
+    def test_on_stack_terminated_invokes_protocol_on_connection_error_and_closed(
             self):
-        """_on_terminate invokes `ON_CONNECTION_ERROR` with \
+        """_on_stack_terminated invokes `ON_CONNECTION_ERROR` with \
         `IncompatibleProtocolError` and `ON_CONNECTION_CLOSED` callbacks"""
         with mock.patch.object(self.connection.callbacks, 'process'):
 
@@ -219,10 +226,12 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
 
             self.connection._set_connection_state(
                 self.connection.CONNECTION_PROTOCOL)
+            self.connection._opened = False
 
-            self.connection._on_terminate(1, 'error text')
+            original_exc = exceptions.StreamLostError(1, 'error text')
+            self.connection._on_stack_terminated(original_exc)
 
-            self.assertEqual(self.connection.callbacks.process.call_count, 2)
+            self.assertEqual(self.connection.callbacks.process.call_count, 1)
 
             self.connection.callbacks.process.assert_any_call(
                 0, self.connection.ON_CONNECTION_ERROR, self.connection,
@@ -231,14 +240,10 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
             conn_exc = self.connection.callbacks.process.call_args_list[0][0][
                 4]
             self.assertIs(type(conn_exc), exceptions.IncompatibleProtocolError)
-            self.assertSequenceEqual(conn_exc.args, [1, 'error text'])
+            self.assertSequenceEqual(conn_exc.args, [repr(original_exc)])
 
-            self.connection.callbacks.process.assert_any_call(
-                0, self.connection.ON_CONNECTION_CLOSED, self.connection,
-                self.connection, 1, 'error text')
-
-    def test_on_terminate_invokes_auth_on_connection_error_and_closed(self):
-        """_on_terminate invokes `ON_CONNECTION_ERROR` with \
+    def test_on_stack_terminated_invokes_auth_on_connection_error_and_closed(self):
+        """_on_stack_terminated invokes `ON_CONNECTION_ERROR` with \
         `ProbableAuthenticationError` and `ON_CONNECTION_CLOSED` callbacks"""
         with mock.patch.object(self.connection.callbacks, 'process'):
 
@@ -246,10 +251,12 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
 
             self.connection._set_connection_state(
                 self.connection.CONNECTION_START)
+            self.connection._opened = False
 
-            self.connection._on_terminate(1, 'error text')
+            original_exc = exceptions.StreamLostError(1, 'error text')
+            self.connection._on_stack_terminated(original_exc)
 
-            self.assertEqual(self.connection.callbacks.process.call_count, 2)
+            self.assertEqual(self.connection.callbacks.process.call_count, 1)
 
             self.connection.callbacks.process.assert_any_call(
                 0, self.connection.ON_CONNECTION_ERROR, self.connection,
@@ -259,15 +266,11 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
                 4]
             self.assertIs(
                 type(conn_exc), exceptions.ProbableAuthenticationError)
-            self.assertSequenceEqual(conn_exc.args, [1, 'error text'])
+            self.assertSequenceEqual(conn_exc.args, [repr(original_exc)])
 
-            self.connection.callbacks.process.assert_any_call(
-                0, self.connection.ON_CONNECTION_CLOSED, self.connection,
-                self.connection, 1, 'error text')
-
-    def test_on_terminate_invokes_access_denied_on_connection_error_and_closed(
+    def test_on_stack_terminated_invokes_access_denied_on_connection_error_and_closed(
             self):
-        """_on_terminate invokes `ON_CONNECTION_ERROR` with \
+        """_on_stack_terminated invokes `ON_CONNECTION_ERROR` with \
         `ProbableAccessDeniedError` and `ON_CONNECTION_CLOSED` callbacks"""
         with mock.patch.object(self.connection.callbacks, 'process'):
 
@@ -275,10 +278,12 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
 
             self.connection._set_connection_state(
                 self.connection.CONNECTION_TUNE)
+            self.connection._opened = False
 
-            self.connection._on_terminate(1, 'error text')
+            original_exc = exceptions.StreamLostError(1, 'error text')
+            self.connection._on_stack_terminated(original_exc)
 
-            self.assertEqual(self.connection.callbacks.process.call_count, 2)
+            self.assertEqual(self.connection.callbacks.process.call_count, 1)
 
             self.connection.callbacks.process.assert_any_call(
                 0, self.connection.ON_CONNECTION_ERROR, self.connection,
@@ -287,16 +292,15 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
             conn_exc = self.connection.callbacks.process.call_args_list[0][0][
                 4]
             self.assertIs(type(conn_exc), exceptions.ProbableAccessDeniedError)
-            self.assertSequenceEqual(conn_exc.args, [1, 'error text'])
+            self.assertSequenceEqual(conn_exc.args, [repr(original_exc)])
 
-            self.connection.callbacks.process.assert_any_call(
-                0, self.connection.ON_CONNECTION_CLOSED, self.connection,
-                self.connection, 1, 'error text')
-
-    @mock.patch('pika.connection.Connection.connect')
+    @mock.patch('pika.connection.Connection._adapter_connect_stack')
     def test_new_conn_should_use_first_channel(self, connect):
         """_next_channel_number in new conn should always be 1"""
-        conn = ConstructibleConnection()
+        with mock.patch.object(ConstructibleConnection,
+                               '_adapter_connect_stack'):
+            conn = ConstructibleConnection()
+
         self.assertEqual(1, conn._next_channel_number())
 
     def test_next_channel_number_returns_lowest_unused(self):
@@ -355,53 +359,44 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
 
     def test_channel_on_closed_connection_raises_connection_closed(self):
         self.connection.connection_state = self.connection.CONNECTION_CLOSED
-        with self.assertRaises(exceptions.ConnectionClosed):
+        with self.assertRaises(exceptions.ConnectionWrongStateError):
             self.connection.channel(on_open_callback=lambda *args: None)
 
     def test_channel_on_closing_connection_raises_connection_closed(self):
         self.connection.connection_state = self.connection.CONNECTION_CLOSING
-        with self.assertRaises(exceptions.ConnectionClosed):
+        with self.assertRaises(exceptions.ConnectionWrongStateError):
             self.connection.channel(on_open_callback=lambda *args: None)
 
     def test_channel_on_init_connection_raises_connection_closed(self):
         self.connection.connection_state = self.connection.CONNECTION_INIT
-        with self.assertRaises(exceptions.ConnectionClosed):
+        with self.assertRaises(exceptions.ConnectionWrongStateError):
             self.connection.channel(on_open_callback=lambda *args: None)
 
     def test_channel_on_start_connection_raises_connection_closed(self):
         self.connection.connection_state = self.connection.CONNECTION_START
-        with self.assertRaises(exceptions.ConnectionClosed):
+        with self.assertRaises(exceptions.ConnectionWrongStateError):
             self.connection.channel(on_open_callback=lambda *args: None)
 
     def test_channel_on_protocol_connection_raises_connection_closed(self):
         self.connection.connection_state = self.connection.CONNECTION_PROTOCOL
-        with self.assertRaises(exceptions.ConnectionClosed):
+        with self.assertRaises(exceptions.ConnectionWrongStateError):
             self.connection.channel(on_open_callback=lambda *args: None)
 
     def test_channel_on_tune_connection_raises_connection_closed(self):
         self.connection.connection_state = self.connection.CONNECTION_TUNE
-        with self.assertRaises(exceptions.ConnectionClosed):
+        with self.assertRaises(exceptions.ConnectionWrongStateError):
             self.connection.channel(on_open_callback=lambda *args: None)
 
-    def test_connect_no_adapter_connect_from_constructor(self):
-        """check that adapter connection with AMQP is not happening in constructor """
+    def test_connect_no_adapter_connect_from_constructor_with_external_workflow(self):
+        """check that adapter connection is not happening in constructor with external connection workflow."""
         with mock.patch.object(
-                ConstructibleConnection, '_adapter_connect',
-                return_value=Exception(
-                    '_adapter_connect failed')) as adapter_connect_mock:
-            with mock.patch.object(
-                    ConstructibleConnection, 'add_timeout',
-                    return_value='timer') as add_timeout_mock:
-                conn = ConstructibleConnection()
+                ConstructibleConnection,
+                '_adapter_connect_stack') as adapter_connect_stack_mock:
+            conn = ConstructibleConnection(internal_connection_workflow=False)
 
-                self.assertFalse(adapter_connect_mock.called)
+        self.assertFalse(adapter_connect_stack_mock.called)
 
-                self.assertEqual(conn.connection_state, conn.CONNECTION_INIT)
-
-                self.assertIsNotNone(conn._connection_attempt_timer)
-
-                add_timeout_mock.assert_called_once_with(
-                    0, conn._on_connect_timer)
+        self.assertEqual(conn.connection_state, conn.CONNECTION_INIT)
 
     def test_client_properties(self):
         """make sure client properties has some important keys"""
@@ -448,9 +443,11 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
 
         params = connection.ConnectionParameters(client_properties=override)
 
-        with mock.patch('pika.connection.Connection.connect'):
+        with mock.patch.object(ConstructibleConnection,
+                               '_adapter_connect_stack'):
             conn = ConstructibleConnection(params)
-            self.assertDictEqual(conn._client_properties, expectation)
+
+        self.assertDictEqual(conn._client_properties, expectation)
 
     def test_set_backpressure_multiplier(self):
         """test setting the backpressure multiplier"""
@@ -493,63 +490,17 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
             self.connection._close_channels(200, 'reply text')
 
     @mock.patch('pika.frame.ProtocolHeader')
-    def test_on_connect_timer(self, frame_protocol_header):
-        """make sure the connect method sets the state and sends a frame"""
+    def test_on_stream_connected(self, frame_protocol_header):
+        """make sure the _on_stream_connected() sets the state and sends a frame"""
         self.connection.connection_state = self.connection.CONNECTION_INIT
         self.connection._adapter_connect = mock.Mock(return_value=None)
         self.connection._send_frame = mock.Mock()
         frame_protocol_header.spec = frame.ProtocolHeader
         frame_protocol_header.return_value = 'frame object'
-        self.connection._on_connect_timer()
-        self.connection._on_stream_connection_done(None)
+        self.connection._on_stream_connected()
         self.assertEqual(self.connection.CONNECTION_PROTOCOL,
                          self.connection.connection_state)
         self.connection._send_frame.assert_called_once_with('frame object')
-
-    @mock.patch.object(
-        ConstructibleConnection,
-        '_adapter_disconnect',
-        spec_set=connection.Connection._adapter_disconnect)
-    def test_on_connect_timer_reconnect(self, _adapter_disconnect):
-        """try the different reconnect logic, check state & other class vars"""
-        self.connection.connection_state = self.connection.CONNECTION_INIT
-        self.connection._adapter_connect = mock.Mock(return_value='error')
-        self.connection.callbacks = mock.Mock(spec=self.connection.callbacks)
-        # TODO: remaining_connection_attempts is gone, now part of conn workflow
-        self.connection.remaining_connection_attempts = 2
-        self.connection.params.retry_delay = 555
-        self.connection.params.connection_attempts = 99
-        self.connection.add_timeout = mock.Mock()
-        #first failure
-        self.connection._on_connect_timer()
-        self.connection._on_stream_connection_done(Exception())
-        self.connection.add_timeout.assert_called_once_with(
-            555, self.connection._on_connect_timer)
-        # TODO: remaining_connection_attempts is gone, now part of conn workflow
-        self.assertEqual(1, self.connection.remaining_connection_attempts)
-        self.assertFalse(self.connection.callbacks.process.called)
-        self.assertEqual(self.connection.CONNECTION_INIT,
-                         self.connection.connection_state)
-        #fail with no attempts remaining
-        self.connection.add_timeout.reset_mock()
-        self.connection._on_connect_timer()
-        error = Exception()
-        self.connection._on_stream_connection_done(error)
-        self.assertFalse(self.connection.add_timeout.called)
-        # TODO: remaining_connection_attempts is gone, now part of conn workflow
-        self.assertEqual(99, self.connection.remaining_connection_attempts)
-        self.assertEqual(self.connection.callbacks.process.call_count, 2)
-        conn_error = exceptions.AMQPConnectionError(
-            connection.InternalCloseReasons.SOCKET_ERROR,
-            repr(error))
-        expected_calls = [
-            mock.call(0, self.connection.ON_CONNECTION_ERROR, self.connection,
-                      self.connection, conn_error),
-            mock.call(0, self.connection.ON_CONNECTION_CLOSED, self.connection,
-                      self.connection,
-                      self.connection.ON_CONNECTION_ERROR, repr(error))]
-        self.assertEqual(self.connection.CONNECTION_CLOSED,
-                         self.connection.connection_state)
 
     def test_on_connection_start(self):
         """make sure starting a connection sets the correct class vars"""
@@ -618,7 +569,7 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         self.assertEqual(
             ['ab'],
             [call[0][0] for call in _adapter_emit_data.call_args_list])
-        self.assertEqual('hearbeat obj', self.connection.heartbeat)
+        self.assertEqual('hearbeat obj', self.connection._heartbeat_checker)
 
         # Pika gives precendence to client heartbeat values if set
         # See pika/pika#965.
@@ -685,29 +636,34 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         #verfy
         self.assertEqual(60, self.connection.params.heartbeat)
 
-    def test_on_connection_closed(self):
-        """make sure connection close sends correct frames"""
+    def test_on_connection_close_from_broker_passes_correct_exception(self):
+        """make sure connection close from broker passes correct exception"""
         method_frame = mock.Mock()
         method_frame.method = mock.Mock(spec=spec.Connection.Close)
         method_frame.method.reply_code = 1
         method_frame.method.reply_text = 'hello'
-        self.connection._on_terminate = mock.Mock()
-        self.connection._on_connection_close(method_frame)
+        self.connection._terminate_stream = mock.Mock()
+        self.connection._on_connection_close_from_broker(method_frame)
+
         #Check
-        self.connection._on_terminate.assert_called_once_with(1, 'hello')
+        self.connection._terminate_stream.assert_called_once_with(mock.ANY)
+
+        exc = self.connection._terminate_stream.call_args[0][0]
+        self.assertIsInstance(exc, exceptions.ConnectionClosedByBroker)
+
+        self.assertEqual(exc.reply_code, 1)
+        self.assertEqual(exc.reply_text, 'hello')
 
     def test_on_connection_close_ok(self):
         """make sure _on_connection_close_ok terminates connection"""
         method_frame = mock.Mock()
         method_frame.method = mock.Mock(spec=spec.Connection.CloseOk)
-        # TODO: no more Connection.closing
-        #self.connection.closing = (1, 'bye')
-        self.connection._on_terminate = mock.Mock()
+        self.connection._terminate_stream = mock.Mock()
 
         self.connection._on_connection_close_ok(method_frame)
 
         #Check
-        self.connection._on_terminate.assert_called_once_with(1, 'bye')
+        self.connection._terminate_stream.assert_called_once_with(None)
 
     @mock.patch('pika.frame.decode_frame')
     def test_on_data_available(self, decode_frame):
@@ -720,7 +676,7 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
             frame_value.method = 2
             frame_value.channel_number = 1
             self.connection.bytes_received = 0
-            self.connection.heartbeat = mock.Mock()
+            self.connection._heartbeat_checker = mock.Mock()
             self.connection.frames_received = 0
             decode_frame.return_value = (2, frame_value)
             self.connection._on_data_available(data_in)
@@ -729,7 +685,8 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
             self.assertEqual(2, self.connection.bytes_received)
             self.assertEqual(1, self.connection.frames_received)
             if frame_type == frame.Heartbeat:
-                self.assertTrue(self.connection.heartbeat.received.called)
+                self.assertTrue(
+                    self.connection._heartbeat_checker.received.called)
 
     def test_add_on_connection_blocked_callback(self):
         blocked_buffer = []
@@ -763,8 +720,8 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
 
     @mock.patch.object(
         connection.Connection,
-        'connect',
-        spec_set=connection.Connection.connect)
+        '_adapter_connect_stack',
+        spec_set=connection.Connection._adapter_connect_stack)
     @mock.patch.object(connection.Connection,
                        'add_on_connection_blocked_callback')
     @mock.patch.object(connection.Connection,
@@ -773,9 +730,11 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
             self, add_on_unblocked_callback_mock, add_on_blocked_callback_mock,
             connect_mock):
 
-        conn = ConstructibleConnection(
-            parameters=connection.ConnectionParameters(
-                blocked_connection_timeout=60))
+        with mock.patch.object(ConstructibleConnection,
+                               '_adapter_connect_stack'):
+            conn = ConstructibleConnection(
+                parameters=connection.ConnectionParameters(
+                    blocked_connection_timeout=60))
 
         # Check
         conn.add_on_connection_blocked_callback.assert_called_once_with(
@@ -787,14 +746,15 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
     @mock.patch.object(ConstructibleConnection, 'add_timeout')
     @mock.patch.object(
         connection.Connection,
-        'connect',
-        spec_set=connection.Connection.connect)
+        '_adapter_connect_stack',
+        spec_set=connection.Connection._adapter_connect_stack)
     def test_connection_blocked_sets_timer(self, connect_mock,
                                            add_timeout_mock):
-
-        conn = ConstructibleConnection(
-            parameters=connection.ConnectionParameters(
-                blocked_connection_timeout=60))
+        with mock.patch.object(ConstructibleConnection,
+                               '_adapter_connect_stack'):
+            conn = ConstructibleConnection(
+                parameters=connection.ConnectionParameters(
+                    blocked_connection_timeout=60))
 
         conn._on_connection_blocked(
             conn,
@@ -809,14 +769,16 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
     @mock.patch.object(ConstructibleConnection, 'add_timeout')
     @mock.patch.object(
         connection.Connection,
-        'connect',
-        spec_set=connection.Connection.connect)
+        '_adapter_connect_stack',
+        spec_set=connection.Connection._adapter_connect_stack)
     def test_blocked_connection_multiple_blocked_in_a_row_sets_timer_once(
             self, connect_mock, add_timeout_mock):
 
-        conn = ConstructibleConnection(
-            parameters=connection.ConnectionParameters(
-                blocked_connection_timeout=60))
+        with mock.patch.object(ConstructibleConnection,
+                               '_adapter_connect_stack'):
+            conn = ConstructibleConnection(
+                parameters=connection.ConnectionParameters(
+                    blocked_connection_timeout=60))
 
         # Simulate Connection.Blocked trigger
         conn._on_connection_blocked(
@@ -839,34 +801,40 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         self.assertEqual(conn.add_timeout.call_count, 1)
         self.assertIs(conn._blocked_conn_timer, timer)
 
-    @mock.patch.object(connection.Connection, '_on_terminate')
+    @mock.patch.object(connection.Connection, '_on_stack_terminated')
     @mock.patch.object(
         ConstructibleConnection,
         'add_timeout',
         spec_set=connection.Connection.add_timeout)
     @mock.patch.object(
         connection.Connection,
-        'connect',
-        spec_set=connection.Connection.connect)
-    def test_blocked_connection_timeout_teminates_connection(
+        '_adapter_connect_stack',
+        spec_set=connection.Connection._adapter_connect_stack)
+    def test_blocked_connection_timeout_terminates_connection(
             self, connect_mock, add_timeout_mock, on_terminate_mock):
 
-        conn = ConstructibleConnection(
-            parameters=connection.ConnectionParameters(
-                blocked_connection_timeout=60))
+        with mock.patch.multiple(ConstructibleConnection,
+                                 _adapter_connect_stack=mock.Mock(),
+                                 _terminate_stream=mock.Mock()):
+            conn = ConstructibleConnection(
+                parameters=connection.ConnectionParameters(
+                    blocked_connection_timeout=60))
 
-        conn._on_connection_blocked(
-            conn,
-            mock.Mock(name='frame.Method(Connection.Blocked)'))
+            conn._on_connection_blocked(
+                conn,
+                mock.Mock(name='frame.Method(Connection.Blocked)'))
 
-        conn._on_blocked_connection_timeout()
+            conn._on_blocked_connection_timeout()
 
-        # Check
-        conn._on_terminate.assert_called_once_with(
-            connection.InternalCloseReasons.BLOCKED_CONNECTION_TIMEOUT,
-            'Blocked connection timeout expired')
+            # Check
+            conn._terminate_stream.assert_called_once_with(mock.ANY)
 
-        self.assertIsNone(conn._blocked_conn_timer)
+            exc = conn._terminate_stream.call_args[0][0]
+            self.assertIsInstance(exc, exceptions.ConnectionBlockedTimeout)
+            self.assertSequenceEqual(exc.args,
+                                     ['Blocked connection timeout expired.'])
+
+            self.assertIsNone(conn._blocked_conn_timer)
 
     @mock.patch.object(ConstructibleConnection, 'remove_timeout')
     @mock.patch.object(
@@ -875,14 +843,16 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         spec_set=connection.Connection.add_timeout)
     @mock.patch.object(
         connection.Connection,
-        'connect',
-        spec_set=connection.Connection.connect)
+        '_adapter_connect_stack',
+        spec_set=connection.Connection._adapter_connect_stack)
     def test_blocked_connection_unblocked_removes_timer(
             self, connect_mock, add_timeout_mock, remove_timeout_mock):
 
-        conn = ConstructibleConnection(
-            parameters=connection.ConnectionParameters(
-                blocked_connection_timeout=60))
+        with mock.patch.object(ConstructibleConnection,
+                               '_adapter_connect_stack'):
+            conn = ConstructibleConnection(
+                parameters=connection.ConnectionParameters(
+                    blocked_connection_timeout=60))
 
         conn._on_connection_blocked(
             conn,
@@ -907,14 +877,16 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         spec_set=connection.Connection.add_timeout)
     @mock.patch.object(
         connection.Connection,
-        'connect',
-        spec_set=connection.Connection.connect)
+        '_adapter_connect_stack',
+        spec_set=connection.Connection._adapter_connect_stack)
     def test_blocked_connection_multiple_unblocked_in_a_row_removes_timer_once(
             self, connect_mock, add_timeout_mock, remove_timeout_mock):
 
-        conn = ConstructibleConnection(
-            parameters=connection.ConnectionParameters(
-                blocked_connection_timeout=60))
+        with mock.patch.object(ConstructibleConnection,
+                               '_adapter_connect_stack'):
+            conn = ConstructibleConnection(
+                parameters=connection.ConnectionParameters(
+                    blocked_connection_timeout=60))
 
         # Simulate Connection.Blocked
         conn._on_connection_blocked(
@@ -949,19 +921,22 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
         spec_set=connection.Connection.add_timeout)
     @mock.patch.object(
         connection.Connection,
-        'connect',
-        spec_set=connection.Connection.connect)
+        '_adapter_connect_stack',
+        spec_set=connection.Connection._adapter_connect_stack)
     @mock.patch.object(
         ConstructibleConnection,
         '_adapter_disconnect',
         spec_set=connection.Connection._adapter_disconnect)
-    def test_blocked_connection_on_terminate_removes_timer(
+    def test_blocked_connection_on_stack_terminated_removes_timer(
             self, adapter_disconnect_mock, connect_mock, add_timeout_mock,
             remove_timeout_mock):
 
-        conn = ConstructibleConnection(
-            parameters=connection.ConnectionParameters(
-                blocked_connection_timeout=60))
+        with mock.patch.object(ConstructibleConnection,
+                               '_adapter_connect_stack'):
+            conn = ConstructibleConnection(
+                parameters=connection.ConnectionParameters(
+                    blocked_connection_timeout=60),
+                on_open_error_callback=lambda *args: None)
 
         conn._on_connection_blocked(
             conn,
@@ -971,7 +946,7 @@ class ConnectionTests(unittest.TestCase):  # pylint: disable=R0904
 
         timer = conn._blocked_conn_timer
 
-        conn._on_terminate(0, 'test_on_terminate_removes_timer')
+        conn._on_stack_terminated(exceptions.StreamLostError())
 
         # Check
         conn.remove_timeout.assert_called_once_with(timer)

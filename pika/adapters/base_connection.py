@@ -16,9 +16,6 @@ from pika import connection
 
 LOGGER = logging.getLogger(__name__)
 
-def perr(*args):
-    import sys
-    print(*args, file=sys.stderr)
 
 class BaseConnection(connection.Connection):
     """BaseConnection class that should be extended by connection adapters"""
@@ -171,7 +168,7 @@ class BaseConnection(connection.Connection):
             LOGGER.debug('Created default connection workflow %r', workflow)
 
         if isinstance(workflow, connection_workflow.AMQPConnectionWorkflow):
-            workflow._set_async_services(async_services)
+            workflow.set_async_services(async_services)
 
         def create_connector():
             """`AMQPConnector` factory."""
@@ -257,11 +254,12 @@ class BaseConnection(connection.Connection):
             retry_pause=self.params.retry_delay,
             _until_first_amqp_attempt=True)
 
-        self._connection_workflow._set_async_services(self._async)
+        self._connection_workflow.set_async_services(self._async)
 
         def create_connector():
             """`AMQPConnector` factory"""
-            return connection_workflow.AMQPConnector(lambda: self, self._async)
+            return connection_workflow.AMQPConnector(lambda _params: self,
+                                                     self._async)
 
         self._connection_workflow.start(
             [self.params],
@@ -277,7 +275,7 @@ class BaseConnection(connection.Connection):
         Assumption: may be called only while connection is opening.
 
         """
-        assert self._opening, (
+        assert not self._opened, (
             '_adapter_abort_connection_workflow() may be called only when '
             'connection is opening.')
 
@@ -286,7 +284,10 @@ class BaseConnection(connection.Connection):
             # interrupt internally-initiated connection establishment.
             # self._connection_workflow.abort() would not call
             # Connection.close() before pairing of connection with transport.
-            #
+            assert self._internal_connection_workflow, (
+                'Unexpected _adapter_abort_connection_workflow() call with '
+                'no transport in external connection workflow mode.')
+
             # This will result in call to _on_connection_workflow_done() upon
             # completion
             self._connection_workflow.abort()
@@ -312,8 +313,6 @@ class BaseConnection(connection.Connection):
             `AbstractAMQPConnectionWorkflow.start()` for details.
 
         """
-        perr('_on_connection_workflow_done({!r})'.format(conn_or_exc))
-
         LOGGER.debug('Full-stack connection workflow completed: %r',
                      conn_or_exc)
 

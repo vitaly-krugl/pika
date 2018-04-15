@@ -10,16 +10,12 @@ class AMQPError(Exception):
 class AMQPConnectionError(AMQPError):
 
     def __repr__(self):
-        if len(self.args) == 1:
-            return '{}: No connection could be opened: {}'.format(
-                self.__class__.__name__,
-                self.args[0])
-        elif len(self.args) == 2:
-            return '{}: {}: {}'.format(self.__class__.__name__,
-                                       self.args[0],
-                                       self.args[1])
+        if len(self.args) == 2:
+            return '{}: ({}) {}'.format(self.__class__.__name__,
+                                        self.args[0],
+                                        self.args[1])
         else:
-            return '{}: {!r}'.format(self.__class__.__name__, self.args)
+            return '{}: {}'.format(self.__class__.__name__, self.args)
 
 
 class ConnectionOpenAborted(AMQPConnectionError):

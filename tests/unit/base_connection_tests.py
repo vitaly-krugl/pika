@@ -22,22 +22,34 @@ try:
 except AttributeError:
     socket.TCP_KEEPIDLE = 4
 
+class ConstructibleBaseConnection(base_connection.BaseConnection):
+    """Adds dummy overrides for `BaseConnection`'s abstract methods so
+    that we can instantiate and test it.
+
+    """
+    @classmethod
+    def create_connection(cls, *args, **kwargs):  # pylint: disable=W0221
+        raise NotImplementedError
+
 
 class BaseConnectionTests(unittest.TestCase):
     def setUp(self):
-        with mock.patch('pika.connection.Connection.connect'):
-            self.connection = base_connection.BaseConnection(
-                None, None, None, None, None)
+        with mock.patch.object(ConstructibleBaseConnection,
+                               '_adapter_connect_stack'):
+            self.connection = ConstructibleBaseConnection(
+                None, None, None, None, None,
+                internal_connection_workflow=True)
             self.connection._set_connection_state(
-                base_connection.BaseConnection.CONNECTION_OPEN)
+                ConstructibleBaseConnection.CONNECTION_OPEN)
 
     def test_repr(self):
         text = repr(self.connection)
-        self.assertTrue(text.startswith('<BaseConnection'), text)
+        self.assertTrue(text.startswith('<ConstructibleBaseConnection'), text)
 
     def test_should_raise_value_exception_with_no_params_func_instead(self):
-        self.assertRaises(ValueError, base_connection.BaseConnection,
-                          lambda: True, None, None, None, None)
+        self.assertRaises(ValueError, ConstructibleBaseConnection,
+                          lambda: True, None, None, None, None,
+                          internal_connection_workflow=True)
 
     def test_tcp_options_with_dict_tcp_options(self):
 

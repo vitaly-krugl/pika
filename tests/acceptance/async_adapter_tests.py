@@ -10,6 +10,10 @@
 # Suppress pylint warning about unused argument
 # pylint: disable=W0613
 
+# invalid-name
+# pylint: disable=C0103
+
+
 import functools
 import threading
 import time
@@ -18,8 +22,8 @@ import uuid
 from pika import spec
 from pika.compat import as_bytes
 import pika.connection
+import pika.exceptions
 import pika.frame
-import pika.spec
 
 from .async_test_base import (AsyncTestCase, BoundQueueTestCase, AsyncAdapters)
 
@@ -413,17 +417,18 @@ class TestZ_PublishAndGet(BoundQueueTestCase, AsyncAdapters):  # pylint: disable
 
 
 class TestZ_AccessDenied(AsyncTestCase, AsyncAdapters):  # pylint: disable=C0103
-    DESCRIPTION = "Verify that access denied invokes on open error callback"
+    DESCRIPTION = "Unknown vhost results in ConnectionClosedByBroker."
 
     def start(self, *args, **kwargs):
         self.parameters.virtual_host = str(uuid.uuid4())
-        self.error_captured = False
+        self.error_captured = None
         super(TestZ_AccessDenied, self).start(*args, **kwargs)
-        self.assertTrue(self.error_captured)
+        self.assertIsInstance(self.error_captured,
+                              pika.exceptions.ConnectionClosedByBroker)
 
     def on_open_error(self, connection, error):
-        self.error_captured = True
-        self.stop()
+        self.error_captured = error
+        self._stop()
 
     def on_open(self, connection):
         super(TestZ_AccessDenied, self).on_open(connection)
@@ -435,12 +440,10 @@ class TestBlockedConnectionTimesOut(AsyncTestCase, AsyncAdapters):  # pylint: di
 
     def start(self, *args, **kwargs):
         self.parameters.blocked_connection_timeout = 0.001
-        self.on_closed_pair = None
+        self.on_closed_error = None
         super(TestBlockedConnectionTimesOut, self).start(*args, **kwargs)
-        self.assertEqual(
-            self.on_closed_pair,
-            (pika.connection.InternalCloseReasons.BLOCKED_CONNECTION_TIMEOUT,
-             'Blocked connection timeout expired'))
+        self.assertIsInstance(self.on_closed_error,
+                              pika.exceptions.ConnectionBlockedTimeout)
 
     def begin(self, channel):
 
@@ -448,15 +451,13 @@ class TestBlockedConnectionTimesOut(AsyncTestCase, AsyncAdapters):  # pylint: di
         channel.connection._on_connection_blocked(
             channel.connection,
             pika.frame.Method(0,
-                              pika.spec.Connection.Blocked(
+                              spec.Connection.Blocked(
                                   'Testing blocked connection timeout')))
 
-    def on_closed(self, connection, reply_code, reply_text):
+    def on_closed(self, connection, error):
         """called when the connection has finished closing"""
-        self.on_closed_pair = (reply_code, reply_text)
-        super(TestBlockedConnectionTimesOut, self).on_closed(connection,
-                                                             reply_code,
-                                                             reply_text)
+        self.on_closed_error = error
+        super(TestBlockedConnectionTimesOut, self).on_closed(connection, error)
 
 
 class TestBlockedConnectionUnblocks(AsyncTestCase, AsyncAdapters):  # pylint: disable=C0103
@@ -464,10 +465,12 @@ class TestBlockedConnectionUnblocks(AsyncTestCase, AsyncAdapters):  # pylint: di
 
     def start(self, *args, **kwargs):
         self.parameters.blocked_connection_timeout = 0.001
-        self.on_closed_pair = None
+        self.on_closed_error = None
         super(TestBlockedConnectionUnblocks, self).start(*args, **kwargs)
+        self.assertIsInstance(self.on_closed_error,
+                              pika.exceptions.ConnectionClosedByClient)
         self.assertEqual(
-            self.on_closed_pair,
+            (self.on_closed_error.reply_code, self.on_closed_error.reply_text),
             (200, 'Normal shutdown'))
 
     def begin(self, channel):
@@ -476,13 +479,13 @@ class TestBlockedConnectionUnblocks(AsyncTestCase, AsyncAdapters):  # pylint: di
         channel.connection._on_connection_blocked(
             channel.connection,
             pika.frame.Method(0,
-                              pika.spec.Connection.Blocked(
+                              spec.Connection.Blocked(
                                   'Testing blocked connection unblocks')))
 
         # Simulate Connection.Unblocked
         channel.connection._on_connection_unblocked(
             channel.connection,
-            pika.frame.Method(0, pika.spec.Connection.Unblocked()))
+            pika.frame.Method(0, spec.Connection.Unblocked()))
 
         # Schedule shutdown after blocked connection timeout would expire
         channel.connection.add_timeout(0.005, self.on_cleanup_timer)
@@ -490,12 +493,10 @@ class TestBlockedConnectionUnblocks(AsyncTestCase, AsyncAdapters):  # pylint: di
     def on_cleanup_timer(self):
         self.stop()
 
-    def on_closed(self, connection, reply_code, reply_text):
+    def on_closed(self, connection, error):
         """called when the connection has finished closing"""
-        self.on_closed_pair = (reply_code, reply_text)
-        super(TestBlockedConnectionUnblocks, self).on_closed(connection,
-                                                             reply_code,
-                                                             reply_text)
+        self.on_closed_error = error
+        super(TestBlockedConnectionUnblocks, self).on_closed(connection, error)
 
 
 class TestAddCallbackThreadsafeRequestBeforeIOLoopStarts(AsyncTestCase, AsyncAdapters):

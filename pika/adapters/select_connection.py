@@ -119,7 +119,7 @@ class SelectConnection(BaseConnection):
         """
         async_services = SelectorAsyncServicesAdapter(custom_ioloop or IOLoop())
 
-        def create_connection(params):
+        def connection_factory(params):
             """Connection factory."""
             if params is None:
                 raise ValueError('Expected pika.connection.Parameters '
@@ -131,7 +131,7 @@ class SelectConnection(BaseConnection):
 
         return cls._start_connection_workflow(
             connection_configs=connection_configs,
-            connection_factory=create_connection,
+            connection_factory=connection_factory,
             async_services=async_services,
             workflow=workflow,
             on_done=on_done)

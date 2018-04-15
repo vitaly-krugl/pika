@@ -3,17 +3,15 @@
 Tests for pika.adapters.blocking_connection.BlockingConnection
 
 """
-import socket
 import unittest
 
 import mock
 from mock import patch
 
 import pika
-from pika.adapters import (blocking_connection, async_interface,
-                           select_connection)
+from pika.adapters import blocking_connection, async_interface
 import pika.channel
-from pika.exceptions import AMQPConnectionError, ChannelClosed
+import pika.exceptions
 
 
 # Disable protected-access
@@ -143,8 +141,9 @@ class BlockingConnectionTests(unittest.TestCase):
             connection = blocking_connection.BlockingConnection('params')
 
         connection._user_initiated_close = True
+        original_exc = pika.exceptions.ConnectionClosedByClient(200, 'success')
         connection._closed_result.set_value_once(
-            select_connection_class_mock.return_value, 200, 'success')
+            select_connection_class_mock.return_value, original_exc)
 
         connection._flush_output(lambda: False, lambda: True)
 
@@ -164,10 +163,12 @@ class BlockingConnectionTests(unittest.TestCase):
             connection = blocking_connection.BlockingConnection('params')
 
         connection._user_initiated_close = False
+        original_exc = pika.exceptions.ConnectionClosedByBroker(404,
+                                                                'not found')
         connection._closed_result.set_value_once(
-            select_connection_class_mock.return_value, 404, 'not found')
+            select_connection_class_mock.return_value, original_exc)
 
-        with self.assertRaises(pika.exceptions.ConnectionClosed) as cm:
+        with self.assertRaises(pika.exceptions.ConnectionClosedByBroker) as cm:
             connection._flush_output(lambda: False, lambda: True)
 
         self.assertSequenceEqual(cm.exception.args, (404, 'not found'))
@@ -181,15 +182,18 @@ class BlockingConnectionTests(unittest.TestCase):
         spec_set=SelectConnectionTemplate,
         is_closed=False)
     def test_flush_output_server_initiated_no_error_close(
-            self, select_connection_class_mock):
+            self,
+            select_connection_class_mock):
 
         with mock.patch.object(blocking_connection.BlockingConnection,
                                '_process_io_for_connection_setup'):
             connection = blocking_connection.BlockingConnection('params')
 
         connection._user_initiated_close = False
+        original_exc = pika.exceptions.ConnectionClosedByBroker(200, 'ok')
         connection._closed_result.set_value_once(
-            select_connection_class_mock.return_value, 200, 'ok')
+            select_connection_class_mock.return_value,
+            original_exc)
 
         with self.assertRaises(pika.exceptions.ConnectionClosed) as cm:
             connection._flush_output(lambda: False, lambda: True)
@@ -240,7 +244,7 @@ class BlockingConnectionTests(unittest.TestCase):
         channel1_mock = mock.Mock(
             is_open=True,
             close=mock.Mock(
-                side_effect=ChannelClosed(-1, 'Just because'),
+                side_effect=pika.exceptions.ChannelClosed(-1, 'Just because'),
                 spec_set=pika.channel.Channel.close),
             spec_set=blocking_connection.BlockingChannel)
 

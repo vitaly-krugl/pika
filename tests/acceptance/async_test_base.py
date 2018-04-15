@@ -58,6 +58,7 @@ class AsyncTestCase(unittest.TestCase):
                                     'testdata/certs/client_key.pem')
             self.parameters.ssl_options = pika.SSLOptions(context)
         self._timed_out = False
+        self._conn_open_error = None
         super(AsyncTestCase, self).setUp()
 
     @staticmethod
@@ -95,6 +96,7 @@ class AsyncTestCase(unittest.TestCase):
                                                        self.on_timeout)
             self._run_ioloop()
             self.assertFalse(self._timed_out)
+            self.assertIsNone(self._conn_open_error)
         finally:
             self.connection._async.close()
             self.connection = None
@@ -131,10 +133,9 @@ class AsyncTestCase(unittest.TestCase):
             self.logger.info("Stopping ioloop")
             self.connection._async.stop()
 
-    def on_closed(self, connection, reply_code, reply_text):
+    def on_closed(self, connection, error):
         """called when the connection has finished closing"""
-        self.logger.info('on_closed: %r %r %r', connection,
-                         reply_code, reply_text)
+        self.logger.info('on_closed: %r %r', connection, error)
         self._stop()
 
     def on_open(self, connection):
@@ -142,9 +143,9 @@ class AsyncTestCase(unittest.TestCase):
         self.channel = connection.channel(on_open_callback=self.begin)
 
     def on_open_error(self, connection, error):
+        self._conn_open_error = error
         self.logger.error('on_open_error: %r %r', connection, error)
-        connection._async.stop()
-        raise AssertionError('Error connecting to RabbitMQ')
+        self._stop()
 
     def on_timeout(self):
         """called when stuck waiting for connection to close"""

@@ -1009,7 +1009,7 @@ class Connection(pika.compat.AbstractBase):
         # on_close_callback. So that we don't lose track when state transitions
         # to CONNECTION_CLOSING as the result of Connection.close() call during
         # opening.
-        self._opening = True
+        self._opened = False
 
         # Value to pass to on_open_error_callback or on_close_callback when
         # connection fails to be established or becomes closed
@@ -1121,7 +1121,8 @@ class Connection(pika.compat.AbstractBase):
         # to signal error during connection setup (and wait a longish time
         # before closing the TCP/IP stream). Earlier RabbitMQ versions
         # simply closed the TCP/IP stream.
-        self.callbacks.add(0, spec.Connection.Close, self._on_connection_close)
+        self.callbacks.add(0, spec.Connection.Close,
+                           self._on_connection_close_from_broker)
 
         if self.params.blocked_connection_timeout is not None:
             if self._blocked_conn_timer is not None:
@@ -1223,7 +1224,7 @@ class Connection(pika.compat.AbstractBase):
         connect, and either a string or an exception as its second arg.
 
         :param method callback: Callback to call when can't connect, having
-            the signature _(Connection, BaseException)
+            the signature _(Connection, Exception)
         :param bool remove_default: Remove default exception raising callback
 
         """
@@ -1315,7 +1316,7 @@ class Connection(pika.compat.AbstractBase):
         self._set_connection_state(self.CONNECTION_CLOSING)
         LOGGER.info("Closing connection (%s): %r", reply_code, reply_text)
 
-        if self._opening:
+        if not self._opened:
             # It was opening, but not fully open yet, so we won't attempt
             # graceful AMQP Connection.Close.
             LOGGER.info('Connection.close() is terminating stream and '
@@ -1807,19 +1808,18 @@ class Connection(pika.compat.AbstractBase):
             self.remove_timeout(self._blocked_conn_timer)
             self._blocked_conn_timer = None
 
-    def _on_connection_close(self, method_frame):
+    def _on_connection_close_from_broker(self, method_frame):
         """Called when the connection is closed remotely via Connection.Close
         frame from broker.
 
         :param pika.frame.Method method_frame: The Connection.Close frame
 
         """
-        LOGGER.debug('_on_connection_close: frame=%s', method_frame)
+        LOGGER.debug('_on_connection_close_from_broker: frame=%s', method_frame)
 
         self._terminate_stream(
-            exceptions.ConnectionClosedByBroker(
-                method_frame.method.reply_code,
-                method_frame.method.reply_text))
+            exceptions.ConnectionClosedByBroker(method_frame.method.reply_code,
+                                                method_frame.method.reply_text))
 
     def _on_connection_close_ok(self, method_frame):
         """Called when Connection.CloseOk is received from remote.
@@ -1831,16 +1831,14 @@ class Connection(pika.compat.AbstractBase):
 
         self._terminate_stream(None)
 
-    def _default_on_connection_error(self, _connection_unused,
-                                     error_message=None):
+    def _default_on_connection_error(self, _connection_unused, error):
         """Default behavior when the connecting connection cannot connect and
         user didn't supply own `on_connection_error` callback.
 
-        :raises: exceptions.AMQPConnectionError
+        :raises: the given error
 
         """
-        raise exceptions.AMQPConnectionError(error_message or
-                                             self.params.connection_attempts)
+        raise error
 
     def _on_connection_open_ok(self, method_frame):
         """
@@ -1848,7 +1846,7 @@ class Connection(pika.compat.AbstractBase):
         called the Connection.Open on the server and it has replied with
         Connection.Ok.
         """
-        self._opening = False
+        self._opened = True
 
         self.known_hosts = method_frame.method.known_hosts
 
@@ -2080,8 +2078,8 @@ class Connection(pika.compat.AbstractBase):
             self._remove_callbacks(0, [spec.Connection.Blocked,
                                        spec.Connection.Unblocked])
 
-        if self._opening and isinstance(self._error,
-                                        exceptions.StreamLostError):
+        if not self._opened and isinstance(self._error,
+                                           exceptions.StreamLostError):
             # Heuristically deduce error based on connection state
             if self.connection_state == self.CONNECTION_PROTOCOL:
                 LOGGER.error('Probably incompatible Protocol Versions')
@@ -2117,7 +2115,7 @@ class Connection(pika.compat.AbstractBase):
                 repr(self._error))
 
         # Inform interested parties
-        if self._opening:
+        if not self._opened:
             LOGGER.info('Connection setup terminated due to %r', self._error)
             self.callbacks.process(0,
                                    self.ON_CONNECTION_ERROR,

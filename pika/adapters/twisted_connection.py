@@ -223,13 +223,60 @@ class TwistedConnection(base_connection.BaseConnection):
                  parameters=None,
                  on_open_callback=None,
                  on_open_error_callback=None,
-                 on_close_callback=None):
+                 on_close_callback=None,
+                 custom_ioloop=None,
+                 internal_connection_workflow=True):
+        """
+        :param parameters:
+        :param on_open_callback:
+        :param on_open_error_callback:
+        :param on_close_callback:
+        :param custom_ioloop:
+        :param internal_connection_workflow:
+
+        """
+        if isinstance(custom_ioloop, async_interface.AbstractAsyncServices):
+            async_services = custom_ioloop
+        else:
+            async_services = _TwistedAsyncServicesAdapter(custom_ioloop)
+
         super(TwistedConnection, self).__init__(
             parameters=parameters,
             on_open_callback=on_open_callback,
             on_open_error_callback=on_open_error_callback,
             on_close_callback=on_close_callback,
-            async_services=_TwistedAsyncServicesAdapter(reactor))
+            async_services=async_services,
+            internal_connection_workflow=internal_connection_workflow)
+
+    @classmethod
+    def create_connection(cls,
+                          connection_configs,
+                          on_done,
+                          custom_ioloop=None,
+                          workflow=None):
+        """Override `BaseConnection.create_connection()` pure virtual method.
+
+        See `BaseConnection.create_connection()` documentation.
+
+        """
+        async_services = _TwistedAsyncServicesAdapter(custom_ioloop)
+
+        def connection_factory(params):
+            """Connection factory."""
+            if params is None:
+                raise ValueError('Expected pika.connection.Parameters '
+                                 'instance, but got None in params arg.')
+            return cls(
+                parameters=params,
+                custom_ioloop=async_services,
+                internal_connection_workflow=False)
+
+        return cls._start_connection_workflow(
+            connection_configs=connection_configs,
+            connection_factory=connection_factory,
+            async_services=async_services,
+            workflow=workflow,
+            on_done=on_done)
 
     def channel(self, channel_number=None):
         """Return a Deferred that fires with an instance of a wrapper around the
@@ -266,7 +313,12 @@ class TwistedProtocolConnection(base_connection.BaseConnection):
             on_open_callback=self.connectionReady,
             on_open_error_callback=self.connectionFailed,
             on_close_callback=on_close_callback,
-            async_services=_TwistedAsyncServicesAdapter(reactor))
+            async_services=_TwistedAsyncServicesAdapter(reactor),
+            internal_connection_workflow=False)
+
+    @classmethod
+    def create_connection(cls, *args, **kwargs):
+        raise NotImplementedError
 
     def connect(self):
         # The connection is open asynchronously by Twisted, so skip the whole
@@ -537,10 +589,10 @@ class _TwistedAsyncServicesAdapter(
 
     def __init__(self, in_reactor):
         """
-        :param twisted.internet.interfaces.IReactorFDSet reactor:
+        :param None | twisted.internet.interfaces.IReactorFDSet reactor:
 
         """
-        self._reactor = in_reactor
+        self._reactor = in_reactor or reactor
 
         # Mapping of fd to _SocketReadWriteDescriptor
         self._fd_watchers = dict()

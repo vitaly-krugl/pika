@@ -18,7 +18,8 @@ class AsyncioConnection(base_connection.BaseConnection):
                  on_open_callback=None,
                  on_open_error_callback=None,
                  on_close_callback=None,
-                 custom_ioloop=None):
+                 custom_ioloop=None,
+                 internal_connection_workflow=True):
         """ Create a new instance of the AsyncioConnection class, connecting
         to RabbitMQ automatically
 
@@ -27,16 +28,56 @@ class AsyncioConnection(base_connection.BaseConnection):
             is open
         :param callable on_open_error_callback: Method to call if the connection
             can't be opened.
-        :param asyncio.AbstractEventLoop custom_ioloop: Defaults to
-            asyncio.get_event_loop().
+        :param None | asyncio.AbstractEventLoop |
+            async_interface.AbstractAsyncServices custom_ioloop:
+                Defaults to asyncio.get_event_loop().
+        :param bool internal_connection_workflow: True for autonomous connection
+            establishment which is default; False for externally-managed
+            connection workflow via the `create_connection()` factory.
 
         """
+        if isinstance(custom_ioloop, async_interface.AbstractAsyncServices):
+            async_services = custom_ioloop
+        else:
+            async_services = _AsyncioAsyncServicesAdapter(custom_ioloop)
+
         super().__init__(
             parameters,
             on_open_callback,
             on_open_error_callback,
             on_close_callback,
-            _AsyncioAsyncServicesAdapter(custom_ioloop))
+            async_services,
+            internal_connection_workflow=internal_connection_workflow)
+
+    @classmethod
+    def create_connection(cls,
+                          connection_configs,
+                          on_done,
+                          custom_ioloop=None,
+                          workflow=None):
+        """Override `BaseConnection.create_connection()` pure virtual method.
+
+        See `BaseConnection.create_connection()` documentation.
+
+        """
+        async_services = _AsyncioAsyncServicesAdapter(custom_ioloop)
+
+        def connection_factory(params):
+            """Connection factory."""
+            if params is None:
+                raise ValueError('Expected pika.connection.Parameters '
+                                 'instance, but got None in params arg.')
+            return cls(
+                parameters=params,
+                custom_ioloop=async_services,
+                internal_connection_workflow=False)
+
+        return cls._start_connection_workflow(
+            connection_configs=connection_configs,
+            connection_factory=connection_factory,
+            async_services=async_services,
+            workflow=workflow,
+            on_done=on_done)
 
 
 class _AsyncioAsyncServicesAdapter(

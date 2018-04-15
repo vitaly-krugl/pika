@@ -18,11 +18,12 @@ class ExceptionTests(unittest.TestCase):
     def test_amqp_connection_error_one_param_repr(self):
         self.assertEqual(
             repr(exceptions.AMQPConnectionError(10)),
-            "No connection could be opened after 10 connection attempts")
+            'AMQPConnectionError: (10,)')
 
     def test_amqp_connection_error_two_params_repr(self):
         self.assertEqual(
-            repr(exceptions.AMQPConnectionError(1, 'Test')), "1: Test")
+            repr(exceptions.AMQPConnectionError(1, 'Test')),
+            'AMQPConnectionError: (1) Test')
 
     def test_authentication_error_repr(self):
         self.assertEqual(

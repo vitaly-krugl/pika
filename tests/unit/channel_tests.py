@@ -8,7 +8,7 @@ import unittest
 import warnings
 
 try:
-    from unittest import mock
+    from unittest import mock  # pylint: disable=C0412
 except ImportError:
     import mock
 
@@ -27,8 +27,13 @@ class ConnectionTemplate(connection.Connection):
 
     # Suppress pylint warnings about specific abstract methods not being
     # overridden
-    _adapter_connect = connection.Connection._adapter_connect
+    _adapter_abort_connection_workflow = (
+        connection.Connection._adapter_abort_connection_workflow)
+    _adapter_connect_stack = connection.Connection._adapter_connect_stack
     _adapter_disconnect = connection.Connection._adapter_disconnect
+    _adapter_emit_data = connection.Connection._adapter_emit_data
+    _adapter_get_write_buffer_size = (
+        connection.Connection._adapter_get_write_buffer_size)
     add_timeout = connection.Connection.add_timeout
     remove_timeout = connection.Connection.remove_timeout
 
