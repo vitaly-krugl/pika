@@ -13,6 +13,7 @@ from .test_utils import retry_assertion
 
 import pika
 from pika.adapters import blocking_connection
+from pika.adapters import connection_workflow
 from pika.compat import as_bytes
 import pika.connection
 import pika.exceptions
@@ -205,7 +206,7 @@ class TestLostConnectionResultsInIsClosedConnectionAndChannel(BlockingTestCaseBa
         # Simulate the server dropping the socket connection
         connection._impl._transport._sock.shutdown(socket.SHUT_RDWR)
 
-        with self.assertRaises(pika.exceptions.ConnectionClosed):
+        with self.assertRaises(pika.exceptions.StreamLostError):
             # Changing QoS should result in ConnectionClosed
             channel.basic_qos()
 
@@ -286,7 +287,7 @@ class TestSuddenBrokerDisconnectBeforeChannel(BlockingTestCaseBase):
         # Once outside the context, the connection is broken
 
         # BlockingConnection should raise ConnectionClosed
-        with self.assertRaises(pika.exceptions.ConnectionClosed):
+        with self.assertRaises(pika.exceptions.StreamLostError):
             self.connection.channel()
 
         self.assertTrue(self.connection.is_closed)
@@ -297,7 +298,7 @@ class TestSuddenBrokerDisconnectBeforeChannel(BlockingTestCaseBase):
 class TestNoAccessToFileDescriptorAfterConnectionClosed(BlockingTestCaseBase):
 
     def test(self):
-        """BlockingConnection no access file descriptor after ConnectionClosed
+        """BlockingConnection no access file descriptor after StreamLostError
         """
         with ForwardServer(
             remote_addr=(DEFAULT_PARAMS.host, DEFAULT_PARAMS.port),
@@ -309,7 +310,7 @@ class TestNoAccessToFileDescriptorAfterConnectionClosed(BlockingTestCaseBase):
         # Once outside the context, the connection is broken
 
         # BlockingConnection should raise ConnectionClosed
-        with self.assertRaises(pika.exceptions.ConnectionClosed):
+        with self.assertRaises(pika.exceptions.StreamLostError):
             self.connection.channel()
 
         self.assertTrue(self.connection.is_closed)
@@ -317,7 +318,7 @@ class TestNoAccessToFileDescriptorAfterConnectionClosed(BlockingTestCaseBase):
         self.assertIsNone(self.connection._impl._transport)
 
         # Attempt to operate on the connection once again after ConnectionClosed
-        with self.assertRaises(pika.exceptions.ConnectionClosed):
+        with self.assertRaises(pika.exceptions.ConnectionWrongStateError):
             self.connection.channel()
 
 
@@ -337,7 +338,7 @@ class TestConnectWithDownedBroker(BlockingTestCaseBase):
 
         sock.close()
 
-        with self.assertRaises(pika.exceptions.AMQPConnectionError):
+        with self.assertRaises(pika.exceptions.AMQPConnectionError) as exc_ctx:
             self.connection = self._connect(
                 PARAMS_URL_TEMPLATE % {"port": port})
 
@@ -406,11 +407,11 @@ class TestDisconnectDuringConnectionProtocol(BlockingTestCaseBase):
         self.addCleanup(lambda: fwd.stop() if fwd.running else None)
 
         class MySelectConnection(pika.SelectConnection):
-            assert hasattr(pika.SelectConnection, '_on_connected')
+            assert hasattr(pika.SelectConnection, '_on_stream_connected')
 
-            def _on_connected(self, *args, **kwargs):
+            def _on_stream_connected(self, *args, **kwargs):
                 fwd.stop()
-                return super(MySelectConnection, self)._on_connected(
+                return super(MySelectConnection, self)._on_stream_connected(
                     *args, **kwargs)
 
         with self.assertRaises(pika.exceptions.IncompatibleProtocolError):
@@ -495,14 +496,9 @@ class TestBlockedConnectionTimeout(BlockingTestCaseBase):
                 pika.spec.Connection.Blocked('TestBlockedConnectionTimeout')))
 
         # Wait for connection teardown
-        with self.assertRaises(pika.exceptions.ConnectionClosed) as excCtx:
+        with self.assertRaises(pika.exceptions.ConnectionBlockedTimeout):
             while True:
                 conn.process_data_events(time_limit=1)
-
-        self.assertEqual(
-            excCtx.exception.args,
-            (pika.connection.InternalCloseReasons.BLOCKED_CONNECTION_TIMEOUT,
-             'Blocked connection timeout expired'))
 
 
 class TestAddCallbackThreadsafeFromSameThread(BlockingTestCaseBase):

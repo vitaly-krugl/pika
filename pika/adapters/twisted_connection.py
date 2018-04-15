@@ -326,7 +326,7 @@ class TwistedProtocolConnection(base_connection.BaseConnection):
 
     def connectionMade(self):
         # Tell everyone we're connected
-        self._on_connected()
+        self._on_stream_connected()
 
     # Our own methods
 

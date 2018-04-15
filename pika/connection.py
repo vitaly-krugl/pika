@@ -1309,7 +1309,9 @@ class Connection(pika.compat.AbstractBase):
         if self._channels:
             self._close_channels(reply_code, reply_text)
 
-        # Set our connection state
+        prev_state = self.connection_state
+
+        # Transition to closing
         self._set_connection_state(self.CONNECTION_CLOSING)
         LOGGER.info("Closing connection (%s): %r", reply_code, reply_text)
 
@@ -1322,7 +1324,8 @@ class Connection(pika.compat.AbstractBase):
 
             self._error = exceptions.ConnectionOpenAborted(
                 'Connection.close() called before connection '
-                'finished opening: ({}): {!r}'.format(
+                'finished opening: prev_state={} ({}): {!r}'.format(
+                    self._STATE_NAMES[prev_state],
                     reply_code,
                     reply_text))
             self._adapter_abort_connection_workflow()
@@ -1748,7 +1751,7 @@ class Connection(pika.compat.AbstractBase):
         self._send_connection_close(self._error.reply_code,
                                     self._error.reply_text)
 
-    def _on_connected(self):
+    def _on_stream_connected(self):
         """Invoked when the socket is connected and it's time to start speaking
         AMQP with the broker.
 
@@ -2023,7 +2026,7 @@ class Connection(pika.compat.AbstractBase):
             Connection.CloseOk.
 
         """
-        assert isinstance(error, (None, Exception)), \
+        assert isinstance(error, (type(None), Exception)), \
             'error arg is neither None nor instance of Exception: {!r}.'.format(
                 error)
 
@@ -2076,6 +2079,30 @@ class Connection(pika.compat.AbstractBase):
         if self.params.blocked_connection_timeout is not None:
             self._remove_callbacks(0, [spec.Connection.Blocked,
                                        spec.Connection.Unblocked])
+
+        if self._opening and isinstance(self._error,
+                                        exceptions.StreamLostError):
+            # Heuristically deduce error based on connection state
+            if self.connection_state == self.CONNECTION_PROTOCOL:
+                LOGGER.error('Probably incompatible Protocol Versions')
+                self._error = exceptions.IncompatibleProtocolError(
+                    repr(self._error))
+            elif self.connection_state == self.CONNECTION_START:
+                LOGGER.error('Connection closed while authenticating indicating a '
+                             'probable authentication error')
+                self._error = exceptions.ProbableAuthenticationError(
+                    repr(self._error))
+            elif self.connection_state == self.CONNECTION_TUNE:
+                LOGGER.error('Connection closed while tuning the connection '
+                             'indicating a probable permission error when '
+                             'accessing a virtual host')
+                self._error = exceptions.ProbableAccessDeniedError(
+                    repr(self._error))
+            elif self.connection_state not in [self.CONNECTION_OPEN,
+                                               self.CONNECTION_CLOSED,
+                                               self.CONNECTION_CLOSING]:
+                LOGGER.warning('Unexpected connection state on disconnect: %i',
+                               self.connection_state)
 
         # Transition to closed state
         self._set_connection_state(self.CONNECTION_CLOSED)
@@ -2295,6 +2322,10 @@ class Connection(pika.compat.AbstractBase):
         :param int connection_state: The connection state to set
 
         """
+        LOGGER.debug('New Connection state: %s (prev=%s)',
+                     self._STATE_NAMES[connection_state],
+                     self._STATE_NAMES[self.connection_state])
+
         self.connection_state = connection_state
 
     def _set_server_information(self, method_frame):

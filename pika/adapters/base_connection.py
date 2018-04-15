@@ -16,6 +16,9 @@ from pika import connection
 
 LOGGER = logging.getLogger(__name__)
 
+def perr(*args):
+    import sys
+    print(*args, file=sys.stderr)
 
 class BaseConnection(connection.Connection):
     """BaseConnection class that should be extended by connection adapters"""
@@ -102,8 +105,8 @@ class BaseConnection(connection.Connection):
                  self._STATE_NAMES[self.connection_state],
                  self._transport, self.params))
 
-    @abc.abstractmethod
     @classmethod
+    @abc.abstractmethod
     def create_connection(cls,
                           connection_configs,
                           on_done,
@@ -166,6 +169,9 @@ class BaseConnection(connection.Connection):
         if workflow is None:
             workflow = connection_workflow.AMQPConnectionWorkflow()
             LOGGER.debug('Created default connection workflow %r', workflow)
+
+        if isinstance(workflow, connection_workflow.AMQPConnectionWorkflow):
+            workflow._set_async_services(async_services)
 
         def create_connector():
             """`AMQPConnector` factory."""
@@ -238,7 +244,7 @@ class BaseConnection(connection.Connection):
 
     def _adapter_connect_stack(self):
         """Initiate full-stack connection establishment asynchronously for
-        self-initiated connection brin-up.
+        internally-initiated connection bring-up.
 
         Upon failed completion, we will invoke
         `Connection._on_stack_connection_workflow_failed()`. NOTE: On success,
@@ -250,6 +256,8 @@ class BaseConnection(connection.Connection):
             retries=self.params.connection_attempts - 1,
             retry_pause=self.params.retry_delay,
             _until_first_amqp_attempt=True)
+
+        self._connection_workflow._set_async_services(self._async)
 
         def create_connector():
             """`AMQPConnector` factory"""
@@ -304,6 +312,8 @@ class BaseConnection(connection.Connection):
             `AbstractAMQPConnectionWorkflow.start()` for details.
 
         """
+        perr('_on_connection_workflow_done({!r})'.format(conn_or_exc))
+
         LOGGER.debug('Full-stack connection workflow completed: %r',
                      conn_or_exc)
 
@@ -322,6 +332,15 @@ class BaseConnection(connection.Connection):
             else:
                 LOGGER.error('Full-stack connection workflow failed: %r',
                              conn_or_exc)
+                if (isinstance(conn_or_exc,
+                               connection_workflow
+                               .AMQPConnectionWorkflowError) and
+                        isinstance(conn_or_exc.exceptions[-1],
+                                   connection_workflow
+                                   .AMQPConnectorSocketConnectError)):
+                    conn_or_exc = pika.exceptions.AMQPConnectionError(
+                        conn_or_exc)
+
 
             self._on_stack_connection_workflow_failed(conn_or_exc)
         else:
@@ -369,6 +388,9 @@ class BaseConnection(connection.Connection):
 
         """
         self._transport = transport
+
+        # Lset connection know that stream is available
+        self._on_stream_connected()
 
     def connection_lost(self, error):
         """Called upon loss or closing of TCP connection.

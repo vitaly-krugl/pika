@@ -20,6 +20,10 @@ import pika.tcp_socket_opts
 _LOG = logging.getLogger(__name__)
 
 
+def perr(*args):
+    import sys
+    print(*args, file=sys.stderr)
+
 class AMQPConnectorException(Exception):
     """Base exception for this module"""
     pass
@@ -167,6 +171,9 @@ class AMQPConnector(object):
                 `AMQPConnectorAborted`
 
         """
+        perr('AMQPConnector.start({!r}, {!r}, {!r}, {!r})'.format(
+            addr_record, conn_params, timeout, on_done))
+
         if self._state != self._STATE_INIT:
             raise AMQPConnectorWrongState(
                 'Already in progress or finished; state={}'.format(self._state))
@@ -253,7 +260,11 @@ class AMQPConnector(object):
         Transition to STATE_DONE.
 
         """
+        perr('Connector.close()')
+
         self._deactivate()
+
+        perr('Connector.close(): after _deactivate.')
 
         if self._sock is not None:
             self._sock.close()
@@ -270,11 +281,15 @@ class AMQPConnector(object):
         """Cancel asynchronous tasks.
 
         """
+        perr('Connector._deactivate()')
+
         # NOTE: self._amqp_conn requires special handling as it doesn't support
         # synchronous closing. We special-case it elsewhere in the code where
         # needed.
         assert self._amqp_conn is None, \
             '_deactivate called with self._amqp_conn not None'
+
+        perr('Connector._deactivate(): after assert self._amqp_conn is None.')
 
         if self._tcp_timeout_ref is not None:
             self._tcp_timeout_ref.cancel()
@@ -294,6 +309,7 @@ class AMQPConnector(object):
         :param pika.connection.Connection | BaseException result: value to pass
             to user's `on_done` callback.
         """
+        perr('Connector._report_completion_and_cleanup({!r})'.format(result))
         if isinstance(result, BaseException):
             _LOG.error('AMQPConnector - reporting failure: %r', result)
         else:
@@ -302,6 +318,7 @@ class AMQPConnector(object):
         on_done = self._on_done
         self._close()
 
+        perr('Connector.on_done={!r}'.format(on_done))
         on_done(result)
 
     def _on_tcp_connection_timeout(self):
@@ -372,6 +389,8 @@ class AMQPConnector(object):
             failure
 
         """
+        perr('_on_tcp_connection_done({})'.format(exc))
+
         self._task_ref = None
         self._tcp_timeout_ref.cancel()
 
@@ -415,6 +434,7 @@ class AMQPConnector(object):
             (transport, protocol); on failure, exception instance.
 
         """
+        perr('_on_transport_establishment_done({!r})'.format(result))
         self._task_ref = None
 
         if isinstance(result, BaseException):
@@ -451,6 +471,8 @@ class AMQPConnector(object):
             failure
 
         """
+        perr('_on_amqp_handshake_done({!r}, {!r}'.format(connection, error))
+
         _LOG.debug('AMQPConnector: AMQP handshake attempt completed; state=%s; '
                    'error=%r; %r/%s', self._state, error,
                    self._conn_params.host, self._addr_record)
@@ -652,6 +674,8 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
         """Override `AbstractAMQPConnectionWorkflow.start()`.
 
         """
+        perr('Workflow.start()')
+
         if self._state != self._STATE_INIT:
             raise AMQPConnectorWrongState(
                 'Already in progress or finished; state={}'.format(self._state))
@@ -740,6 +764,8 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
         :param pika.connection.Connection | AMQPConnectionWorkflowError result:
             value to pass to user's `on_done` callback.
         """
+        perr('Workflow._report_completion_and_cleanup({!r})'.format(result))
+
         if isinstance(result, BaseException):
             _LOG.error('AMQPConnectionWorkflow - reporting failure: %r',
                        result)
@@ -759,6 +785,8 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
         :param bool first: if True, don't delay; otherwise delay next attempt by
             `self._retry_pause` seconds.
         """
+        perr('_start_new_cycle_async()')
+
         self._async_ref = None
 
         assert self._attempts_remaining >= 0, self._attempts_remaining
@@ -784,6 +812,7 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
         more configs, start a new cycle.
 
         """
+        perr('_try_next_config_async')
         self._async_ref = None
 
         if self._current_config_index is None:
@@ -815,6 +844,7 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
         :param list | BaseException addrinfos_or_exc: resolved address records
             returned by `getaddrinfo()` or an exception object from failure.
         """
+        perr('_on_getaddrinfo_async_done({!r}'.format(addrinfos_or_exc))
         self._async_ref = None
 
         if isinstance(addrinfos_or_exc, BaseException):
@@ -841,6 +871,8 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
             self._try_next_config_async()
             return
 
+        perr('_try_next_resolved_address: {!r}'.format(addr_record))
+
         _LOG.debug('Attempting to connect using address record %r', addr_record)
 
         self._connector = self._connector_factory()  # type: AMQPConnector
@@ -858,6 +890,7 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
             `AMQPConnector.start()` for exception details.
 
         """
+        perr('Workflow._on_connector_done({!r}'.format(conn_or_exc))
         self._connector = None
         _LOG.debug('Connection attempt completed with %r', conn_or_exc)
 
