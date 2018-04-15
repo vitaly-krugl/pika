@@ -3,16 +3,14 @@ connection.Connection class to encapsulate connection behavior but still
 isolate socket and low level communication.
 
 """
-import errno
+import abc
 import logging
-import os
 
 import pika.compat
 import pika.exceptions
 import pika.tcp_socket_opts
 
-from pika.adapters import connection_workflow # import (AMQPConnectionWorkflow,
-                                              # AMQPConnector)
+from pika.adapters import connection_workflow
 from pika import connection
 
 
@@ -27,7 +25,8 @@ class BaseConnection(connection.Connection):
                  on_open_callback,
                  on_open_error_callback,
                  on_close_callback,
-                 async_services):
+                 async_services,
+                 internal_connection_workflow):
         """Create a new instance of the Connection object.
 
         :param None|pika.connection.Parameters parameters: Connection parameters
@@ -38,6 +37,9 @@ class BaseConnection(connection.Connection):
             on_close_callback(connection, reason_code, reason_text)
         :param async_interface.AbstractAsyncServices async_services:
             asynchronous services
+        :param bool internal_connection_workflow: True for autonomous connection
+            establishment which is default; False for externally-managed
+            connection workflow via the `create_connection()` factory.
         :raises: RuntimeError
         :raises: ValueError
 
@@ -49,13 +51,16 @@ class BaseConnection(connection.Connection):
         self._async = async_services
 
         self._connection_workflow = None  # type: connection_workflow.AMQPConnectionWorkflow
-        self._transport = None  # type: async_interface.AbstractStreamTransport
+        self._transport = None  # type: pika.adapters.async_interface.AbstractStreamTransport
 
         self._got_eof = False  # transport indicated EOF (connection reset)
 
-        super(BaseConnection,
-              self).__init__(parameters, on_open_callback,
-                             on_open_error_callback, on_close_callback)
+        super(BaseConnection, self).__init__(
+            parameters,
+            on_open_callback,
+            on_open_error_callback,
+            on_close_callback,
+            internal_connection_workflow=internal_connection_workflow)
 
     def _init_connection_state(self):
         """Initialize or reset all of our internal state variables for a given
@@ -96,6 +101,85 @@ class BaseConnection(connection.Connection):
                 (self.__class__.__name__,
                  self._STATE_NAMES[self.connection_state],
                  self._transport, self.params))
+
+    @abc.abstractmethod
+    @classmethod
+    def create_connection(cls,
+                          connection_configs,
+                          on_done,
+                          custom_ioloop=None,
+                          workflow=None):
+        """Asynchronously create a connection to an AMQP broker using the given
+        configurations. Will attempt to connect using each config in the given
+        order, including all compatible resolved IP addresses of the hostname
+        supplied in each config, until one is established or all attempts fail.
+
+        See also `_start_connection_workflow()`.
+
+        :param sequence connection_configs: A sequence of one or more
+            `pika.connection.Parameters`-based objects.
+        :param callable on_done: as defined in
+            `pika.adapters.connection_workflow.AbstractAMQPConnectionWorkflow.start()`.
+        :param object | None custom_ioloop: Provide a custom I/O loop that is
+            native to the specific adapter implementation; if None, the adapter
+            will use a default loop instance, which is typically a singleton.
+        :param connection_workflow.AbstractAMQPConnectionWorkflow | None workflow:
+            Pass an instance of an implementation of the
+            `connection_workflow.AbstractAMQPConnectionWorkflow` interface;
+            defaults to a `connection_workflow.AMQPConnectionWorkflow` instance
+            with default values for optional args.
+
+        :return: Connection workflow instance in use. The user should limit
+            their interaction with this object only to it's `abort()` method.
+        :rtype: connection_workflow.AbstractAMQPConnectionWorkflow
+
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def _start_connection_workflow(connection_configs,
+                                   connection_factory,
+                                   async_services,
+                                   workflow,
+                                   on_done):
+        """Helper function for custom implementations of `create_connection()`.
+
+        :param sequence connection_configs: A sequence of one or more
+            `pika.connection.Parameters`-based objects.
+        :param callable connection_factory: A function that takes no args and
+            returns a brand new `pika.connection.Connection`-based adapter
+            instance each time it is called.
+        :param pika.adapters.async_interface.AbstractAsyncServices async_services:
+        :param connection_workflow.AbstractAMQPConnectionWorkflow | None workflow:
+            Pass an instance of an implementation of the
+            `connection_workflow.AbstractAMQPConnectionWorkflow` interface;
+            defaults to a `connection_workflow.AMQPConnectionWorkflow` instance
+            with default values for optional args.
+        :param callable on_done: as defined in
+            `pika.adapters.connection_workflow.AbstractAMQPConnectionWorkflow.start()`.
+
+        :return: Connection workflow instance in use. The user should limit
+            their interaction with this object only to it's `abort()` method.
+        :rtype: connection_workflow.AbstractAMQPConnectionWorkflow
+
+        """
+        if workflow is None:
+            workflow = connection_workflow.AMQPConnectionWorkflow()
+            LOGGER.debug('Created default connection workflow %r', workflow)
+
+        def create_connector():
+            """`AMQPConnector` factory."""
+            return connection_workflow.AMQPConnector(connection_factory,
+                                                     async_services)
+
+        workflow.start(
+            connection_configs=connection_configs,
+            connector_factory=create_connector,
+            native_loop=async_services.get_native_ioloop(),
+            on_done=on_done)
+
+        return workflow
+
 
     @property
     def ioloop(self):
@@ -162,27 +246,55 @@ class BaseConnection(connection.Connection):
 
         """
         self._connection_workflow = connection_workflow.AMQPConnectionWorkflow(
-            [self.params],
             connection_timeout=self.params.socket_timeout * 1.5,
             retries=self.params.connection_attempts - 1,
             retry_pause=self.params.retry_delay,
             _until_first_amqp_attempt=True)
 
         def create_connector():
+            """`AMQPConnector` factory"""
             return connection_workflow.AMQPConnector(lambda: self, self._async)
 
         self._connection_workflow.start(
+            [self.params],
             connector_factory=create_connector,
             native_loop=self._async.get_native_ioloop(),
             on_done=self._on_connection_workflow_done)
 
     def _adapter_abort_connection_workflow(self):
-        """Asynchronously abort connection workflow. Upon completion, call
-        `Connection._on_stack_connection_workflow_failed()` with None as the
-        argument.
+        """Asynchronously abort connection workflow. Upon
+        completion, call `Connection._on_stack_connection_workflow_failed()`
+        with None as the argument.
+
+        Assumption: may be called only while connection is opening.
 
         """
-        self._connection_workflow.abort()
+        assert self._opening, (
+            '_adapter_abort_connection_workflow() may be called only when '
+            'connection is opening.')
+
+        if self._transport is None:
+            # NOTE: this is possible only when user calls Connection.close() to
+            # interrupt internally-initiated connection establishment.
+            # self._connection_workflow.abort() would not call
+            # Connection.close() before pairing of connection with transport.
+            #
+            # This will result in call to _on_connection_workflow_done() upon
+            # completion
+            self._connection_workflow.abort()
+        else:
+            # NOTE: we can't use self._connection_workflow.abort() in this case,
+            # because it would result in infinite recursion as we're called
+            # from Connection.close() and _connection_workflow.abort() calls
+            # Connection.close() to abort a connection that's already been
+            # paired with a transport. During internally-initiated connection
+            # establishment, AMQPConnectionWorkflow will discover that user
+            # aborted the connection when it receives
+            # pika.exceptions.ConnectionOpenAborted.
+
+            # This completes asynchronously, culminating in call to our method
+            # `connection_lost()`
+            self._transport.abort()
 
     def _on_connection_workflow_done(self, conn_or_exc):
         """`AMQPConnectionWorkflow` completion callback.
@@ -220,18 +332,13 @@ class BaseConnection(connection.Connection):
                     self, conn_or_exc)
 
     def _adapter_disconnect(self):
-        """Disconnect
+        """Asynchronously bring down the streaming transport layer and invoke
+        `Connection._on_stack_terminated()` asynchronously when complete.
 
         """
-        # TODO: deal with connection workflow and tranport abort instead of drop.
-        # TODO: get rid of _transport_mgr
-        if self._transport_mgr is not None:
-            self._transport_mgr.close()
-            self._transport_mgr = None
-
-        if self._transport is not None:
-            self._transport.drop()
-            self._transport = None
+        # This completes asynchronously, culminating in call to our method
+        # `connection_lost()`
+        self._transport.abort()
 
     def _adapter_emit_data(self, data):
         """Take ownership of data and send it to AMQP server as soon as
@@ -293,10 +400,7 @@ class BaseConnection(connection.Connection):
                    'connection_lost: %r',
                    error)
 
-        if error is not None and self._error is None:
-            self._error = error
-
-        self._on_stack_terminated()
+        self._on_stack_terminated(error)
 
     def eof_received(self):  # pylint: disable=R0201
         """Called after the remote peer shuts its write end of the connection.

@@ -14,6 +14,7 @@ import threading
 
 import pika.compat
 
+import pika.adapters.async_interface
 from pika.adapters.base_connection import BaseConnection
 from pika.adapters.selector_ioloop_adapter import (
     SelectorAsyncServicesAdapter,
@@ -72,7 +73,8 @@ class SelectConnection(BaseConnection):
             on_open_callback=None,
             on_open_error_callback=None,
             on_close_callback=None,
-            custom_ioloop=None):
+            custom_ioloop=None,
+            internal_connection_workflow=True):
         """Create a new instance of the Connection object.
 
         :param pika.connection.Parameters parameters: Connection parameters
@@ -81,17 +83,58 @@ class SelectConnection(BaseConnection):
             be established: on_open_error_callback(connection, str|exception)
         :param method on_close_callback: Called when the connection is closed:
             on_close_callback(connection, reason_code, reason_text)
-        :param custom_ioloop: Override using the global IOLoop in Tornado
+        :param None | IOLoop | pika.adapters.async_interface.AbstractAsyncServices custom_ioloop:
+            Provide a custom I/O Loop object.
+        :param bool internal_connection_workflow: True for autonomous connection
+            establishment which is default; False for externally-managed
+            connection workflow via the `create_connection()` factory.
         :raises: RuntimeError
 
         """
-        ioloop = custom_ioloop or IOLoop()
+        if isinstance(custom_ioloop,
+                      pika.adapters.async_interface.AbstractAsyncServices):
+            async_services = custom_ioloop
+        else:
+            async_services = SelectorAsyncServicesAdapter(
+                custom_ioloop or IOLoop())
+
         super(SelectConnection, self).__init__(
             parameters,
             on_open_callback,
             on_open_error_callback,
             on_close_callback,
-            SelectorAsyncServicesAdapter(ioloop))
+            async_services,
+            internal_connection_workflow=internal_connection_workflow)
+
+    @classmethod
+    def create_connection(cls,
+                          connection_configs,
+                          on_done,
+                          custom_ioloop=None,
+                          workflow=None):
+        """Override `BaseConnection.create_connection()` pure virtual method.
+
+        See `BaseConnection.create_connection()` documentation.
+
+        """
+        async_services = SelectorAsyncServicesAdapter(custom_ioloop or IOLoop())
+
+        def create_connection(params):
+            """Connection factory."""
+            if params is None:
+                raise ValueError('Expected pika.connection.Parameters '
+                                 'instance, but got None in params arg.')
+            return cls(
+                parameters=params,
+                custom_ioloop=async_services,
+                internal_connection_workflow=False)
+
+        return cls._start_connection_workflow(
+            connection_configs=connection_configs,
+            connection_factory=create_connection,
+            async_services=async_services,
+            workflow=workflow,
+            on_done=on_done)
 
 
 @functools.total_ordering

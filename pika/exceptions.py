@@ -18,21 +18,17 @@ class AMQPConnectionError(AMQPError):
             return '{}: {}: {}'.format(self.__class__.__name__,
                                        self.args[0],
                                        self.args[1])
+        else:
+            return '{}: {!r}'.format(self.__class__.__name__, self.args)
+
 
 class ConnectionOpenAborted(AMQPConnectionError):
     """Client closed connection while opening."""
     pass
 
 
-class StreamBringUpError(AMQPConnectionError):
-    """Stream (TCP or SSL) connection error."""
-    # TODO: do we use this?
-    pass
-
-
 class StreamLostError(AMQPConnectionError):
     """Stream (TCP) connection lost."""
-    # TODO: do we use this?
     pass
 
 
@@ -74,7 +70,7 @@ class NoFreeChannels(AMQPConnectionError):
 class ConnectionWrongStateError(AMQPConnectionError):
     def __repr__(self):
         if self.args:
-            return super(ConnectionWrongState, self).__repr__()
+            return super(ConnectionWrongStateError, self).__repr__()
         else:
             return (
                 'The connection is in wrong state for the requested operation.')
@@ -131,7 +127,7 @@ class ConnectionBlockedTimeout(AMQPConnectionError):
     pass
 
 
-class HeartbeatTimeout(AMQPConnectionError):
+class AMQPHeartbeatTimeout(AMQPConnectionError):
     """Connection was dropped as result of heartbeat timeout."""
     pass
 
@@ -335,7 +331,7 @@ class InvalidMaximumFrameSize(ProtocolSyntaxError):
         return 'AMQP Maximum Frame Size is 131072 Bytes'
 
 
-class RecursionError(Exception):
+class ReentrancyError(Exception):
     """The requested operation would result in unsupported recursion or
     reentrancy.
 

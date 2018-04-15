@@ -13,6 +13,7 @@ import numbers
 import socket
 
 import pika.compat
+import pika.exceptions
 import pika.tcp_socket_opts
 
 
@@ -111,9 +112,6 @@ class AMQPConnectionWorkflowError(AMQPConnectorException):
             self.exceptions[-1])
 
 
-# TODO: Abort the transport instead of closing AMQP Connection in all cases.
-#       Look into connection callback (de)registration logic.
-
 class AMQPConnector(object):
     """Performs a single TCP/[SSL]/AMQP connection workflow.
 
@@ -131,8 +129,8 @@ class AMQPConnector(object):
         """
 
         :param callable conn_factory: A function that takes no args and
-            returns a brand new `pika.connection.Connection`-based object
-            each time it is called.
+            returns a brand new `pika.connection.Connection`-based adapter
+            instance each time it is called.
         :param pika.adapters.async_interface.AbstractAsyncServices async_services:
 
         """
@@ -237,9 +235,9 @@ class AMQPConnector(object):
                 # callback from the Connection instance before reporting
                 # completion to client
                 _LOG.debug('AMQPConnector.abort(): closing Connection.')
-                self._amqp_conn.add_on_close_callback(self._on_amqp_closed)
-                self._amqp_conn.close(320,
-                                      'Client-initiated abort of AMQPConnector')
+                self._amqp_conn.close(
+                    320,
+                    'Client-initiated abort of AMQP Connection Workflow.')
             else:
                 # It's already closing, must be due to our timeout processing,
                 # so we'll just piggy back on the callback it registered
@@ -345,7 +343,6 @@ class AMQPConnector(object):
             # to client
             assert not self._amqp_conn.is_open, \
                 'Unexpected open state of {!r}'.format(self._amqp_conn)
-            self._amqp_conn.add_on_close_callback(self._on_amqp_closed)
             self._amqp_conn.close(320, msg)
             return
 
@@ -442,7 +439,7 @@ class AMQPConnector(object):
         self._amqp_conn.add_on_open_callback(self._on_amqp_handshake_done)
 
     def _on_amqp_handshake_done(self, connection, error=None):
-        """Handle completion of AMQP connection handsahke attempt.
+        """Handle completion of AMQP connection handshake attempt.
 
         NOTE: we handle two types of callbacks - success with just connection
         arg as well as the open-error callback with connection and error
@@ -454,66 +451,43 @@ class AMQPConnector(object):
             failure
 
         """
-
-        if self._state != self._STATE_AMQP:
-            # We timed out or aborted and initiated closing of the connection,
-            # but this callback snuck in
-            _LOG.debug('Ignoring AMQP hanshake completion notification due to '
-                       'wrong state=%s; error=%r; conn=%r',
-                       self._state, error, connection)
-            return
-
-        self._amqp_conn = None
-
-        if error is None:
-            _LOG.debug(
-                'AMQPConnector: AMQP connection established for %r/%s: %r',
-                self._conn_params.host, self._addr_record, connection)
-            result = connection
-        else:
-            _LOG.debug(
-                'AMQPConnector: AMQP connection handshake failed for %r/%s: %r',
-                self._conn_params.host, self._addr_record, error)
-            result = AMQPConnectorAMQPHandshakeError(error)
-
-        self._report_completion_and_cleanup(result)
-
-    def _on_amqp_closed(self, _connection, reply_code, reply_text):
-        """Handle closing of connection. We request this callback when forcing
-        the Conneciton instance closed durin timeout and abort handling.
-
-        Reports AMQPConnectorAMQPHandshakeError with AMQPConnectorTimeout if
-        overall timeout occurred during AMQP handshake.
-
-        Reports AMQPConnectorAborted if the workflow was aborted.
-
-        :param pika.connection.Connection _connection: unused
-        :param int reply_code:
-        :param text reply_text:
-
-        """
-        self._amqp_conn = None
-
-        _LOG.debug(
-            'AMQPConnector: AMQP connection close completed; state=%s; '
-            'reply_code=%s; reply_text=%r; %r/%s',
-            self._state, reply_code, reply_text, self._conn_params.host,
-            self._addr_record)
+        _LOG.debug('AMQPConnector: AMQP handshake attempt completed; state=%s; '
+                   'error=%r; %r/%s', self._state, error,
+                   self._conn_params.host, self._addr_record)
 
         if self._state == self._STATE_ABORTING:
             # Client-initiated abort takes precedence over timeout
-            self._report_completion_and_cleanup(AMQPConnectorAborted())
+            result = AMQPConnectorAborted()
         elif self._state == self._STATE_TIMEOUT:
-            self._report_completion_and_cleanup(
-                AMQPConnectorAMQPHandshakeError(
-                    AMQPConnectorTimeout(
-                        'Timeout during AMQP handshake{!r}/{}; ssl={}'.format(
-                            self._conn_params.host,
-                            self._addr_record,
-                            bool(self._conn_params.ssl_options)))))
+            result = AMQPConnectorAMQPHandshakeError(
+                AMQPConnectorTimeout(
+                    'Timeout during AMQP handshake{!r}/{}; ssl={}'.format(
+                        self._conn_params.host,
+                        self._addr_record,
+                        bool(self._conn_params.ssl_options))))
+        elif self._state == self._STATE_AMQP:
+            self._amqp_conn = None
+
+            if error is None:
+                _LOG.debug(
+                    'AMQPConnector: AMQP connection established for %r/%s: %r',
+                    self._conn_params.host, self._addr_record, connection)
+                result = connection
+            else:
+                _LOG.debug(
+                    'AMQPConnector: AMQP connection handshake failed for '
+                    '%r/%s: %r',
+                    self._conn_params.host, self._addr_record, error)
+                result = AMQPConnectorAMQPHandshakeError(error)
         else:
-            _LOG.critical('AMQPConnector._on_amqp_closed() called in '
-                          'unexpected state=%s', self._state)
+            # We timed out or aborted and initiated closing of the connection,
+            # but this callback snuck in
+            _LOG.debug('AMQPConnector: Ignoring AMQP handshake completion '
+                       'notification due to wrong state=%s; error=%r; conn=%r',
+                       self._state, error, connection)
+            return
+
+        self._report_completion_and_cleanup(result)
 
 
 class AbstractAMQPConnectionWorkflow(pika.compat.AbstractBase):
@@ -521,14 +495,20 @@ class AbstractAMQPConnectionWorkflow(pika.compat.AbstractBase):
 
     """
 
-    def start(self, connector_factory, native_loop, on_done):
+    def start(self,
+              connection_configs,
+              connector_factory,
+              native_loop,
+              on_done):
         """Asynchronously perform the workflow until success or all retries
         are exhausted. Called by the adapter.
 
+        :param sequence connection_configs: A sequence of one or more
+            `pika.connection.Parameters`-based objects. Will attempt to connect
+            using each config in the given order.
         :param callable connector_factory: call it without args to obtain a new
-            instance of `AMQPConnector` for each connection attempt, then use
-            its `start()` method to initiate the full stack connection setup.
-            See `AMQPConnector.start()` for details.
+            instance of `AMQPConnector` for each connection attempt.
+            See `AMQPConnector` for details.
         :param native_loop: Native I/O loop passed by app to the adapter or
             obtained by the adapter by default.
         :param callable on_done: Function to call upon completion of the
@@ -584,15 +564,11 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
     _STATE_DONE = 3
 
     def __init__(self,
-                 connection_configs,
                  connection_timeout=20,
                  retries=0,
                  retry_pause=2,
                  _until_first_amqp_attempt=False):
         """
-        :param sequence connection_configs: A sequence of
-            `pika.connection.Parameters`-based objects. Will attempt to connect
-            using each config in the given order.
         :param int | float connection_timeout: Positive overall timeout for a
             given TCP/[SSL]/AMQP connection attempt.
         :param int retries: Non-negative maximum number of retries after the
@@ -612,16 +588,6 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
         TODO: Would it be useful to implement exponential back-off?
 
         """
-        try:
-            iter(connection_configs)
-        except Exception as error:
-            raise TypeError(
-                'connection_configs does not support iteration: {!r}'.format(
-                    error))
-        if not connection_configs:
-            raise ValueError(
-                'connection_configs is empty: {!r}.'.format(connection_configs))
-
         if connection_timeout <= 0.0:
             raise ValueError(
                 'connection_timeout must be a positive number: {!r}.'.format(
@@ -638,7 +604,6 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
             raise ValueError(
                 'retry_pause must be non-negative: {!r}.'.format(retry_pause))
 
-        self._connection_configs = connection_configs
         self._connection_timeout = connection_timeout
         self._attempts_remaining = retries + 1
         self._retry_pause = retry_pause
@@ -651,8 +616,9 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
         # starting a new connection sequence.
         self._current_config_index = None
 
-        self._connector_factory = None  # provided by start()
-        self._on_done = None  # provided by start()
+        self._connection_configs = None  # supplied by start()
+        self._connector_factory = None  # supplied by start()
+        self._on_done = None  # supplied by start()
 
         self._connector = None  # type: AMQPConnector
 
@@ -679,6 +645,7 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
         self._async_services = async_services
 
     def start(self,
+              connection_configs,
               connector_factory,
               native_loop,  # pylint: disable=W0613
               on_done):
@@ -689,10 +656,23 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
             raise AMQPConnectorWrongState(
                 'Already in progress or finished; state={}'.format(self._state))
 
+        try:
+            iter(connection_configs)
+        except Exception as error:
+            raise TypeError(
+                'connection_configs does not support iteration: {!r}'.format(
+                    error))
+        if not connection_configs:
+            raise ValueError(
+                'connection_configs is empty: {!r}.'.format(connection_configs))
+
+        self._connection_configs = connection_configs
         self._connector_factory = connector_factory
         self._on_done = on_done
 
         self._state = self._STATE_ACTIVE
+
+        _LOG.debug('Starting AMQP Connection workflow asynchronously.')
 
         # Begin from our own I/O loop context to avoid calling back into client
         # from client's call here
@@ -894,8 +874,13 @@ class AMQPConnectionWorkflow(AbstractAMQPConnectionWorkflow):
                   isinstance(conn_or_exc, AMQPConnectorAMQPHandshakeError)):
                 _LOG.debug('Ending AMQP connection workflow after first failed '
                            'AMQP handshake due to _until_first_amqp_attempt.')
-                self._report_completion_and_cleanup(
-                    AMQPConnectionWorkflowError(self._connection_errors))
+                if isinstance(conn_or_exc.exception,
+                              pika.exceptions.ConnectionOpenAborted):
+                    error = AMQPConnectionWorkflowAborted
+                else:
+                    error = AMQPConnectionWorkflowError(self._connection_errors)
+
+                self._report_completion_and_cleanup(error)
             else:
                 self._try_next_resolved_address()
         else:
