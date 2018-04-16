@@ -984,11 +984,6 @@ class TestStreamConnectorEOFReceived(
         logger = self.logger
 
         streaming_connection_result_bucket = []
-        socket_connect_done_result_bucket = []
-
-        echo = ForwardServer(remote_addr=None)
-        echo.start()
-        self.addCleanup(lambda: echo.stop() if echo.running else None)
 
         class TestStreamConnectorTxRxStreamProtocol(
                 async_interface.AbstractStreamProtocol):
@@ -1023,36 +1018,27 @@ class TestStreamConnectorEOFReceived(
             def data_received(self, data):
                 # logger.info('data_received: len=%s', len(data))
                 self.all_rx_data += data
-                if self.transport.get_write_buffer_size() == 0:
-                    # Simulate EOF
-                    echo.stop()
 
-        sock = self.create_nonblocking_tcp_socket()
+        local_sock, remote_sock = self.create_nonblocking_socketpair()
 
-        logger.info('created sock=%s', sock)
+        logger.info('created local_sock=%s, remote_sock=%s',
+                    local_sock, remote_sock)
 
         def on_streaming_creation_done(result):
             logger.info('on_streaming_creation_done(%r)', result)
             streaming_connection_result_bucket.append(result)
 
-        def on_socket_connect_done(result):
-            logger.info('on_socket_connect_done(%r)', result)
-            socket_connect_done_result_bucket.append(result)
+            # Simulate EOF
+            remote_sock.shutdown(socket.SHUT_WR)
 
-            svcs.create_streaming_connection(
-                TestStreamConnectorTxRxStreamProtocol,
-                sock,
-                on_streaming_creation_done)
-
-        svcs.connect_socket(sock,
-                            echo.server_address,
-                            on_socket_connect_done)
+        svcs.create_streaming_connection(
+            TestStreamConnectorTxRxStreamProtocol,
+            local_sock,
+            on_streaming_creation_done)
 
         logger.info('calling svcs.run()')
         svcs.run()
         logger.info('svcs.run() returned')
-
-        self.assertEqual(socket_connect_done_result_bucket, [None])
 
         my_proto = my_protocol_bucket[0]  # type: TestStreamConnectorTxRxStreamProtocol
 
