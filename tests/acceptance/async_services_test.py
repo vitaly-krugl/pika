@@ -964,7 +964,7 @@ class TestStreamConnectorBrokenPipe(
         my_proto = my_protocol_bucket[0]  # type: TestStreamConnectorTxRxStreamProtocol
 
         error = my_proto.connection_lost_error_bucket[0]
-        self.assertIsInstance(error, OSError)
+        self.assertIsInstance(error, pika.compat.SOCKET_ERROR)
         # NOTE: we occasionally see EPROTOTYPE on OSX
         self.assertIn(error.errno,
                       [errno.EPIPE, errno.ECONNRESET, errno.EPROTOTYPE])
