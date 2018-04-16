@@ -6,15 +6,21 @@ Tests of async_interface.AbstractAsyncServices adaptations
 import collections
 import errno
 import logging
+import os
 import platform
 import socket
 import time
 import unittest
 
 import pika.compat
+from pika.adapters import async_interface
+
+from ..forward_server import ForwardServer
 
 from ..async_services_test_stubs import AsyncServicesTestStubs
 
+# too-many-lines
+# pylint: disable=C0302
 
 # Suppress missing-docstring to allow test method names to be printed by our the
 # test runner
@@ -25,6 +31,9 @@ from ..async_services_test_stubs import AsyncServicesTestStubs
 
 # protected-access
 # pylint: disable=W0212
+
+# too-many-locals
+# pylint: disable=R0914
 
 
 ON_WINDOWS = platform.system() == 'Windows'
@@ -739,3 +748,318 @@ class TestConnectSocketIPv6Fail(SocketConnectorTestBase,
 
     def start(self):
         self.check_failed_connect(socket.AF_INET6)
+
+
+class StreamingTestBase(AsyncServicesTestBase):
+    pass
+
+
+class TestStreamConnectorRaisesValueErrorFromUnconnectedSocket(
+        StreamingTestBase,
+        AsyncServicesTestStubs):
+
+    def start(self):
+        svcs = self.create_async()
+
+        with self.assertRaises(ValueError) as exc_ctx:
+            svcs.create_streaming_connection(
+                lambda: None,  # dummy protocol factory
+                self.create_nonblocking_tcp_socket(),
+                lambda result: None)  # dummy on_done callback
+
+        self.assertIn('getpeername() failed', exc_ctx.exception.args[0])
+
+
+class TestStreamConnectorTxRx(
+        StreamingTestBase,
+        AsyncServicesTestStubs):
+
+    def start(self):
+        svcs = self.create_async()
+
+        original_data = tuple(
+            os.urandom(1000) for _ in pika.compat.xrange(1000))
+        original_data_length = sum(len(s) for s in original_data)
+
+        my_protocol_bucket = []
+
+        logger = self.logger
+
+        class TestStreamConnectorTxRxStreamProtocol(
+                async_interface.AbstractStreamProtocol):
+
+            def __init__(self):
+                self.transport = None  # type: async_interface.AbstractStreamTransport
+                self.connection_lost_error_bucket = []
+                self.eof_rx = False
+                self.all_rx_data = b''
+
+                my_protocol_bucket.append(self)
+
+            def connection_made(self, transport):
+                logger.info('connection_made(%r)', transport)
+                self.transport = transport
+
+                for chunk in original_data:
+                    self.transport.write(chunk)
+
+            def connection_lost(self, error):
+                logger.info('connection_lost(%r)', error)
+                self.connection_lost_error_bucket.append(error)
+                svcs.stop()
+
+            def eof_received(self):
+                logger.info('eof_received()')
+                self.eof_rx = True
+                # False tells transport to close the sock and call
+                # connection_lost(None)
+                return False
+
+            def data_received(self, data):
+                # logger.info('data_received: len=%s', len(data))
+                self.all_rx_data += data
+                if (self.transport.get_write_buffer_size() == 0 and
+                        len(self.all_rx_data) >= original_data_length):
+                    self.transport.abort()
+
+        streaming_connection_result_bucket = []
+        socket_connect_done_result_bucket = []
+
+        with ForwardServer(remote_addr=None) as echo:
+            sock = self.create_nonblocking_tcp_socket()
+
+            logger.info('created sock=%s', sock)
+
+            def on_streaming_creation_done(result):
+                logger.info('on_streaming_creation_done(%r)', result)
+                streaming_connection_result_bucket.append(result)
+
+            def on_socket_connect_done(result):
+                logger.info('on_socket_connect_done(%r)', result)
+                socket_connect_done_result_bucket.append(result)
+
+                svcs.create_streaming_connection(
+                    TestStreamConnectorTxRxStreamProtocol,
+                    sock,
+                    on_streaming_creation_done)
+
+            svcs.connect_socket(sock,
+                                echo.server_address,
+                                on_socket_connect_done)
+
+            logger.info('calling svcs.run()')
+            svcs.run()
+            logger.info('svcs.run() returned')
+
+        self.assertEqual(socket_connect_done_result_bucket, [None])
+
+        my_proto = my_protocol_bucket[0]  # type: TestStreamConnectorTxRxStreamProtocol
+        transport, protocol = streaming_connection_result_bucket[0]
+        self.assertIsInstance(transport,
+                              async_interface.AbstractStreamTransport)
+        self.assertIs(protocol, my_proto)
+        self.assertIs(transport, my_proto.transport)
+
+        self.assertEqual(my_proto.connection_lost_error_bucket, [None])
+
+        self.assertFalse(my_proto.eof_rx)
+
+        self.assertEqual(len(my_proto.all_rx_data), original_data_length)
+        self.assertEqual(my_proto.all_rx_data, b''.join(original_data))
+
+
+class TestStreamConnectorBrokenPipe(
+        StreamingTestBase,
+        AsyncServicesTestStubs):
+
+    def start(self):
+        svcs = self.create_async()
+
+        my_protocol_bucket = []
+
+        logger = self.logger
+
+        streaming_connection_result_bucket = []
+        socket_connect_done_result_bucket = []
+
+        echo = ForwardServer(remote_addr=None)
+        echo.start()
+        self.addCleanup(lambda: echo.stop() if echo.running else None)
+
+        class TestStreamConnectorTxRxStreamProtocol(
+                async_interface.AbstractStreamProtocol):
+
+            def __init__(self):
+                self.transport = None  # type: async_interface.AbstractStreamTransport
+                self.connection_lost_error_bucket = []
+                self.eof_rx = False
+                self.all_rx_data = b''
+
+                my_protocol_bucket.append(self)
+
+                self._timer_ref = None
+
+            def connection_made(self, transport):
+                logger.info('connection_made(%r)', transport)
+                self.transport = transport
+
+                # Simulate Broken Pipe
+                echo.stop()
+
+                self._on_write_timer()
+
+            def connection_lost(self, error):
+                logger.info('connection_lost(%r)', error)
+                self.connection_lost_error_bucket.append(error)
+
+                self._timer_ref.cancel()
+                svcs.stop()
+
+            def eof_received(self):
+                logger.info('eof_received()')
+                self.eof_rx = True
+
+                # Force write
+                self.transport.write(b'eof_received')
+
+                # False tells transport to close the sock and call
+                # connection_lost(None)
+                return True  # Don't close sock, let writer logic detect error
+
+            def data_received(self, data):
+                logger.info('data_received: len=%s', len(data))
+                self.all_rx_data += data
+
+            def _on_write_timer(self):
+                self.transport.write(b'_on_write_timer')
+                self._timer_ref = svcs.call_later(0.01, self._on_write_timer)
+
+        sock = self.create_nonblocking_tcp_socket()
+
+        logger.info('created sock=%s', sock)
+
+        def on_streaming_creation_done(result):
+            logger.info('on_streaming_creation_done(%r)', result)
+            streaming_connection_result_bucket.append(result)
+
+        def on_socket_connect_done(result):
+            logger.info('on_socket_connect_done(%r)', result)
+            socket_connect_done_result_bucket.append(result)
+
+            svcs.create_streaming_connection(
+                TestStreamConnectorTxRxStreamProtocol,
+                sock,
+                on_streaming_creation_done)
+
+        svcs.connect_socket(sock,
+                            echo.server_address,
+                            on_socket_connect_done)
+
+        logger.info('calling svcs.run()')
+        svcs.run()
+        logger.info('svcs.run() returned')
+
+        self.assertEqual(socket_connect_done_result_bucket, [None])
+
+        my_proto = my_protocol_bucket[0]  # type: TestStreamConnectorTxRxStreamProtocol
+
+        error = my_proto.connection_lost_error_bucket[0]
+        if isinstance(error, BrokenPipeError):
+            pass
+        elif isinstance(error, ConnectionResetError):
+            # We see this on OS X now and then
+            self.assertEqual(error.errno, 54)
+        else:
+            # We see this on OS X now and then
+            self.assertIsInstance(error, OSError)
+            self.assertEqual(error.errno, 41)
+
+
+class TestStreamConnectorEOFReceived(
+        StreamingTestBase,
+        AsyncServicesTestStubs):
+
+    def start(self):
+        svcs = self.create_async()
+
+        original_data = [b'A' * 1000]
+
+        my_protocol_bucket = []
+
+        logger = self.logger
+
+        streaming_connection_result_bucket = []
+        socket_connect_done_result_bucket = []
+
+        echo = ForwardServer(remote_addr=None)
+        echo.start()
+        self.addCleanup(lambda: echo.stop() if echo.running else None)
+
+        class TestStreamConnectorTxRxStreamProtocol(
+                async_interface.AbstractStreamProtocol):
+
+            def __init__(self):
+                self.transport = None  # type: async_interface.AbstractStreamTransport
+                self.connection_lost_error_bucket = []
+                self.eof_rx = False
+                self.all_rx_data = b''
+
+                my_protocol_bucket.append(self)
+
+            def connection_made(self, transport):
+                logger.info('connection_made(%r)', transport)
+                self.transport = transport
+
+                for chunk in original_data:
+                    self.transport.write(chunk)
+
+            def connection_lost(self, error):
+                logger.info('connection_lost(%r)', error)
+                self.connection_lost_error_bucket.append(error)
+                svcs.stop()
+
+            def eof_received(self):
+                logger.info('eof_received()')
+                self.eof_rx = True
+                # False tells transport to close the sock and call
+                # connection_lost(None)
+                return False
+
+            def data_received(self, data):
+                # logger.info('data_received: len=%s', len(data))
+                self.all_rx_data += data
+                if self.transport.get_write_buffer_size() == 0:
+                    # Simulate EOF
+                    echo.stop()
+
+        sock = self.create_nonblocking_tcp_socket()
+
+        logger.info('created sock=%s', sock)
+
+        def on_streaming_creation_done(result):
+            logger.info('on_streaming_creation_done(%r)', result)
+            streaming_connection_result_bucket.append(result)
+
+        def on_socket_connect_done(result):
+            logger.info('on_socket_connect_done(%r)', result)
+            socket_connect_done_result_bucket.append(result)
+
+            svcs.create_streaming_connection(
+                TestStreamConnectorTxRxStreamProtocol,
+                sock,
+                on_streaming_creation_done)
+
+        svcs.connect_socket(sock,
+                            echo.server_address,
+                            on_socket_connect_done)
+
+        logger.info('calling svcs.run()')
+        svcs.run()
+        logger.info('svcs.run() returned')
+
+        self.assertEqual(socket_connect_done_result_bucket, [None])
+
+        my_proto = my_protocol_bucket[0]  # type: TestStreamConnectorTxRxStreamProtocol
+
+        self.assertTrue(my_proto.eof_rx)
+        self.assertEqual(my_proto.connection_lost_error_bucket, [None])

@@ -228,8 +228,8 @@ class AbstractAsyncServices(pika.compat.AbstractBase):
 
         NOTE: This method takes ownership of the socket.
 
-        :param callable protocol_factory: returns an instance with the
-            `AbstractStreamProtocol` interface. The protocol's
+        :param callable protocol_factory: called without args, returns an
+            instance with the `AbstractStreamProtocol` interface. The protocol's
             `connection_made(transport)` method will be called to link it to
             the transport after remaining connection activity (e.g., SSL session
             establishment), if any, is completed successfully.

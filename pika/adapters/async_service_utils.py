@@ -235,7 +235,7 @@ class _AsyncSocketConnector(object):
 
         try:
             socket.inet_pton(sock.family, resolved_addr[0])
-        except Exception as error:
+        except Exception as error:  # pylint: disable=W0703
             if not hasattr(socket, 'inet_pton'):
                 _LOGGER.debug(
                     'Unable to check resolved address: no socket.inet_pton().')
@@ -350,7 +350,8 @@ class _AsyncSocketConnector(object):
         try:
             self._async.set_writer(self._sock.fileno(), self._on_writable)
         except Exception as error:  # pylint: disable=W0703
-            _LOGGER.error('async.set_writer(%s) failed: %r', self._sock, error)
+            _LOGGER.exception('async.set_writer(%s) failed: %r',
+                              self._sock, error)
             self._report_completion(error)
             return
         else:
@@ -438,7 +439,7 @@ class _AsyncStreamConnector(object):
             sock.getpeername()
         except Exception as error:
             raise ValueError(
-                'Expected connected socket, but `getpeername()` failed: '
+                'Expected connected socket, but getpeername() failed: '
                 'error={!r}; {}; '.format(error, sock))
 
         self._async = async_services
@@ -475,8 +476,8 @@ class _AsyncStreamConnector(object):
                 try:
                     self._sock.close()
                 except Exception as error:  # pylint: disable=W0703
-                    _LOGGER.error('_sock.close() failed: error=%r; %s',
-                                  error, self._sock)
+                    _LOGGER.exception('_sock.close() failed: error=%r; %s',
+                                      error, self._sock)
                     raise
         finally:
             self._sock = None
@@ -549,8 +550,8 @@ class _AsyncStreamConnector(object):
         try:
             self._on_done(result)
         except Exception:
-            _LOGGER.error('%r: _on_done(%r) failed.',
-                          self._report_completion, result)
+            _LOGGER.exception('%r: _on_done(%r) failed.',
+                              self._report_completion, result)
             raise
         finally:
             # NOTE: Close the socket on error, since we took ownership of it
@@ -587,8 +588,8 @@ class _AsyncStreamConnector(object):
                     suppress_ragged_eofs=False,  # False = error on incoming EOF
                     server_hostname=self._server_hostname)
             except Exception as error:  # pylint: disable=W0703
-                _LOGGER.error('SSL wrap_socket(%s) failed: %r', self._sock,
-                              error)
+                _LOGGER.exception('SSL wrap_socket(%s) failed: %r', self._sock,
+                                  error)
                 self._report_completion(error)
                 return
 
@@ -609,8 +610,8 @@ class _AsyncStreamConnector(object):
             try:
                 protocol = self._protocol_factory()
             except Exception as error:
-                _LOGGER.error('protocol_factory() failed: error=%r; %s',
-                              error, self._sock)
+                _LOGGER.exception('protocol_factory() failed: error=%r; %s',
+                                  error, self._sock)
                 raise
 
             if self._ssl_context is None:
@@ -620,8 +621,8 @@ class _AsyncStreamConnector(object):
                                                          protocol,
                                                          self._async)
                 except Exception as error:
-                    _LOGGER.error('PlainTransport() failed: error=%r; %s',
-                                  error, self._sock)
+                    _LOGGER.exception('PlainTransport() failed: error=%r; %s',
+                                      error, self._sock)
                     raise
             else:
                 # Create SSL streaming transport
@@ -630,8 +631,8 @@ class _AsyncStreamConnector(object):
                                                    protocol,
                                                    self._async)
                 except Exception as error:
-                    _LOGGER.error('SSLTransport() failed: error=%r; %s',
-                                  error, self._sock)
+                    _LOGGER.exception('SSLTransport() failed: error=%r; %s',
+                                      error, self._sock)
                     raise
 
             _LOGGER.debug('_linkup(): created transport %r', transport)
@@ -640,7 +641,7 @@ class _AsyncStreamConnector(object):
             try:
                 protocol.connection_made(transport)
             except Exception as error:
-                _LOGGER.error(
+                _LOGGER.exception(
                     'protocol.connection_made(%r) failed: error=%r; %s',
                     transport, error, self._sock)
                 raise
@@ -693,8 +694,8 @@ class _AsyncStreamConnector(object):
                 _LOGGER.info('SSL handshake completed successfully: %s',
                              self._sock)
         except Exception as error:  # pylint: disable=W0703
-            _LOGGER.error('SSL do_handshake failed: error=%r; %s',
-                          error, self._sock)
+            _LOGGER.exception('SSL do_handshake failed: error=%r; %s',
+                              error, self._sock)
             self._report_completion(error)
             return
 
@@ -837,8 +838,9 @@ class _AsyncTransportBase(  # pylint: disable=W0223
             try:
                 self._protocol.data_received(data)
             except Exception as error:
-                _LOGGER.error('protocol.data_received() failed: error=%r; %s',
-                              error, self._sock)
+                _LOGGER.exception(
+                    'protocol.data_received() failed: error=%r; %s',
+                    error, self._sock)
                 raise
 
     def _produce(self):
@@ -991,7 +993,7 @@ class _AsyncTransportBase(  # pylint: disable=W0223
             otherwise the exception corresponding to the the failed connection.
         """
         _LOGGER.debug('Concluding transport shutdown: state=%s; error=%r',
-                      self._state, errno)
+                      self._state, error)
 
         if self._state == self._STATE_COMPLETED:
             return
@@ -1007,8 +1009,8 @@ class _AsyncTransportBase(  # pylint: disable=W0223
         try:
             self._protocol.connection_lost(error)
         except Exception as exc:  # pylint: disable=W0703
-            _LOGGER.error('protocol.connection_lost(%r) failed: exc=%r; %s',
-                          error, exc, self._sock)
+            _LOGGER.exception('protocol.connection_lost(%r) failed: exc=%r; %s',
+                              error, exc, self._sock)
         finally:
             self._close_and_finalize()
 
@@ -1077,8 +1079,9 @@ class _AsyncPlaintextTransport(_AsyncTransportBase):
             try:
                 keep_open = self._protocol.eof_received()
             except Exception as error:  # pylint: disable=W0703
-                _LOGGER.error('protocol.eof_received() failed: error=%r; %s',
-                              error, self._sock)
+                _LOGGER.exception(
+                    'protocol.eof_received() failed: error=%r; %s',
+                    error, self._sock)
                 self._initiate_abort(error)
             else:
                 if keep_open:
