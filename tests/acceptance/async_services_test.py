@@ -964,15 +964,10 @@ class TestStreamConnectorBrokenPipe(
         my_proto = my_protocol_bucket[0]  # type: TestStreamConnectorTxRxStreamProtocol
 
         error = my_proto.connection_lost_error_bucket[0]
-        if isinstance(error, BrokenPipeError):
-            pass
-        elif isinstance(error, ConnectionResetError):
-            # We see this on OS X now and then
-            self.assertEqual(error.errno, 54)
-        else:
-            # We see this on OS X now and then
-            self.assertIsInstance(error, OSError)
-            self.assertEqual(error.errno, 41)
+        self.assertIsInstance(error, OSError)
+        # NOTE: we occasionally see EPROTOTYPE on OSX
+        self.assertIn(error.errno,
+                      [errno.EPIPE, errno.ECONNRESET, errno.EPROTOTYPE])
 
 
 class TestStreamConnectorEOFReceived(
